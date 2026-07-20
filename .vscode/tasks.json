@@ -1,0 +1,107 @@
+{
+  // Optional convenience for VS Code-family editors (VS Code, VSCodium, …):
+  // task-runner entries for the harness design-docs → PRs pipeline. Run any of
+  // these from the Command Palette → "Tasks: Run Task", or bind one to a
+  // keybinding. The same commands work from any terminal:
+  //   .venv/bin/python -m harness.cli pipeline ...
+  "version": "2.0.0",
+  "options": {
+    // Use the project's virtualenv interpreter and keep output uncoloured so
+    // problem matchers parse cleanly.
+    "env": { "NO_COLOR": "1" }
+  },
+  "inputs": [
+    {
+      "id": "taskId",
+      "type": "promptString",
+      "description": "Task id (run 'Harness: Pipeline status' to see them)"
+    },
+    {
+      "id": "prMode",
+      "type": "pickString",
+      "description": "Where should the PR go?",
+      "options": ["local", "github"],
+      "default": "local"
+    },
+    {
+      "id": "backend",
+      "type": "pickString",
+      "description": "Code-writing backend",
+      "options": ["ide-handoff", "claude-code", "openai", "gemini"],
+      "default": "ide-handoff"
+    },
+    {
+      "id": "autoBackend",
+      "type": "pickString",
+      "description": "Unattended code-writing backend",
+      "options": ["claude-code", "openai", "gemini"],
+      "default": "claude-code"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Harness: Plan from designs",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline plan --repo ${workspaceFolder} --designs designs",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Pipeline status",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline status --repo ${workspaceFolder}",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Run — IDE handoff (prepare task packets)",
+      "detail": "Plan → worktree per task → grounded TASK.md packet you implement in the editor.",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline run --repo ${workspaceFolder} --designs designs --backend ide-handoff --pr ${input:prMode}",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Run — auto (agent loop)",
+      "detail": "Unattended: the chosen backend writes code in each worktree, grounded + verified, then PRs.",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline run --repo ${workspaceFolder} --designs designs --backend ${input:autoBackend} --pr ${input:prMode}",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Run one task",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline run --repo ${workspaceFolder} --designs designs --backend ${input:backend} --pr ${input:prMode} --task ${input:taskId}",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Complete task → PR",
+      "detail": "After implementing a task packet in the editor: re-ground, review, open the PR.",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline complete ${input:taskId} --repo ${workspaceFolder} --pr ${input:prMode}",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Harness: Grounding check current file",
+      "detail": "Neuro-symbolic preflight on the open file. Hallucinated symbols show as squiggles.",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli verify ${file} --project ${workspaceFolder}",
+      "presentation": { "reveal": "silent", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "harness-grounding",
+        "source": "harness",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "severity": "error",
+        "pattern": {
+          "regexp": "^\\s*[✗⚠]\\s*(.+?):(\\d+)\\s*\\[(\\w+)\\]\\s*(.+)$",
+          "file": 1,
+          "line": 2,
+          "message": 4
+        }
+      }
+    }
+  ]
+}

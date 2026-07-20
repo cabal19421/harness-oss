@@ -1,0 +1,36 @@
+{
+  // Debug the pipeline from the editor (set breakpoints in harness/pipeline/).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pipeline: plan",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "harness.cli",
+      "args": ["pipeline", "plan", "--repo", "${workspaceFolder}", "--designs", "designs"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Pipeline: run (ide-handoff, local PRs)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "harness.cli",
+      "args": [
+        "pipeline", "run", "--repo", "${workspaceFolder}",
+        "--designs", "designs", "--backend", "ide-handoff", "--pr", "local"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Verify (ground) current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "harness.cli",
+      "args": ["verify", "${file}", "--project", "${workspaceFolder}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

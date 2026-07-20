@@ -1,0 +1,19 @@
+# ── Runtime dependencies ──────────────────────────────────────────────────────
+# NONE. The harness core (grounding engine, pipeline, agents, CLI) runs on the
+# Python standard library alone — no install of this file is required to use it.
+#
+# Optional Python packages (install to unlock a feature; see INSTALL.md):
+#   pip install -e ".[z3]"     # z3-accelerated grounding constraint solver
+#   pip install -e ".[dev]"    # test toolchain (pytest)
+#
+# Optional external tools (install via your OS package manager / vendor):
+#   git      — required for the design-docs → PRs pipeline (worktrees, branches)
+#   gh       — `harness pipeline --pr github` (open real GitHub PRs)
+#   tmux     — `harness pipeline tmux` cockpit (run several features at once)
+#   claude   — the claude-code backend (unattended ralph loop); https://code.claude.com
+#   go       — augments the Go grounding stdlib set via `go list std`
+#   node/npm — JS/TS repos the pipeline validates via an `npm test` oracle
+#
+# Run `harness status` to see which of the above are present on this machine.
+
+# z3-solver  # optional — or use:  pip install -e ".[z3]"

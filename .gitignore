@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Harness runtime state (written at runtime, never committed)
+harness/data/*.json
+harness/data/*.json.bak
+harness/data/*.json.tmp
+harness/data/*.lock
+
+# Pipeline state + isolated worktrees (see harness/pipeline/)
+.harness/
+.harness-wt/
+
+# Editor / OS
+.idea/
+.DS_Store
+*.swp

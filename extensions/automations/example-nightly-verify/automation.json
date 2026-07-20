@@ -1,0 +1,7 @@
+{
+  "name": "nightly-verify",
+  "description": "Ground every changed .py/.go file each night and report grounding failures.",
+  "trigger": "cron:0 3 * * *",
+  "action": "harness verify ${changed_files} --project .",
+  "enabled": true
+}

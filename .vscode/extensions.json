@@ -1,0 +1,13 @@
+{
+  // Optional: recommended extensions for driving the pipeline from a VS Code-
+  // family editor. None are required — the CLI and other editors work fine.
+  // Note for VSCodium and other MS-marketplace-free builds: install equivalents
+  // from the Open VSX registry (https://open-vsx.org) or your provider's VSIX.
+  "recommendations": [
+    "ms-python.python",
+    "github.copilot",
+    "github.copilot-chat",
+    "anthropic.claude-code",
+    "eamodio.gitlens"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  // Point the editor at the project virtualenv so the pipeline tasks and the
+  // grounding gate resolve `harness` and your dependencies.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+
+  // Surface design docs and task packets nicely.
+  "files.associations": {
+    "TASK.md": "markdown",
+    "designs/**/*.md": "markdown"
+  },
+
+  // The pipeline writes runtime state + worktrees here — keep them out of the
+  // file explorer and search.
+  "files.exclude": {
+    "**/.harness": true,
+    "**/__pycache__": true,
+    "**/*.egg-info": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/.harness": true
+  }
+}

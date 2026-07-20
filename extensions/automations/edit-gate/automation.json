@@ -1,0 +1,7 @@
+{
+  "name": "edit-gate",
+  "description": "Ground every Edit/Write to a .py/.go file via a Claude Code PostToolUse hook; feed hallucinated-symbol findings straight back to the agent so it fixes them before continuing.",
+  "trigger": "on:edit (Claude Code PostToolUse: Edit|Write|MultiEdit)",
+  "action": "harness verify --hook --project $CLAUDE_PROJECT_DIR",
+  "enabled": true
+}

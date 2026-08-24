@@ -10,7 +10,7 @@ Plan state stays consistent across those processes because each writes only its
 own task under a file lock (see :func:`harness.pipeline.store.save_merged`).
 
 This is optional and opt-in (``harness pipeline tmux``); the editor-first
-ide-handoff flow remains the default. tmux is only required for this command.
+VSCodium tasks remain the default. tmux is only required for this command.
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 from harness.log import fmt_cmd, get_logger
 
@@ -96,7 +96,7 @@ def launch(
     config: PipelineConfig,
     tasks: list[Task],
     *,
-    backend: str = "claude-code",
+    backend: str = "agent-cli",
     pr_mode: str = "local",
     attach: bool = True,
     log: Callable[[str], None] = print,
@@ -115,7 +115,7 @@ def launch(
     # pids and half-written worktrees. Tell the operator instead.
     probe = ["tmux", "has-session", "-t", sess]
     logger.debug("%s", fmt_cmd(probe))
-    exists = subprocess.run(probe, capture_output=True).returncode == 0
+    exists = subprocess.run(probe, capture_output=True, check=False).returncode == 0
     if exists:
         logger.warning("cockpit: session %r already exists — refusing to "
                        "recreate it (its panes may hold live agents "
@@ -146,7 +146,7 @@ def launch(
 
     sel = ["tmux", "select-window", "-t", f"{sess}:dashboard"]
     logger.debug("%s", fmt_cmd(sel))
-    res = subprocess.run(sel, capture_output=True)
+    res = subprocess.run(sel, capture_output=True, check=False)
     if res.returncode != 0:
         logger.debug("cockpit: select-window rc=%s — dashboard not focused "
                      "(cosmetic only; all windows were still created)",
@@ -166,7 +166,7 @@ def launch(
     if attach and sys.stdout.isatty():
         logger.info("cockpit: attaching to session %r (exec tmux attach — "
                     "replaces this process)", sess)
-        os.execvp("tmux", ["tmux", "attach", "-t", sess])  # replaces this process
+        os.execvp("tmux", ["tmux", "attach", "-t", sess])  # noqa: S606 - deliberate: exec replaces this process with the tmux client, fixed argv
     logger.info("cockpit: session %r ready, left detached (attach=%s, "
                 "stdout is a TTY=%s)", sess, attach, sys.stdout.isatty())
     return CockpitResult(sess, len(tasks) + 1, False, attach_cmd,
@@ -178,7 +178,7 @@ def kill(config: PipelineConfig) -> bool:
     sess = session_name(config)
     cmd = ["tmux", "kill-session", "-t", sess]
     logger.debug("%s", fmt_cmd(cmd))
-    res = subprocess.run(cmd, capture_output=True)
+    res = subprocess.run(cmd, capture_output=True, check=False)
     if res.returncode == 0:
         logger.info("cockpit: killed tmux session %r (all panes terminated)",
                     sess)

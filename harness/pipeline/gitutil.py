@@ -13,18 +13,18 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
 
-from harness.log import get_logger, fmt_cmd, redact, trunc
+from harness.log import fmt_cmd, get_logger, redact, trunc
 
 logger = get_logger(__name__)
 
-# Hardening: never let a scripted git call hang on an
-# interactive credential / passphrase prompt during an unattended run, and never
-# block a commit on a GPG/SSH signing prompt the loop can't answer. These are
-# applied to *every* git call below via the wrapper's environment + ``-c`` flags.
+# Hardening for unattended runs: never let a scripted git call hang on an
+# interactive credential / passphrase prompt, and never block a commit on a
+# GPG/SSH signing prompt the loop can't answer. These are applied to *every*
+# git call below via the wrapper's environment + ``-c`` flags.
 _HARDENED_ENV = {
     "GIT_TERMINAL_PROMPT": "0",   # fail instead of prompting for credentials
     "GIT_OPTIONAL_LOCKS": "0",    # don't take index.lock for read-only queries
@@ -51,6 +51,14 @@ class GitResult:
 
 def have_git() -> bool:
     return shutil.which("git") is not None
+
+
+def pwd_for(cwd: Path | str) -> str:
+    """Absolute ``$PWD`` for a child running in *cwd* (unresolvable → as given)."""
+    try:
+        return str(Path(cwd).resolve())
+    except OSError:                        # pragma: no cover - defensive
+        return str(cwd)
 
 
 def git(
@@ -80,7 +88,12 @@ def git(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, **_HARDENED_ENV},
+            check=False,   # non-zero degrades to a GitResult; GitError is raised below
+            # PWD is set explicitly, not inherited: our own PWD points at the
+            # ORCHESTRATOR's directory, and anything git spawns that trusts $PWD
+            # (hooks, credential helpers, `sh -c` aliases) would then act on the
+            # main repo instead of this worktree.
+            env={**os.environ, **_HARDENED_ENV, "PWD": pwd_for(cwd)},
         )
     except subprocess.TimeoutExpired:
         res = GitResult(124, "", f"git {' '.join(args)} timed out after {timeout}s")
@@ -107,6 +120,53 @@ def git(
 
 def is_repo(path: Path | str) -> bool:
     return have_git() and git(["rev-parse", "--is-inside-work-tree"], cwd=path).ok
+
+
+def main_repo_root(path: Path | str) -> Path:
+    """The MAIN checkout's root when *path* sits inside a linked worktree.
+
+    ``git rev-parse --path-format=absolute --git-common-dir`` names the shared
+    ``.git`` directory: for the main checkout that is ``<path>/.git`` itself,
+    while inside a linked worktree (whose ``.git`` is a file pointing back) it
+    is the main repo's ``.git`` — whose parent is the main checkout. Callers
+    that anchor state to "the repo" (``.harness``, ``worktree_root``, base-ref
+    resolution) must use that root, or running from inside an agent worktree
+    makes the worktree itself the repo and everything derives from the wrong
+    place.
+
+    On ANY failure — git absent, *path* not a repo, a pre-2.31 git without
+    ``--path-format``, or a layout whose common-dir parent is not a checkout
+    (bare repo) — the input is returned unchanged: degrade-not-crash, like
+    every other helper here.
+    """
+    p = Path(path)
+    # Broader than the usual OSError catch on purpose: this runs during
+    # PipelineConfig construction, where a crash would take down every command
+    # including the read-only ones — an unresolvable root must always degrade
+    # to "use the path as given", never abort.
+    try:
+        res = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=p)
+        if not res.ok or not res.out:
+            logger.debug("main_repo_root: --git-common-dir unresolvable in %s "
+                         "(rc=%s) — returning the input unchanged", p, res.code)
+            return p
+        common = Path(res.out.splitlines()[0].strip()).resolve()
+        own = (p / ".git").resolve()
+    except Exception as exc:  # noqa: BLE001 - degrade-not-crash, see above
+        logger.debug("main_repo_root: probe failed in %s (%s: %s) — returning "
+                     "the input unchanged", p, type(exc).__name__, exc)
+        return p
+    if common == own:
+        return p
+    root = common.parent
+    if not (root / ".git").exists():
+        # A common dir that is not a checkout's ``.git`` (bare repo, exotic
+        # GIT_DIR layout) has no main checkout to substitute.
+        logger.debug("main_repo_root: common dir %s has no checkout around it — "
+                     "returning the input unchanged", common)
+        return p
+    logger.debug("main_repo_root: %s is inside a linked worktree of %s", p, root)
+    return root
 
 
 def current_branch(repo: Path | str) -> str:
@@ -138,6 +198,17 @@ def head_sha(repo: Path | str, ref: str = "HEAD") -> str:
     return git(["rev-parse", ref], cwd=repo).out
 
 
+def ref_exists(cwd: Path | str, ref: str) -> bool:
+    """Does *ref* resolve in this repo/worktree? (e.g. ``origin/agent/x``).
+
+    Callers use it to tell "nothing to compare against" apart from a comparison
+    that genuinely found nothing — a distinction the safety checks that consume
+    ``rev-list`` output cannot make on their own, since a failed rev-list and an
+    empty result both come back as no lines.
+    """
+    return git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).ok
+
+
 def has_commits(repo: Path | str) -> bool:
     return git(["rev-parse", "--verify", "HEAD"], cwd=repo).ok
 
@@ -157,8 +228,8 @@ def commits_ahead(repo: Path | str, base: str, branch: str) -> int:
 def changed_files(
     cwd: Path | str,
     *,
-    base: Optional[str] = None,
-    only_suffix: Optional[str] = None,
+    base: str | None = None,
+    only_suffix: str | None = None,
 ) -> list[str]:
     """Files that differ from *base* (or the working tree), including untracked.
 
@@ -197,11 +268,25 @@ def changed_files(
     return files
 
 
+# The marker appended when a diff body is clipped. Exported so consumers can
+# DETECT truncation instead of re-typing the literal: the verifier turns a
+# truncated diff into a mandatory ABSTAIN, which only works if the two agree.
+DIFF_TRUNCATED = "\n…(diff truncated)…"
+
+# The marker appended when the FILE MANIFEST itself had to be clipped, exported
+# for exactly the same reason. The manifest is the thing that makes a truncated
+# diff safe to judge, so a prompt that presents a clipped manifest as "COMPLETE
+# and AUTHORITATIVE" re-creates the very confusion the manifest exists to remove
+# — one layer further out. A consumer that renders the manifest MUST check for
+# this marker and stop claiming completeness when it is present.
+MANIFEST_CLIPPED = "— this file LIST IS INCOMPLETE"
+
+
 def diff_text(
     cwd: Path | str,
     *,
-    base: Optional[str] = None,
-    paths: Optional[Sequence[str]] = None,
+    base: str | None = None,
+    paths: Sequence[str] | None = None,
     max_chars: int = 20000,
 ) -> str:
     """The unified diff of *paths* (or everything) vs *base*, incl. uncommitted work.
@@ -233,8 +318,63 @@ def diff_text(
             chunks.append(add.out)
     text = "\n".join(chunks)
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n…(diff truncated)…"
+        text = text[:max_chars] + DIFF_TRUNCATED
     return text
+
+
+def diff_manifest(
+    cwd: Path | str,
+    *,
+    base: str | None = None,
+    paths: Sequence[str] | None = None,
+    limit: int = 400,
+) -> list[str]:
+    """``<status> <path>`` for every file in the change — never truncated with the body.
+
+    :func:`diff_text` clips GLOBALLY over its concatenated chunks, so the files
+    appended last simply disappear. A verifier shown such a diff cannot tell
+    "unshown" from "absent", and has failed a change for a missing test file that
+    was on the branch all along. This manifest is small (names only) and is
+    rendered OUTSIDE the truncated body, so absence becomes checkable.
+
+    Reads the same three sources as :func:`diff_text` — committed ``base...HEAD``,
+    uncommitted vs ``HEAD``, and untracked-as-added — so the two can never
+    disagree about which files are in the change.
+    """
+    limit_paths = list(paths) if paths else []
+    seen: dict[str, str] = {}
+
+    def _record(status: str, rel: str) -> None:
+        if rel and (not limit_paths or rel in set(limit_paths)):
+            seen.setdefault(rel, status)
+
+    def _scan(res: GitResult) -> None:
+        for line in _lines(res.out):
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                # Rename/copy carry two paths (R100 old new): report the new one.
+                # Only the leading LETTER is kept — `[:2]` rendered a rename as
+                # "R1" and a copy as "C0", which reads like a truncated status in
+                # a listing whose whole job is to be unambiguous.
+                _record(parts[0].strip()[:1] or "M", parts[-1].strip())
+
+    if base and git(["rev-parse", "--verify", base], cwd=cwd).ok:
+        _scan(git(["diff", "--name-status", f"{base}...HEAD", "--", *limit_paths], cwd=cwd))
+    _scan(git(["diff", "--name-status", "HEAD", "--", *limit_paths], cwd=cwd))
+    for rel in _lines(git(["ls-files", "--others", "--exclude-standard"], cwd=cwd).out):
+        _record("A", rel)
+
+    out = [f"{seen[rel]} {rel}" for rel in sorted(seen)]
+    if len(out) > limit:
+        dropped = len(out) - limit
+        out = [*out[:limit], f"… and {dropped} more file(s) {MANIFEST_CLIPPED}"]
+        logger.warning("diff_manifest(cwd=%s, base=%s): %d file(s) exceeds the "
+                       "listing limit of %d — the manifest is CLIPPED and is no "
+                       "longer a complete file list; consumers must stop treating "
+                       "it as authoritative about absence", cwd, base, len(seen),
+                       limit)
+    logger.debug("diff_manifest(cwd=%s, base=%s): %d file(s)", cwd, base, len(seen))
+    return out
 
 
 def add_all(cwd: Path | str) -> GitResult:
@@ -265,7 +405,7 @@ def working_tree_dirty(cwd: Path | str) -> bool:
     return bool(git(["status", "--porcelain"], cwd=cwd).out)
 
 
-# ── rollback / clean (cache-preserving for warm reuse) ────────────────────────────
+# ── rollback / clean (hard reset + clean, cache-preserving for warm reuse) ────────
 
 
 def reset_hard(cwd: Path | str, ref: str = "HEAD") -> GitResult:
@@ -278,11 +418,49 @@ def clean_untracked(cwd: Path | str, *, keep_ignored: bool = True) -> GitResult:
 
     *keep_ignored* (default) drops ``-x`` so git-ignored paths (``node_modules``,
     ``.venv``, build caches) survive — this is what makes a reused worktree
-    "warm" instead of forcing a cold dependency reinstall every task
-    (reset-on-reuse).
+    "warm" instead of forcing a cold dependency reinstall every task.
     """
     args = ["clean", "-fd"] if keep_ignored else ["clean", "-fdx"]
     return git(args, cwd=cwd)
+
+
+def stash_push(cwd: Path | str, message: str, *, include_untracked: bool = True) -> str | None:
+    """Park the working tree's uncommitted changes on the stash; return its sha.
+
+    The safety net in front of :func:`discard_changes` during crash recovery:
+    stale-detection is a heuristic, so an iteration's uncommitted edits are
+    *moved* somewhere recoverable (``git stash list`` / ``git stash apply
+    <sha>``) instead of being destroyed outright. Returns ``None`` when there
+    was nothing to stash or git refused — the caller continues either way,
+    because failing to preserve is not a reason to fail recovery.
+
+    ``_NO_SIGN`` matters: ``git stash`` writes commits, so a repo with
+    ``commit.gpgsign=true`` would otherwise block on a passphrase prompt.
+    """
+    if not git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd=cwd).ok:
+        logger.debug("stash_push in %s: no commit on HEAD yet — nothing stashable", cwd)
+        return None
+    args = [*_NO_SIGN, "stash", "push"]
+    if include_untracked:
+        args.append("--include-untracked")
+    args += ["-m", message]
+    res = git(args, cwd=cwd)
+    if not res.ok:
+        logger.warning("stash_push: git stash push failed in %s (rc=%s): %s — "
+                       "uncommitted changes were NOT preserved",
+                       cwd, res.code, trunc(redact(res.err or res.out), 200))
+        return None
+    if "No local changes" in res.out:
+        logger.debug("stash_push in %s: git reported no local changes to save", cwd)
+        return None
+    sha = git(["rev-parse", "--verify", "refs/stash"], cwd=cwd).out
+    if not sha:
+        logger.warning("stash_push: stashed in %s but refs/stash is unreadable — the "
+                       "changes are on the stash without a recorded ref", cwd)
+        return None
+    logger.info("stash_push: parked uncommitted changes in %s as %s (%r)",
+                cwd, sha[:12], message)
+    return sha
 
 
 def discard_changes(cwd: Path | str, ref: str = "HEAD", *, keep_ignored: bool = True) -> None:
@@ -305,12 +483,46 @@ def discard_changes(cwd: Path | str, ref: str = "HEAD", *, keep_ignored: bool = 
                        cwd, res.code, trunc(redact(res.err or res.out), 200))
 
 
-# ── landed-work proof (refuse to delete unmerged work) ────────────────────────────
+# ── landed-work proof (refuse to delete work that has not merged) ─────────────────
 
 
 def is_ancestor(cwd: Path | str, ancestor: str, descendant: str) -> bool:
     """True iff *ancestor* is reachable from *descendant* (a plain merge landed)."""
     return git(["merge-base", "--is-ancestor", ancestor, descendant], cwd=cwd).ok
+
+
+def seed_commit(cwd: Path | str, base: str, branches: Sequence[str], *,
+                message: str) -> str:
+    """A commit containing *base* merged with *branches* and NOTHING else.
+
+    Used to re-base a task's dependency seed when the task already has commits of
+    its own: the diff base must contain every dependency and none of the task's
+    work, and neither the old base (which then leaks dependency code into the
+    review diff) nor the post-merge HEAD (which deletes the task's own work from
+    it) satisfies that.
+
+    Pure plumbing: ``merge-tree --write-tree`` + ``commit-tree`` never touch a
+    working tree and never move a ref, so there is no dirty-tree hazard and no
+    window in which a crash leaves a worktree detached. Returns ``""`` when the
+    plumbing is unavailable (git < 2.38) or any merge conflicts — a conflicting
+    ``merge-tree`` still prints a tree but exits non-zero, so the ``.ok`` check is
+    what rejects it. Callers MUST handle ``""`` by falling back.
+    """
+    ref = base
+    for br in branches:
+        tree = git(["merge-tree", "--write-tree", ref, br], cwd=cwd)
+        if not tree.ok or not tree.out.strip():
+            logger.debug("seed_commit: merge-tree %s + %s did not produce a clean "
+                         "tree — no seed commit (caller must fall back)", ref, br)
+            return ""
+        c = git([*_NO_SIGN, "commit-tree", tree.out.strip().splitlines()[0],
+                 "-p", ref, "-p", br, "-m", message], cwd=cwd)
+        if not c.ok or not c.out.strip():
+            logger.debug("seed_commit: commit-tree failed for %s + %s — no seed "
+                         "commit (caller must fall back)", ref, br)
+            return ""
+        ref = c.out.strip()
+    return "" if ref == base else ref
 
 
 def tree_sha(cwd: Path | str, ref: str) -> str:
@@ -363,7 +575,7 @@ def unlanded_by_patch_id(cwd: Path | str, new_head: str, remote: str) -> list[st
     ``rev-list --cherry-pick --right-only A...B`` lists commits on the *remote*
     side whose patch-id has no equivalent on *new_head* — exactly the commits a
     force-push would clobber. Empty ⇒ a force-push only replays equivalent
-    content and is safe — the pre-force-push safety check.
+    content and is safe. This check gates every force-push in the pipeline.
     """
     res = git(
         ["rev-list", "--cherry-pick", "--right-only", f"{new_head}...{remote}"],
@@ -399,10 +611,11 @@ def force_push_with_lease(
     return git(["push", lease, remote, branch], cwd=worktree, timeout=timeout)
 
 
-def remote_url(repo: Path | str, name: str = "origin") -> str:
-    return git(["remote", "get-url", name], cwd=repo).out
-
-
+# No `remote_url()` accessor on purpose: `git remote get-url` returns the
+# credential-bearing form (``https://user:token@host/…``) and nothing in the
+# pipeline needs the URL itself — only whether a remote exists. Anything that
+# does grow a need for it must route the value through ``log.redact`` before
+# it reaches a log line or a PR body.
 def has_remote(repo: Path | str, name: str = "origin") -> bool:
     return git(["remote", "get-url", name], cwd=repo).ok
 

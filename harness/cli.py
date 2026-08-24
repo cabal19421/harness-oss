@@ -11,8 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Sequence
-
+from collections.abc import Sequence
 
 # ── ANSI colour helpers ──────────────────────────────────────────────────────
 
@@ -33,8 +32,8 @@ class _C:
 
 
 # Honour NO_COLOR (https://no-color.org) — disable ANSI so editor task problem
-# matchers (e.g. the bundled "Harness: Grounding check current file" task in
-# .vscode/tasks.json) parse clean, uncoloured output.
+# matchers (e.g. the VSCodium "Grounding check current file" task) parse clean,
+# uncoloured output.
 if os.environ.get("NO_COLOR"):
     for _attr in list(vars(_C)):
         if _attr.isupper():
@@ -65,17 +64,34 @@ def _error(text: str) -> str:
 
 def _cmd_status(args: argparse.Namespace) -> None:
     """Handle the ``status`` subcommand — the grounding + pipeline environment doctor."""
-    from harness.config import TOOLS, detect_tools
-    from harness.grounding import get_solver
+    from harness.config import PY_EXTRAS, TOOLS, detect_tool_versions, detect_tools
+    from harness.grounding import get_solver, require_z3_enabled
+    from harness.grounding.solver import ENV_REQUIRE_Z3
     from harness.pipeline.backends import available_backends, get_backend
 
     print(_header("Harness Status"))
 
-    # Grounding solver (z3 accelerator vs the stdlib fallback).
-    solver = get_solver()
+    # Grounding solver: z3 decides strictly more constraint kinds than the
+    # stdlib fallback — it is a capability, not a speed-up.
+    #
+    # require_z3=False, NOT the default: `status` is the doctor whose whole job
+    # is to report a missing z3, so it must never *enforce* HARNESS_REQUIRE_Z3
+    # and die with Z3Unavailable before printing the very line the operator ran
+    # it for. The requirement is reported below instead.
+    required = require_z3_enabled()
+    solver = get_solver(require_z3=False)
+    kinds = ", ".join(sorted(solver.capabilities))
     print(f"{_C.BOLD}Grounding solver:{_C.RESET} {_C.CYAN}{solver.backend}{_C.RESET}"
+          + _info(f"  decides: {kinds}")
           + ("" if solver.backend == "z3"
-             else _info("  (install z3-solver for the accelerated backend)")))
+             else _info("  (install z3-solver to also decide call_binding + "
+                        "guard_exclusivity; they abstain → unverified without it)")))
+    if required and solver.backend != "z3":
+        print(_error(f"  ⛔ {ENV_REQUIRE_Z3} is set but the z3 backend is unusable — "
+                     "every command that honours the requirement (--require-z3) will "
+                     "fail until z3-solver is installed: pip install -e '.[z3]'"))
+    elif required:
+        print(_info(f"  ({ENV_REQUIRE_Z3} is set — the requirement is satisfied)"))
 
     # Coding backends (the pluggable code-writers) and their availability.
     print(f"\n{_C.BOLD}Backends:{_C.RESET}")
@@ -86,11 +102,24 @@ def _cmd_status(args: argparse.Namespace) -> None:
 
     # External dependencies (and what each one unlocks).
     print(f"\n{_C.BOLD}Dependencies (see INSTALL.md):{_C.RESET}")
+    # Versions are probed only for the tools that declare a security floor; the
+    # detected-vs-required pair is printed next to them so "installed" and
+    # "recent enough to be safe" are visibly different states.
+    versions = detect_tool_versions()
     for name, found in detect_tools().items():
         icon = _success("✔") if found else _warn("✗")
-        note = ("grounding accelerator (optional; stdlib fallback otherwise)"
-                if name == "z3" else TOOLS.get(name, ""))
-        print(f"  {icon} {_C.CYAN}{name}{_C.RESET} — {_info(note)}")
+        note = PY_EXTRAS.get(name) or TOOLS.get(name, "")
+        line = f"  {icon} {_C.CYAN}{name}{_C.RESET} — {_info(note)}"
+        info = versions.get(name)
+        if found and info is not None and info.detected:
+            if info.blocked:
+                line += "  " + _error(f"⛔ {info.summary()} — below the hard "
+                                      f"minimum {info.hard_minimum}, refused")
+            elif not info.ok:
+                line += "  " + _warn(f"⚠ {info.summary()}")
+            else:
+                line += "  " + _info(info.summary())
+        print(line)
 
     # Extensions (drop-in skills / MCP / automations).
     try:
@@ -98,19 +127,34 @@ def _cmd_status(args: argparse.Namespace) -> None:
         reg = load_extensions()
         print(f"\n{_C.BOLD}Extensions:{_C.RESET} {reg.summary()}   "
               f"{_info('(harness extensions)')}")
-    except Exception:  # noqa: BLE001 - status must never crash on a bad drop-in
+    except Exception:  # noqa: S110, BLE001 - status must never crash on a bad drop-in
         pass
 
 
 def _cmd_extensions(args: argparse.Namespace) -> None:
     """Handle the ``extensions`` subcommand — list discovered drop-ins."""
-    from harness.extensions import ensure_layout, load_extensions
+    from harness.extensions import (
+        available_skills_prompt,
+        ensure_layout,
+        load_extensions,
+        merged_mcp_config,
+    )
 
     if getattr(args, "init", False):
         base = ensure_layout()
         print(_success(f"✔ extensions layout ready at {base}"))
         for sub in ("skills", "mcp", "automations"):
             print(f"  {base / sub}")
+        return
+
+    # Machine-readable handoffs: the whole point of discovery is giving a
+    # runtime something it can consume, so both categories have one.
+    if getattr(args, "skills_prompt", False):
+        print(available_skills_prompt())
+        return
+    if getattr(args, "mcp_config", False):
+        import json as _json
+        print(_json.dumps(merged_mcp_config(), indent=2))
         return
 
     reg = load_extensions()
@@ -120,12 +164,21 @@ def _cmd_extensions(args: argparse.Namespace) -> None:
     if reg.skills:
         print(f"{_C.BOLD}Skills{_C.RESET}:")
         for s in reg.skills:
-            print(f"  • {_C.CYAN}{s.name}{_C.RESET} — {_info(s.description)}")
+            # A skill is invoked by its directory name; `name` only relabels it.
+            ident = (f" {_C.DIM}(invoked as: {s.identifier}){_C.RESET}"
+                     if s.identifier != s.name else "")
+            print(f"  • {_C.CYAN}{s.name}{_C.RESET}{ident} — {_info(s.description)}")
+            if s.allowed_tools:
+                # A security disclosure, not trivia: a dropped-in skill can
+                # pre-approve broad tool access for whoever loads it.
+                print(f"      {_warn('⚑ allowed-tools:')} "
+                      f"{_warn(', '.join(s.allowed_tools))}")
     if reg.mcp_servers:
         print(f"\n{_C.BOLD}MCP servers{_C.RESET}:")
         for m in reg.mcp_servers:
             argstr = (" " + " ".join(m.args)) if m.args else ""
-            print(f"  • {_C.CYAN}{m.name}{_C.RESET} — {_info(m.command + argstr)} [{m.transport}]")
+            target = (m.command + argstr) if m.command else str(m.raw.get("url", ""))
+            print(f"  • {_C.CYAN}{m.name}{_C.RESET} — {_info(target)} [{m.transport}]")
     if reg.automations:
         print(f"\n{_C.BOLD}Automations{_C.RESET}:")
         for a in reg.automations:
@@ -136,9 +189,10 @@ def _cmd_extensions(args: argparse.Namespace) -> None:
         print(_info("No drop-ins yet. Add files under the subfolders "
                     "(see extensions/README.md), or run `harness extensions --init`."))
     if reg.errors:
-        print(f"\n{_C.BOLD}{_warn('Skipped (malformed):')}{_C.RESET}")
+        print(f"\n{_C.BOLD}{_warn('Skipped (malformed) / warnings:')}{_C.RESET}")
         for e in reg.errors:
-            print(f"  {_error('✗')} {e}")
+            mark = _warn("⚠") if ": warning:" in e else _error("✗")
+            print(f"  {mark} {e}")
 
 
 def _log_hook_error(detail: str) -> None:
@@ -153,18 +207,49 @@ def _log_hook_error(detail: str) -> None:
         from pathlib import Path
         log_dir = Path.home() / ".harness"
         log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        # Deliberately naive local wall-clock time: this is what a human reads
+        # "the next morning" in a local log file; an aware timestamp would
+        # change the written values for no consumer.
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")  # noqa: DTZ005
         with open(log_dir / "hook-errors.log", "a", encoding="utf-8") as fh:
             fh.write(f"{stamp} verify --hook fail-open: {detail}\n")
-    except Exception:  # noqa: BLE001 - logging must not introduce a new crash path
+    except Exception:  # noqa: S110, BLE001 - logging must not introduce a new crash path
         pass
 
 
+# Only these two extensions are grounded; everything else exits 0 (skip).
+_GROUNDED_SUFFIXES = (".py", ".go")
+
+# Post-tool events are the only ones whose file is already on disk in its
+# EDITED form. On a pre-tool event the on-disk content is still the old code, so
+# the findings would describe code the agent never wrote — and there exit 2
+# genuinely blocks the tool call, i.e. it would block the very edit that fixes
+# them.
+_POST_TOOL_EVENTS = {"posttooluse", "posttoolbatch"}
+# `file_path` is also Read's primary field, so under a `"*"` matcher a plain
+# Read of a .py file would otherwise be grounded and could exit 2 about a file
+# the agent never touched.
+_FILE_EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
+
+# Agent CLIs commonly cap hook output (10,000 characters is a typical ceiling),
+# replacing anything past it with a preview plus a file path — which turns
+# immediate feedback into a file the agent has to go read, defeating the point
+# of the gate. Stay comfortably inside the typical ceiling.
+_HOOK_MAX_CHARS = 8000
+_HOOK_MAX_FINDINGS = 40
+
+
 def _hook_file_path(event: dict) -> str | None:
-    """Extract the edited file path from a Claude-Code-style hook event."""
+    """Extract the edited file path from a PostToolUse-style hook event
+    (the JSON shape agentic CLIs emit from an after-edit hook).
+
+    ``notebook_path`` is deliberately not read: it only ever names a ``.ipynb``,
+    which never passes the ``.py``/``.go`` suffix check below, and the shipped
+    matcher no longer claims to cover ``NotebookEdit``.
+    """
     ti = event.get("tool_input")
     if isinstance(ti, dict):
-        for key in ("file_path", "path", "filePath", "notebook_path"):
+        for key in ("file_path", "path", "filePath"):
             v = ti.get(key)
             if isinstance(v, str) and v:
                 return v
@@ -175,17 +260,123 @@ def _hook_file_path(event: dict) -> str | None:
     return None
 
 
-def _verify_hook(args: argparse.Namespace) -> None:
-    """Side-car mode: read a PostToolUse event on stdin, ground the edited
-    ``.py``/``.go`` file, and feed any hallucinated-symbol findings back.
+def _hook_event_allowed(event: dict) -> bool:
+    """True when this event is a post-tool event on a file-editing tool.
 
-    Contract (Claude Code PostToolUse): exit 0 = ok/skip (silent); exit 2 =
-    findings — stderr is surfaced to the agent so it fixes the symbol before
-    continuing. Any malformed event or internal error exits 0, so the side-car
-    can never break the agent's edit loop.
+    Each field is checked only when PRESENT: ``--hook`` is documented to work
+    from any runtime that can run a command on a file-change event (a git
+    ``pre-commit`` hook, an editor on-save task, CI), and those send neither
+    ``hook_event_name`` nor ``tool_name``. A misconfigured agent hook — a
+    ``"*"`` matcher, or the same command wired to PreToolUse — does send them,
+    and that is exactly the case these two guards close.
+    """
+    ev = event.get("hook_event_name")
+    if isinstance(ev, str) and ev.strip() and ev.strip().lower() not in _POST_TOOL_EVENTS:
+        return False
+    tool = event.get("tool_name")
+    return not (isinstance(tool, str) and tool.strip()
+                and tool.strip().lower() not in _FILE_EDIT_TOOLS)
+
+
+def _hook_batch_paths(event: dict) -> list[str]:
+    """Edited file paths in a PostToolBatch event (nested under ``tool_calls``)."""
+    calls = event.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    out: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict) or not _hook_event_allowed(call):
+            continue
+        p = _hook_file_path(call)
+        if p:
+            out.append(p)
+    return out
+
+
+def _hook_grounder(args: argparse.Namespace):
+    """A ``path -> GroundingReport`` callable that indexes the project once per language.
+
+    The Preflight index is the expensive part; a batch of edits must not rebuild
+    it per file.
+    """
+    from pathlib import Path
+
+    from harness.grounding import Preflight, detect_language
+
+    # An empty --project (a hook wiring whose ${HARNESS_PROJECT_DIR} expanded
+    # to nothing) falls through to the env var, then to the process cwd.
+    project = (getattr(args, "project", None)
+               or os.environ.get("HARNESS_PROJECT_DIR")
+               or os.getcwd())
+    cache: dict = {}
+
+    def ground(p: Path):
+        lang = getattr(args, "lang", None) or detect_language(str(p))
+        pf = cache.get(lang)
+        if pf is None:
+            pf = cache[lang] = Preflight(
+                project, lang=lang, solver=getattr(args, "solver", None),
+                require_z3=_require_z3(args))
+        return pf.check(p.read_text(encoding="utf-8"))
+
+    return ground
+
+
+def _hook_block(reason: str, *, json_decision: bool) -> None:
+    """Report findings and exit 2.
+
+    *json_decision* is for PostToolBatch, the one post-hoc event that can
+    actually halt the loop — and only via ``{"decision": "block"}`` on stdout.
+    Everywhere else the hook writes NOTHING to stdout: a stdout payload that
+    fails the consumer's schema validation degrades the exit-2 contract.
+    """
+    if json_decision:
+        import json as _json
+        print(_json.dumps({"decision": "block", "reason": reason}))
+    print(reason, file=sys.stderr)
+    sys.exit(2)
+
+
+def _verify_hook(args: argparse.Namespace) -> None:
+    """Side-car mode: read a post-tool event on stdin, ground the edited
+    ``.py``/``.go`` file(s), and feed any hallucinated-symbol findings back.
+
+    Contract (PostToolUse-style hook consumers): exit 0 = ok/skip (silent);
+    exit 2 = findings, which go to stderr. On **PostToolUse** that stderr is
+    *surfaced* to the agent as the reason to fix the symbol — the tool has
+    already run, so the hook cannot undo or block it, and the model may or may
+    not act on the finding. On **PostToolBatch** (``tool_calls``) the hook can
+    genuinely halt the loop, so the findings are additionally emitted as
+    ``{"decision": "block", …}`` on stdout. Any malformed event or internal
+    error exits 0, so the side-car can never break the agent's edit loop.
+
+    The ONE exception is a requirement the operator asked for explicitly:
+    ``--require-z3`` / ``HARNESS_REQUIRE_Z3=1`` with no usable z3 exits 2 with
+    the reason. Failing open there would silently disable the whole gate for
+    every file in the session — the exact silent downgrade that knob exists to
+    prevent — while looking identical to "nothing was wrong".
     """
     import json as _json
+
+    # In hook mode stderr is a PROTOCOL channel, not a log: on PostToolUse the
+    # consumer surfaces it to the agent verbatim as the reason to fix a symbol.
+    # A stray WARNING there does not read as a log line — it reads as a finding,
+    # and it breaks the "exit 0 = silent" half of the contract above. (Without
+    # the optional z3 extra, `get_solver` emits exactly one such line, so every
+    # clean file in the session would hand the agent an unrelated "install
+    # z3-solver" nag.) Drop only the stderr sink: HARNESS_LOG_FILE still
+    # records everything, and internal errors already go to
+    # ~/.harness/hook-errors.log via `_log_hook_error`.
+    import logging
     from pathlib import Path
+    _harness_log = logging.getLogger("harness")
+    for _handler in list(_harness_log.handlers):
+        if getattr(_handler, "stream", None) is sys.stderr:
+            _harness_log.removeHandler(_handler)
+    # A NullHandler, not an empty list: with no handler anywhere on the chain
+    # (`harness` does not propagate to the global root) logging falls back to
+    # `logging.lastResort`, which writes the bare message to — stderr.
+    _harness_log.addHandler(logging.NullHandler())
 
     raw = sys.stdin.read()
     try:
@@ -194,32 +385,68 @@ def _verify_hook(args: argparse.Namespace) -> None:
         sys.exit(0)
     if not isinstance(event, dict):
         sys.exit(0)
-
-    fpath = _hook_file_path(event)
-    if not fpath:
+    if not _hook_event_allowed(event):
         sys.exit(0)
-    p = Path(fpath)
-    if p.suffix not in (".py", ".go") or not p.is_file():
+
+    batch = isinstance(event.get("tool_calls"), list)
+    if batch:
+        paths = [Path(x) for x in _hook_batch_paths(event)]
+    else:
+        fpath = _hook_file_path(event)
+        paths = [Path(fpath)] if fpath else []
+    targets = [p for p in paths
+               if p.suffix in _GROUNDED_SUFFIXES and p.is_file()]
+    if not targets:
         sys.exit(0)  # only ground Python/Go source
 
-    from harness.grounding import Preflight, detect_language
+    from harness.grounding import Z3Unavailable
+    ground = _hook_grounder(args)
+    failures = []
     try:
-        code = p.read_text(encoding="utf-8")
-        project = getattr(args, "project", None) or os.getcwd()
-        lang = getattr(args, "lang", None) or detect_language(str(p))
-        report = Preflight(project, lang=lang, solver=getattr(args, "solver", None)).check(code)
+        for p in targets:
+            report = ground(p)
+            if not report.ok:
+                failures.append((p, report))
+    except Z3Unavailable as exc:
+        # NOT swallowed like other errors: the operator asked for z3 explicitly
+        # (--require-z3 / HARNESS_REQUIRE_Z3). Failing open here would turn the
+        # knob whose entire purpose is to prevent a SILENT capability downgrade
+        # into a silent no-op — exit 0 on every file for the whole session, with
+        # only a line in the hook log. Surface it to the agent (exit 2) instead.
+        _log_hook_error(f"Z3Unavailable: {exc} (files={[str(p) for p in targets]})")
+        _hook_block(
+            f"⛔ harness grounding gate — cannot ground "
+            f"{', '.join(p.name for p in targets)}: {exc}\n"
+            "The gate is NOT running; fix the solver or drop the requirement.",
+            json_decision=batch)
     except Exception as exc:  # noqa: BLE001 - a verifier crash must never break the agent
-        _log_hook_error(f"{type(exc).__name__}: {exc} (file={p})")
+        _log_hook_error(f"{type(exc).__name__}: {exc} "
+                        f"(files={[str(p) for p in targets]})")
         sys.exit(0)
 
-    if report.ok:
+    if not failures:
         sys.exit(0)
-    print(
-        f"⛔ harness grounding gate — {p.name} references symbols that do not exist; "
-        f"fix these before continuing:\n{report.render(path=str(p))}",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    # Split the payload budget across the files that actually have findings so
+    # one noisy file can't crowd the others out of the 10,000-char cap.
+    budget = max(400, _HOOK_MAX_CHARS // len(failures))
+    names = ", ".join(p.name for p, _ in failures)
+    body = "\n".join(
+        r.render(path=str(p), max_findings=_HOOK_MAX_FINDINGS, max_chars=budget)
+        for p, r in failures)
+    message = (f"⛔ harness grounding gate — {names} references symbols that do "
+               f"not exist; fix these before continuing:\n{body}")
+    if len(message) > _HOOK_MAX_CHARS:   # belt and braces: the cap is the point
+        message = message[:_HOOK_MAX_CHARS] + "\n… (output truncated)"
+    _hook_block(message, json_decision=batch)
+
+
+def _require_z3(args: argparse.Namespace) -> bool | None:
+    """``True`` when ``--require-z3`` was passed, else ``None``.
+
+    ``None`` (not ``False``) so an unset flag falls through to the
+    ``HARNESS_REQUIRE_Z3`` environment variable instead of pinning it off.
+    """
+    return True if getattr(args, "require_z3", False) else None
 
 
 def _cmd_verify(args: argparse.Namespace) -> None:
@@ -236,21 +463,27 @@ def _cmd_verify(args: argparse.Namespace) -> None:
         print(_error("verify: a FILE (or '-' for stdin) is required, unless using --hook."))
         sys.exit(2)
 
-    from harness.grounding import Preflight, detect_language
+    from harness.grounding import Preflight, Z3Unavailable, detect_language
 
     if args.file == "-":
         code, label = sys.stdin.read(), "<stdin>"
     else:
         try:
-            code = open(args.file, "r", encoding="utf-8").read()
+            with open(args.file, encoding="utf-8") as fh:
+                code = fh.read()
         except OSError as exc:
             print(_error(str(exc)))
             sys.exit(2)
         label = args.file
 
     lang = args.lang or detect_language(label)
-    pf = Preflight(args.project or ".", lang=lang, solver=args.solver)
-    trace: list = [] if getattr(args, "explain", False) else None
+    try:
+        pf = Preflight(args.project or ".", lang=lang, solver=args.solver,
+                       require_z3=_require_z3(args))
+    except Z3Unavailable as exc:
+        print(_error(f"verify: {exc}"))
+        sys.exit(2)
+    trace: list | None = [] if getattr(args, "explain", False) else None
     report = pf.check(code, trace=trace)
     print(_header(f"Preflight grounding — {label} [{lang}]"))
     # Pass the file path so each finding line is self-contained (file:line) and
@@ -259,14 +492,22 @@ def _cmd_verify(args: argparse.Namespace) -> None:
 
     if trace is not None:
         print(f"\n{_C.BOLD}Solver rules generated this run "
-              f"[{pf.solver.backend}] — {len(trace)} arity constraint(s):{_C.RESET}")
+              f"[{pf.solver.backend}] — {len(trace)} constraint(s):{_C.RESET}")
         if not trace:
-            print(_info("  (none — no resolved callable had a checkable arity)"))
+            print(_info("  (none — nothing with a checkable signature or guard)"))
         for t in trace:
-            mark = _success("sat ✓") if t["ok"] else _error("unsat ✗")
-            hi = "∞" if t["hi"] is None else t["hi"]
-            print(f"  • {t['site']}")
-            print(f"      inputs : argc={t['argc']}  signature arity=[{t['lo']}, {hi}]")
+            kind = t.get("kind", "arity")
+            if t["ok"] is None:
+                mark = _info("abstained — reported unverified")
+            else:
+                mark = _success("sat ✓") if t["ok"] else _error("unsat ✗")
+            print(f"  • {t['site']}  [{kind}]")
+            if kind == "guard_exclusivity":
+                print(f"      inputs : {len(t.get('guards', ()))} branch guard(s) "
+                      f"{list(t.get('guards', ()))}")
+            else:
+                hi = "∞" if t["hi"] is None else t["hi"]
+                print(f"      inputs : argc={t['argc']}  signature arity=[{t['lo']}, {hi}]")
             print(f"      rule   : {t['constraint']}{t['note']}")
             print(f"      result : {mark}")
 
@@ -316,6 +557,13 @@ def _pipeline_config(args: argparse.Namespace):
         "no_progress_window": getattr(args, "no_progress_window", None),
         "dependency_blame_gate": (
             False if getattr(args, "no_dep_blame_gate", False) else None),
+        # Only the enabling side is forwarded: unset must fall through to
+        # HARNESS_REQUIRE_Z3 rather than pin the knob off.
+        "require_z3": (True if getattr(args, "require_z3", False) else None),
+        # Same one-sided forwarding: this one CHANGES WHAT GREEN MEANS, so it is
+        # never turned on implicitly.
+        "validation_baseline": (
+            True if getattr(args, "validation_baseline", False) else None),
     }
     overrides.update({k: v for k, v in optional.items() if v is not None})
     return PipelineConfig.from_env(**overrides)
@@ -356,7 +604,8 @@ def _cmd_verify_diff(args: argparse.Namespace) -> None:
     on whether the diff does what ``--intent`` describes. Fails open (skip) when
     the backend can't answer a one-shot prompt; exits 1 only on an explicit FAIL.
     """
-    from harness.pipeline import gitutil
+    from harness.grounding import Z3Unavailable
+    from harness.pipeline import gitutil, shutdown
     from harness.pipeline.backends import get_backend
     from harness.pipeline.backends.base import ImplementContext
     from harness.pipeline.grounding_gate import GroundingGate
@@ -380,8 +629,15 @@ def _cmd_verify_diff(args: argparse.Namespace) -> None:
     if blame:
         print(_warn(f"dependency-blame: {blame}"))
 
-    # Grounding summary for context (reuses the existing gate).
-    grounding = GroundingGate(repo).check_changes(base=base)
+    # Grounding summary for context (reuses the existing gate). With the z3
+    # requirement on, the gate refuses to be built at all — report that as a
+    # clean CLI error (as `verify` does) rather than a traceback.
+    try:
+        grounding = GroundingGate(
+            repo, require_z3=config.require_z3 or None).check_changes(base=base)
+    except Z3Unavailable as exc:
+        print(_error(f"verify-diff: {exc}"))
+        sys.exit(2)
     print(_info(f"grounding: {grounding.summary}"))
 
     backend = get_backend(config.backend)
@@ -389,16 +645,32 @@ def _cmd_verify_diff(args: argparse.Namespace) -> None:
     task = Task(id="verify-diff", title=intent, design_doc="(cli)", description=intent)
     ctx = ImplementContext(task=task, worktree=repo, base_branch=base, config=config)
     ask = (lambda p: backend.ask_oneshot(ctx, p)) if avail else None
+    # Prefer the schema-validated path when the backend has one — the verdict is
+    # then read from an object the CLI validated, not from a prose trailer.
+    ask_structured = ((lambda p, schema: backend.ask_oneshot_structured(ctx, p, schema=schema))
+                      if avail else None)
     if ask is None:
         print(_warn(f"backend '{config.backend}' unavailable ({reason}) — "
                     "verifier skipped (fail-open)"))
     diff = gitutil.diff_text(repo, base=base, paths=changed)
+    # Complete file list outside the truncatable body, so the judge can never read
+    # "unshown" as "absent" (see gitutil.diff_manifest).
+    manifest = "\n".join(gitutil.diff_manifest(repo, base=base, paths=changed))
     samples = getattr(args, "verify_samples", None) or config.verify_samples
 
-    report = verify_change(
-        ask=ask, task_title=intent, task_intent=intent, diff=diff,
-        grounding_summary=grounding.summary, validation_ok=None,
-        samples=samples)
+    # The verifier is the only part of this command that spawns an agent, and
+    # the backend detaches it (``start_new_session=True``) before registering it
+    # with :func:`~harness.pipeline.shutdown.killable` — a registration with no
+    # guard on the stack is inert, so Ctrl-C here would kill the CLI and leave
+    # a billing agent process running against this repo. No sleep inhibitor:
+    # this is a short read-only foreground command, not an unattended overnight
+    # run.
+    with shutdown.guard():
+        report = verify_change(
+            ask=ask, task_title=intent, task_intent=intent, diff=diff,
+            grounding_summary=grounding.summary, validation_ok=None,
+            samples=samples, ask_structured=ask_structured,
+            file_manifest=manifest)
 
     color = {"pass": _C.GREEN, "fail": _C.RED,
              "abstain": _C.YELLOW, "skip": _C.DIM}.get(report.verdict, "")
@@ -409,6 +681,69 @@ def _cmd_verify_diff(args: argparse.Namespace) -> None:
     # Exit-code contract: 1 = the verifier said this diff is wrong.
     if report.blocking:
         sys.exit(1)
+
+
+# The pipeline subcommands that MUTATE run state (plan statuses, worktrees,
+# branches). `plan` and `tmux` belong here because both re-plan and persist —
+# "re-plans under the enclosing run" is the harm this guard exists for.
+# Read-only ones — status, trace, verify-diff, backends — keep working while a
+# run is live, so they are deliberately absent. `supervise` is also absent:
+# operating the fleet alongside live runs is its documented job (its own
+# proof-of-death gates protect live tasks) — but `supervise --recover` gets the
+# nested-only check below, since an agent recovering the fleet that is running
+# it is the recursion incident this guard closes.
+_MUTATING_PIPELINE_SUBS = ("run", "requeue", "prune", "complete", "plan", "tmux")
+
+
+def _refuse_if_run_live(config, sub: str, *, lock_probe: bool = True) -> None:
+    """Refuse a mutating pipeline subcommand while a run is live on its state dir.
+
+    Two signals, checked before any state is touched (``lock_probe=False``
+    keeps only the nested-case env check, for subcommands that legitimately
+    run alongside a live run but never from inside one):
+
+    * ``HARNESS_ACTIVE_STATE_DIR`` matching the target state dir proves this
+      process was spawned FROM INSIDE a live run (an agent's Bash tool, a
+      design's ``(validate:)`` command) — the nested case, named as such in the
+      refusal. Diagnostic-only: an env var can outlive its setter.
+    * a flock-held ``run.lock`` is the authoritative liveness signal — it dies
+      with its holder, so a stale lock file with no live process never refuses.
+      ``run`` itself skips this probe: its own :class:`RunLock` acquisition in
+      the orchestrator is the authoritative check and knows whether the run
+      needs the exclusive (plan-wide) or shared (``--task``-scoped, tmux
+      cockpit) grant — an exclusive probe here would wrongly refuse a second
+      cockpit pane.
+
+    There is deliberately no bypass flag: a run that must proceed anyway means
+    the live holder should be stopped first, not raced.
+    """
+    from pathlib import Path
+
+    from harness.pipeline.store import ACTIVE_STATE_DIR_ENV, RunLock
+
+    state_dir = Path(config.state_dir)
+    active = os.environ.get(ACTIVE_STATE_DIR_ENV, "")
+    if active:
+        try:
+            nested = Path(active).resolve() == state_dir.resolve()
+        except OSError:
+            nested = False
+        if nested:
+            print(_error(
+                f"pipeline {sub}: refusing — this command was launched from inside "
+                f"a live harness run on {state_dir} ({ACTIVE_STATE_DIR_ENV} matches "
+                f"the target state dir). A nested '{sub}' would mutate the enclosing "
+                "run's plan under it; run it again after that run finishes."))
+            sys.exit(2)
+    if lock_probe and sub != "run" and RunLock.held_elsewhere(state_dir):
+        hint = (" A live cockpit session is re-entered with `tmux attach`, not "
+                "by re-running `pipeline tmux`." if sub == "tmux" else "")
+        print(_error(
+            f"pipeline {sub}: refusing — a live `harness pipeline` run holds "
+            f"{state_dir / 'run.lock'}. A concurrent '{sub}' would mutate the plan "
+            "under it; wait for that run to finish, or stop it, then retry. "
+            f"(A stale lock whose process died refuses nothing.){hint}"))
+        sys.exit(2)
 
 
 def _cmd_pipeline(args: argparse.Namespace) -> None:
@@ -427,10 +762,11 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
     # Validate the subcommand BEFORE building the orchestrator — its __init__
     # shells out to git and constructs a worktree manager, which is real work
     # (and can stall on a locked repo) just to print a usage line.
-    if sub not in ("plan", "status", "run", "tmux", "complete", "supervise",
-                   "prune", "trace", "verify-diff"):
+    if sub not in ("plan", "status", "run", "tmux", "complete", "requeue",
+                   "supervise", "prune", "trace", "verify-diff"):
         print(_error("Usage: harness pipeline "
-                     "{plan|run|status|complete|supervise|prune|trace|verify-diff|backends} …"))
+                     "{plan|run|status|complete|requeue|supervise|prune|trace|"
+                     "verify-diff|backends} …"))
         sys.exit(2)
 
     if sub == "verify-diff":
@@ -456,6 +792,13 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
     from harness.pipeline import PipelineOrchestrator
 
     config = _pipeline_config(args)
+    if sub in _MUTATING_PIPELINE_SUBS:
+        _refuse_if_run_live(config, sub)
+    elif sub == "supervise" and getattr(args, "recover", False):
+        # Recovery stashes and resets worktrees; running it from INSIDE a live
+        # run is the nested case. Running it alongside one is designed usage,
+        # so the lock probe stays off.
+        _refuse_if_run_live(config, sub, lock_probe=False)
     orch = PipelineOrchestrator(config, log=lambda m: print(_info(m)))
 
     if sub == "plan":
@@ -479,7 +822,7 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
         # must be visible to `set -e` scripts, not swallowed as success.
         bad = [r for r in report.runs
                if r.status in ("failed", "blocked", "error", "unavailable",
-                               "waiting-dependency")]
+                               "locked", "waiting-dependency", "interrupted")]
         if bad:
             sys.exit(1)
         return
@@ -510,15 +853,29 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
 
     if sub == "complete":
         print(_header(f"Complete task {args.task_id}"))
-        result = orch.complete(args.task_id, open_pr=not args.no_pr)
-        line = f"  [{result.task_id}] {result.status}"
-        if result.risk:
-            line += f"  risk={result.risk}"
-        if result.pr_url:
-            line += f"  PR={result.pr_url}"
+        run = orch.complete(args.task_id, open_pr=not args.no_pr)
+        line = f"  [{run.task_id}] {run.status}"
+        if run.risk:
+            line += f"  risk={run.risk}"
+        if run.pr_url:
+            line += f"  PR={run.pr_url}"
         print(line)
-        if result.detail:
-            print(_info(f"      {result.detail}"))
+        if run.detail:
+            print(_info(f"      {run.detail}"))
+        return
+
+    if sub == "requeue":
+        print(_header(f"Requeue task(s) — {config.repo.name}"))
+        res = orch.requeue(list(args.task_id),
+                           reset_attempts=getattr(args, "reset_attempts", False),
+                           force=getattr(args, "force", False))
+        for tid, outcome in res.items():
+            line = f"  [{tid}] {outcome}"
+            print(line if outcome in ("requeued", "attempts-reset") else _warn(line))
+        # Exit-code contract: a script must see that something did not happen.
+        if any(o not in ("requeued", "already-pending", "attempts-reset")
+               for o in res.values()):
+            sys.exit(1)
         return
 
     if sub == "supervise":
@@ -528,15 +885,20 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
 
     if sub == "prune":
         print(_header(f"Prune merged worktree branches — {config.repo.name}"))
-        res = orch.prune(force=getattr(args, "force", False))
-        for label, branches in res.items():
+        force = getattr(args, "force", False)
+        pruned = orch.prune(
+            allow_dirty=getattr(args, "allow_dirty", False) or force,
+            allow_unlanded=getattr(args, "allow_unlanded", False) or force,
+        )
+        for label, branches in pruned.items():
             if branches:
                 print(_info(f"  {label.replace('_', ' ')}: {', '.join(branches)}"))
-        if not any(res.values()):
+        if not any(pruned.values()):
             print(_info("  no agent/* branches to prune"))
         return
 
-    print(_error("Usage: harness pipeline {plan|run|status|complete|supervise|prune|backends} …"))
+    print(_error("Usage: harness pipeline "
+                 "{plan|run|status|complete|requeue|supervise|prune|backends} …"))
     sys.exit(2)
 
 
@@ -573,7 +935,7 @@ def _add_pipeline_parser(subparsers) -> None:
     # No argparse `choices`: backends are an extensible registry (drop-ins can
     # register more) — get_backend() rejects unknown names with the live list.
     sp_run.add_argument("--backend", default=None,
-                        help="Code-writing backend: ide-handoff, claude-code, openai, "
+                        help="Code-writing backend: ide-handoff, agent-cli, openai, "
                              "gemini, or a registered drop-in (default/env: ide-handoff)")
     sp_run.add_argument("--pr", choices=["local", "github"], default=None,
                         help="Where PRs go (default/env: local branch)")
@@ -584,7 +946,10 @@ def _add_pipeline_parser(subparsers) -> None:
     sp_run.add_argument("--max-tokens", type=int, default=None,
                         help="Abort the loop once this many tokens are spent (env: HARNESS_MAX_TOKENS)")
     sp_run.add_argument("--max-cost", type=float, default=None,
-                        help="Abort the loop once this USD cost is spent (env: HARNESS_MAX_COST_USD)")
+                        help="Abort the loop once this USD cost is spent — best-effort "
+                             "from the agent CLI's usage envelope on agent-cli, an "
+                             "estimate from a per-model rate table on openai/gemini "
+                             "(env: HARNESS_MAX_COST_USD, HARNESS_MODEL_PRICES)")
     sp_run.add_argument("--untrusted", action="store_true",
                         help="Treat design docs as untrusted: allowlist-filter their validation commands")
     sp_run.add_argument("--mutation-min", type=float, default=None,
@@ -594,15 +959,29 @@ def _add_pipeline_parser(subparsers) -> None:
                         help="Disable the independent verifier gate (a fresh-context "
                              "second opinion on each diff; on by default, env: HARNESS_VERIFY)")
     sp_run.add_argument("--verify-samples", type=int, default=None,
-                        help="Self-consistency: take N independent verifier votes and use "
-                             "the majority (disagreement → human review). 1 = off "
-                             "(default/env: HARNESS_VERIFY_SAMPLES)")
+                        help="Number of independent verifier votes per diff (minimum 2 — "
+                             "at least two adversarial verifiers always run while the "
+                             "verify gate is on; N>2 adds more). Majority wins; "
+                             "disagreement with no strict majority → abstain → human "
+                             "review (default 2, env: HARNESS_VERIFY_SAMPLES)")
     sp_run.add_argument("--no-progress-window", type=int, default=None,
                         help="Abstain to a human after N iterations reach the same failing "
                              "state (0 disables; default 3, env: HARNESS_NO_PROGRESS_WINDOW)")
     sp_run.add_argument("--no-dep-blame-gate", action="store_true",
                         help="Disable the dependency-blame review gate (flags a fix that "
                              "patches vendored third-party code; on by default)")
+    sp_run.add_argument("--require-z3", action="store_true",
+                        help="Fail fast if the z3 constraint solver is unavailable "
+                             "instead of degrading to the builtin backend (which "
+                             "abstains on call-binding and guard-exclusivity checks). "
+                             "Off by default (env: HARNESS_REQUIRE_Z3)")
+    sp_run.add_argument("--validation-baseline", action="store_true",
+                        help="Run the oracle against the task's diff base FIRST and don't "
+                             "blame the agent for a command that was already failing "
+                             "there. Costs a second validation run per task and can hide "
+                             "a pre-existing failure — use it on repos that are not green "
+                             "at HEAD, or whose toolchain reds them independently of any "
+                             "diff. Off by default (env: HARNESS_VALIDATION_BASELINE)")
     sp_run.add_argument("--no-pr", action="store_true", help="Implement + review but don't open PRs")
 
     sp_status = psub.add_parser("status", help="Show the current plan + task statuses")
@@ -612,9 +991,9 @@ def _add_pipeline_parser(subparsers) -> None:
         "tmux", help="Run several features simultaneously, one per tmux window (cockpit)")
     _common(sp_tmux)
     _oracle(sp_tmux)
-    sp_tmux.add_argument("--backend", default="claude-code",
-                         help="Code-writing backend: ide-handoff, claude-code, openai, "
-                              "gemini, or a registered drop-in (default: claude-code)")
+    sp_tmux.add_argument("--backend", default="agent-cli",
+                         help="Code-writing backend: ide-handoff, agent-cli, openai, "
+                              "gemini, or a registered drop-in (default: agent-cli)")
     sp_tmux.add_argument("--pr", choices=["local", "github"], default="local",
                          help="Where PRs go (default: local branch)")
     sp_tmux.add_argument("--max", type=int, default=None,
@@ -632,6 +1011,20 @@ def _add_pipeline_parser(subparsers) -> None:
                              help="Fail review when the changed code's mutation score is "
                                   "below this ratio, 0..1 (env: HARNESS_MUTATION_MIN)")
 
+    sp_requeue = psub.add_parser(
+        "requeue",
+        help="Return awaiting-human/blocked/failed task(s) to pending so the next "
+             "run picks them up")
+    _common(sp_requeue)
+    sp_requeue.add_argument("task_id", nargs="+", help="Task id(s) to requeue")
+    sp_requeue.add_argument("--reset-attempts", action="store_true",
+                            help="Also zero the cross-run attempt counter (needed "
+                                 "for a task blocked by the attempt budget, which "
+                                 "the cap would otherwise re-park immediately)")
+    sp_requeue.add_argument("--force", action="store_true",
+                            help="Also requeue 'done' or in-flight tasks (discards "
+                                 "a recorded result / races a resume)")
+
     sp_supervise = psub.add_parser(
         "supervise", help="Show task liveness; --recover rolls back crashed/hung tasks")
     _common(sp_supervise)
@@ -648,19 +1041,28 @@ def _add_pipeline_parser(subparsers) -> None:
                           help="Only spans for this task id")
     sp_trace.add_argument("--type", default="",
                           help="Only spans of this type (agent, validation, grounding, "
-                               "review, mutation, freeze, pr, recovery, task_status, …)")
+                               "review, mutation, freeze, pr, recovery, prune, "
+                               "task_status, …)")
     sp_trace.add_argument("-n", "--last", type=int, default=0,
                           help="Only the last N spans")
 
+    # Two unrelated risks, two separate opt-ins; --force stays as the
+    # deprecated alias that turns on both.
+    sp_prune.add_argument("--allow-unlanded", action="store_true",
+                          help="Also delete UNLANDED agent/* branches and reclaim their "
+                               "worktrees (discards commits that never landed)")
+    sp_prune.add_argument("--allow-dirty", action="store_true",
+                          help="Also remove worktrees with UNCOMMITTED changes "
+                               "(discards that work); by default they are reported and kept")
     sp_prune.add_argument("--force", action="store_true",
-                          help="Also delete UNLANDED agent/* branches (discards their commits)")
+                          help="Deprecated alias for --allow-unlanded --allow-dirty")
 
     sp_verify_diff = psub.add_parser(
         "verify-diff",
         help="Independent fresh-context verifier over the working diff (fail → exit 1)")
     _common(sp_verify_diff)
-    sp_verify_diff.add_argument("--backend", default="claude-code",
-                                help="Backend whose one-shot judge answers (default: claude-code; "
+    sp_verify_diff.add_argument("--backend", default="agent-cli",
+                                help="Backend whose one-shot judge answers (default: agent-cli; "
                                      "ide-handoff has no one-shot path → verifier skips)")
     sp_verify_diff.add_argument("--base", default=None,
                                 help="Diff against this ref (default: base branch or 'main')")
@@ -668,8 +1070,11 @@ def _add_pipeline_parser(subparsers) -> None:
                                 help="What the change is supposed to accomplish "
                                      "(the requirement the verifier judges against)")
     sp_verify_diff.add_argument("--verify-samples", type=int, default=None,
-                                help="Self-consistency: N independent votes, majority wins "
-                                     "(env: HARNESS_VERIFY_SAMPLES)")
+                                help="Number of independent verifier votes (minimum 2 — at "
+                                     "least two adversarial verifiers always run; N>2 adds "
+                                     "more). Majority wins; disagreement with no strict "
+                                     "majority → abstain → human review (default 2, env: "
+                                     "HARNESS_VERIFY_SAMPLES)")
 
     sp_backends = psub.add_parser("backends", help="List code-writing backends and availability")
     _add_logging_flags(sp_backends, child=True)
@@ -730,16 +1135,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_verify.add_argument(
         "--explain", action="store_true",
-        help="Show every arity constraint (z3/builtin rule) generated this run + its inputs",
+        help="Show every constraint (call-binding / arity / guard rule) generated this "
+             "run + its inputs and sat/unsat/abstained result",
     )
     p_verify.add_argument(
         "--hook", action="store_true",
-        help="Side-car mode: read a Claude-Code PostToolUse event on stdin, ground the "
-             "edited .py/.go file, feed findings back (exit 2 on hallucinations)",
+        help="Side-car mode: read a PostToolUse/PostToolBatch hook event (the JSON "
+             "shape agentic CLIs emit from an after-edit hook) on stdin, ground the "
+             "edited .py/.go file(s), feed findings back (exit 2 on hallucinations; "
+             "a batch event is additionally blocked on stdout)",
     )
     p_verify.add_argument(
         "--solver", default=None, choices=["builtin", "z3"],
         help="Constraint-solver backend (default: z3 if installed, else builtin)",
+    )
+    p_verify.add_argument(
+        "--require-z3", action="store_true",
+        help="Fail fast if z3 is unavailable instead of grounding with the builtin "
+             "backend, which abstains on call-binding and guard-exclusivity checks "
+             "(env: HARNESS_REQUIRE_Z3)",
     )
     _add_logging_flags(p_verify, child=True)
 
@@ -748,6 +1162,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "extensions", help="List drop-in tools, skills, MCP servers & automations")
     p_ext.add_argument("--init", action="store_true",
                        help="Create the extensions/ folder layout if missing")
+    p_ext.add_argument("--skills-prompt", action="store_true",
+                       help="Print discovered skills as the <available_skills> XML "
+                            "block a model's system prompt consumes (name, "
+                            "description, absolute SKILL.md location)")
+    p_ext.add_argument("--mcp-config", action="store_true",
+                       help="Print the merged {\"mcpServers\": …} JSON config "
+                            "(the same object merged_mcp_config() returns)")
     _add_logging_flags(p_ext, child=True)
 
     # --- pipeline ------------------------------------------------------------

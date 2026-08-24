@@ -1,0 +1,55 @@
+# Lint configuration for harness itself.
+#
+# Same job as mypy.ini's pinning: REPRODUCIBILITY. Ruff's default rule set
+# widens across releases (0.16 turned on UP/PLW/I/BLE/FURB/… by default), so a
+# checkout that inherits "whatever the installed ruff defaults to" can flip
+# from green to red on a version bump alone — the verdict-flip failure mode
+# the pipeline's own validation legs exist to catch. The families are
+# therefore stated explicitly: this is the set the codebase holds itself to,
+# not everything ruff can check. (No pyproject.toml in this repo, on purpose —
+# hence this standalone file.)
+#
+# setup.py declares python_requires>=3.10; keep this in lockstep with it and
+# with mypy.ini's python_version.
+target-version = "py310"
+
+# The scaffolded sample apps and build output are not part of the linted
+# surface (mirrors mypy.ini's exclude).
+extend-exclude = ["build", "my-web-app", "my-xr-app", "loopeng"]
+
+[lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle errors (ruff's long-standing core)
+    "F",               # pyflakes
+    "I",               # import sorting
+    "UP",              # pyupgrade (target-version-aware)
+    "B",               # bugbear
+    "A",               # builtin shadowing
+    "C4",              # comprehensions
+    "SIM",             # simplify
+    "PIE",             # misc lints
+    "ISC",             # implicit string concatenation
+    "G",               # logging format
+    "DTZ",             # naive datetimes
+    "S",               # bandit-derived security checks
+    "BLE",             # blind excepts (annotate the deliberate ones)
+    "PYI",             # stub-style hygiene
+    "RUF",             # ruff-native rules
+    "FURB",            # refurb modernisations
+    "PLR", "PLW",      # pylint refactor/warning subsets ruff enables
+]
+
+# PLR09xx complexity thresholds and PLR2004 magic-values are style budgets,
+# not defects — the long functions here (orchestrator, cli) are long because
+# the run-book reads top to bottom. S603/S607 flag every subprocess call; this
+# codebase IS a subprocess orchestrator with its own trust layer (trust.py),
+# so the blanket findings carry no signal here. RUF001/2/3 flag typographic
+# punctuation (em-dashes, arrows, ellipses) as "ambiguous unicode" — that
+# punctuation is this repo's documentation voice, used on purpose.
+ignore = ["PLR09", "PLR2004", "S603", "S607", "RUF001", "RUF002", "RUF003"]
+
+[lint.per-file-ignores]
+# Tests assert on internals and monkeypatch freely; security and
+# magic-value rules carry no signal there. B017 (assert-raises-Exception)
+# stays on.
+"tests/*" = ["S", "PLR2004", "SIM117"]

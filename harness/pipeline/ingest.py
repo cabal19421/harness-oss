@@ -26,7 +26,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from harness.log import get_logger, redact, trunc
 
@@ -67,7 +66,7 @@ _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<text>.+?)\s*$")
 # (e.g. ``python -c "print(1)"``) belong in a ``## Validation`` block instead.
 _ANNOT_RE = re.compile(
     r"\((?P<key>risk|validate|paths|depends|id|accept|mutation|verify|samples)\s*:\s*(?P<val>[^)]+)\)",
-    re.I)
+    re.IGNORECASE)
 
 
 @dataclass
@@ -79,7 +78,7 @@ class DesignDoc:
     title: str
     frontmatter: dict[str, str] = field(default_factory=dict)
     default_validation: list[str] = field(default_factory=list)
-    default_risk: Optional[RiskLevel] = None
+    default_risk: RiskLevel | None = None
     body: str = ""
 
 
@@ -109,7 +108,7 @@ def plan_from_designs(
     repo: Path,
     designs_dir: Path,
     *,
-    default_validation: Optional[list[str]] = None,
+    default_validation: list[str] | None = None,
 ) -> Plan:
     """Parse every design doc under *designs_dir* into a single :class:`Plan`."""
     repo = Path(repo).resolve()
@@ -303,7 +302,7 @@ def _task_from_line(doc: DesignDoc, raw: str, validation: list[str], *, body: st
     # gate rejects any diff from this task that modifies them.
     accept = _parse_list(annots.get("accept", ""))
     # Per-task minimum mutation score, e.g. ``(mutation: 0.7)``.
-    mutation_min: Optional[float] = None
+    mutation_min: float | None = None
     if annots.get("mutation"):
         try:
             mutation_min = float(annots["mutation"])
@@ -315,10 +314,10 @@ def _task_from_line(doc: DesignDoc, raw: str, validation: list[str], *, body: st
                            task_id, trunc(redact(annots["mutation"]), 40))
             mutation_min = None
     # Independent-verifier overrides: ``(verify: off)`` / ``(samples: 3)``.
-    verify: Optional[bool] = None
+    verify: bool | None = None
     if annots.get("verify") is not None:
         verify = annots["verify"].strip().lower() in ("1", "true", "yes", "on")
-    verify_samples: Optional[int] = None
+    verify_samples: int | None = None
     if annots.get("samples"):
         try:
             verify_samples = int(annots["samples"])
@@ -414,7 +413,7 @@ def _validation_section(body: str) -> list[str]:
             continue
         # Prefer fenced code blocks; fall back to bullet lines. Tolerate any (or
         # no) info-string after the opening fence, plus trailing whitespace.
-        fenced = re.findall(r"```[^\n]*\n(.*?)```", sec, re.S)
+        fenced = re.findall(r"```[^\n]*\n(.*?)```", sec, re.DOTALL)
         if fenced:
             cmds = [ln.strip() for block in fenced for ln in block.splitlines() if ln.strip()]
             return [c for c in cmds if not c.startswith("#")]
@@ -427,7 +426,7 @@ def _validation_section(body: str) -> list[str]:
 
 def _split_sections(body: str, *, level: int) -> list[tuple[str, str]]:
     """Split markdown into ``(heading_text, section_body)`` at the given ``#`` level."""
-    pattern = re.compile(rf"^#{{{level}}}\s+(.+?)\s*$", re.M)
+    pattern = re.compile(rf"^#{{{level}}}\s+(.+?)\s*$", re.MULTILINE)
     out: list[tuple[str, str]] = []
     matches = list(pattern.finditer(body))
     for i, m in enumerate(matches):
@@ -455,7 +454,7 @@ def _sublist_body(lines: list[str], idx: int) -> str:
     return "\n".join(out)
 
 
-def _first_title(body: str) -> Optional[str]:
+def _first_title(body: str) -> str | None:
     for line in body.splitlines():
         h = _HEADING_RE.match(line)
         if h:
@@ -471,7 +470,7 @@ def _parse_list(val: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _coerce_risk(val: Optional[str]) -> Optional[RiskLevel]:
+def _coerce_risk(val: str | None) -> RiskLevel | None:
     if not val:
         return None
     v = val.strip().lower()

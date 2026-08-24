@@ -26,10 +26,10 @@ import textwrap
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar
 
-from harness.grounding import Preflight, detect_language
-from harness.grounding.report import GroundingReport, Verdict
+from harness.grounding import Preflight, detect_language, get_solver, require_z3_enabled
+from harness.grounding.report import GroundingReport
 from harness.log import get_logger, step, trunc
 
 from . import gitutil
@@ -87,17 +87,32 @@ class GroundingGate:
     worktree's code, which is exactly what we want to ground its changes against.
     """
 
-    _cache: dict[str, Preflight] = {}
-    _lock = threading.Lock()
+    _cache: ClassVar[dict[str, Preflight]] = {}
+    _lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, root: Path | str, *, solver: Optional[str] = None,
-                 target_env_root: Path | str | None = None) -> None:
+    def __init__(self, root: Path | str, *, solver: str | None = None,
+                 target_env_root: Path | str | None = None,
+                 require_z3: bool | None = None) -> None:
         self.root = Path(root).resolve()
         self.solver = solver
+        # None → the HARNESS_REQUIRE_Z3 env var decides. True makes a missing z3
+        # a hard error (Z3Unavailable) rather than a silent downgrade to the
+        # builtin backend, which abstains on call-binding/guard constraints.
+        self.require_z3 = require_z3
         # The main repo root whose venv holds the target's dependencies — a
         # git WORKTREE has no .venv of its own, so grounding it must resolve
         # environment imports against the primary checkout's env.
         self.target_env_root = Path(target_env_root).resolve() if target_env_root else None
+        # FAIL FAST, HERE. The solver is otherwise built lazily (first
+        # check_code/check_changes), which lands the error mid-run — after a
+        # backend has already spent a full implementation pass — where the
+        # orchestrator records it as a generic "unexpected error" per task. Worse,
+        # a task whose diff touches no .py/.go file returns early from
+        # check_changes and would never enforce the requirement at all. Resolving
+        # the solver in the constructor is what makes "raises Z3Unavailable when
+        # the grounding gate is built" (PIPELINE.md, --require-z3 help) true.
+        if require_z3_enabled(require_z3):
+            get_solver(solver, require_z3=True)
 
     def _preflight(self, lang: str = "python") -> Preflight:
         """Cached KB for repeated preflight checks on the same root+language.
@@ -106,7 +121,7 @@ class GroundingGate:
         lock so concurrent worktrees don't serialise on it, and the lock only
         guards the dict read/insert.
         """
-        key = f"{self.root}|{lang}|{self.solver}|{self.target_env_root}"
+        key = f"{self.root}|{lang}|{self.solver}|{self.target_env_root}|{self.require_z3}"
         with self._lock:
             pf = self._cache.get(key)
         if pf is not None:
@@ -116,7 +131,8 @@ class GroundingGate:
         with step(logger, "build grounding KB", root=str(self.root), lang=lang,
                   solver=self.solver or "auto"):
             built = Preflight(self.root, lang=lang, solver=self.solver,
-                              target_env_root=self.target_env_root)
+                              target_env_root=self.target_env_root,
+                              require_z3=self.require_z3)
         with self._lock:
             pf = self._cache.get(key)
             if pf is None:
@@ -128,7 +144,7 @@ class GroundingGate:
         return pf
 
     @classmethod
-    def invalidate(cls, root: Optional[Path | str] = None) -> None:
+    def invalidate(cls, root: Path | str | None = None) -> None:
         """Drop cached knowledge bases (call after a worktree's files change)."""
         with cls._lock:
             if root is None:
@@ -182,7 +198,7 @@ class GroundingGate:
 
     # ── oracle: ground a worktree's changed files ─────────────────────────────
 
-    def check_changes(self, *, base: Optional[str] = None) -> GateResult:
+    def check_changes(self, *, base: str | None = None) -> GateResult:
         """Ground every changed ``.py`` and ``.go`` file under this root vs *base*.
 
         Builds a **fresh, local** KB per language (the worktree mutates between
@@ -226,7 +242,8 @@ class GroundingGate:
                 with step(logger, "build local grounding KB", root=str(self.root),
                           lang=lang, solver=self.solver or "auto"):
                     pf = Preflight(self.root, lang=lang, solver=self.solver,
-                               target_env_root=self.target_env_root)
+                                   target_env_root=self.target_env_root,
+                                   require_z3=self.require_z3)
                 pf_cache[lang] = pf
             reports[rel] = pf.check(code)
             logger.debug("grounding oracle: %s [%s]: ok=%s", rel, lang, reports[rel].ok)

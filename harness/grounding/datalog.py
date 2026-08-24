@@ -17,8 +17,8 @@ system) could drop in behind the same fact/rule interface.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Union
 
 from harness.log import get_logger
 
@@ -41,7 +41,7 @@ def var(name: str) -> Var:
     return Var(name)
 
 
-Term = Union[Var, str, int, None]
+Term = Var | str | int | None
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,7 @@ def _unify(pattern: tuple[Term, ...], tpl: tuple, binding: dict) -> dict | None:
     if len(pattern) != len(tpl):
         return None
     b = dict(binding)
-    for pat, val in zip(pattern, tpl):
+    for pat, val in zip(pattern, tpl, strict=False):
         if isinstance(pat, Var):
             if pat.name in b:
                 if b[pat.name] != val:

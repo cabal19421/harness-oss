@@ -23,11 +23,14 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from harness.log import get_logger
 
 from .knowledge import KnowledgeBase
+
+if TYPE_CHECKING:
+    from .go import GoKnowledgeBase
 from .reasoner import ground
 from .report import GroundingReport
 from .solver import ConstraintSolver, get_solver
@@ -51,32 +54,42 @@ class Preflight:
     """Reusable grounding gate bound to one project root + language (KB built once)."""
 
     def __init__(self, project_root: str | Path = ".", *, lang: str = "python",
-                 solver: Optional[str] = None,
-                 target_env_root: str | Path | None = None) -> None:
+                 solver: str | None = None,
+                 target_env_root: str | Path | None = None,
+                 require_z3: bool | None = None) -> None:
         if lang not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language '{lang}'. Choose from {SUPPORTED_LANGUAGES}.")
         self.lang = lang
-        self.solver: ConstraintSolver = get_solver(solver)
+        # require_z3=None → the HARNESS_REQUIRE_Z3 env var decides. When set and
+        # z3 is unusable this raises Z3Unavailable instead of quietly grounding
+        # with a backend that abstains on call-binding / guard exclusivity.
+        self.solver: ConstraintSolver = get_solver(solver, require_z3=require_z3)
         logger.debug("preflight init: lang=%s solver=%s (requested=%r) root=%s",
                      lang, self.solver.backend, solver, project_root)
+        # The two KB types share no interface on purpose: each is consumed only
+        # by its own language's grounding function, and `self.lang` (fixed at
+        # construction) decides which branch — and therefore which KB — runs.
+        self.kb: GoKnowledgeBase | KnowledgeBase
         if lang == "go":
             from .go import GoKnowledgeBase
             self.kb = GoKnowledgeBase(project_root)
         else:
             self.kb = KnowledgeBase(project_root, target_env_root=target_env_root)
 
-    def check(self, proposed_code: str, *, trace: Optional[list] = None) -> GroundingReport:
+    def check(self, proposed_code: str, *, trace: list | None = None) -> GroundingReport:
         """Ground *proposed_code* and return the report (does not raise).
 
-        Pass *trace* (a list) to capture every arity constraint generated this
-        run — the exact rule, its inputs, and sat/unsat — for ``--explain``.
+        Pass *trace* (a list) to capture every constraint generated this run —
+        the exact rule, its inputs, and sat/unsat/abstained — for ``--explain``.
         """
         t0 = time.monotonic()
         if self.lang == "go":
             from .go import ground_go
-            report = ground_go(proposed_code, self.kb, self.solver, trace=trace)
+            # lang == "go" ⇒ __init__ built a GoKnowledgeBase (and vice versa);
+            # mypy cannot see that pairing through the union.
+            report = ground_go(proposed_code, self.kb, self.solver, trace=trace)  # type: ignore[arg-type]
         else:
-            report = ground(proposed_code, self.kb, self.solver, trace=trace)
+            report = ground(proposed_code, self.kb, self.solver, trace=trace)  # type: ignore[arg-type]
         if logger.isEnabledFor(logging.INFO):
             findings = report.ungrounded + report.contradicted
             logger.info("preflight %s: %d finding(s) across %d claim(s) "
@@ -97,6 +110,8 @@ class Preflight:
 
 
 def preflight_check(proposed_code: str, project_root: str | Path = ".", *,
-                    lang: str = "python", solver: Optional[str] = None) -> GroundingReport:
+                    lang: str = "python", solver: str | None = None,
+                    require_z3: bool | None = None) -> GroundingReport:
     """One-shot convenience wrapper around :class:`Preflight`."""
-    return Preflight(project_root, lang=lang, solver=solver).check(proposed_code)
+    return Preflight(project_root, lang=lang, solver=solver,
+                     require_z3=require_z3).check(proposed_code)

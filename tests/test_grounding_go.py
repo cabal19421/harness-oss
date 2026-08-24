@@ -6,9 +6,13 @@ from pathlib import Path
 import pytest
 
 from harness.grounding import detect_language, preflight_check
-from harness.grounding.go import GoKnowledgeBase, extract_go_claims, ground_go, is_stdlib_package
+from harness.grounding.go import (
+    GoKnowledgeBase,
+    extract_go_claims,
+    ground_go,
+    is_stdlib_package,
+)
 from harness.grounding.solver import get_solver
-
 
 # ── fixture: a small Go module ──────────────────────────────────────────────────
 
@@ -42,6 +46,72 @@ def test_stdlib_membership():
     assert is_stdlib_package("net/http")
     assert not is_stdlib_package("fmtx")
     assert not is_stdlib_package("github.com/google/uuid")
+
+
+def test_bundled_snapshot_covers_recent_std_additions():
+    """The bundled list runs on every machine WITHOUT a go toolchain, so a stale
+    snapshot flags real post-quantum/FIPS/synctest imports as ungrounded."""
+    from harness.grounding.go.stdlib import _BUNDLED_STDLIB
+    for pkg in ("crypto/fips140", "crypto/hkdf", "crypto/pbkdf2", "crypto/sha3",
+                "crypto/mlkem", "testing/synctest", "go/doc/comment",
+                "runtime/coverage"):
+        assert pkg in _BUNDLED_STDLIB, pkg
+    # GOEXPERIMENT-only packages stay OUT — grounding them would green-light
+    # imports that fail to build on a stock toolchain.
+    for pkg in ("encoding/json/v2", "encoding/json/jsontext", "simd", "runtime/secret"):
+        assert pkg not in _BUNDLED_STDLIB, pkg
+    # The snapshot itself must satisfy the same importability rule the live
+    # `go list std` output is filtered by (the two paths answer one question).
+    from harness.grounding.go.stdlib import _is_importable_std
+    assert all(_is_importable_std(p) for p in _BUNDLED_STDLIB)
+
+
+def test_internal_filter_is_segmentwise_not_substring():
+    """`"internal/" not in line` misses a trailing `internal` segment, so
+    `log/internal` & friends were merged into the grounded set."""
+    from harness.grounding.go.stdlib import _is_importable_std
+    for unimportable in ("log/internal", "log/slog/internal", "encoding/json/internal",
+                         "go/internal", "net/internal", "image/internal",
+                         "crypto/internal", "crypto/internal/fips140/aes",
+                         "vendor/golang.org/x/net/http2/hpack"):
+        assert not _is_importable_std(unimportable), unimportable
+    for importable in ("fmt", "net/http", "crypto/sha3", "internalthing/x", "os/internals"):
+        assert _is_importable_std(importable), importable
+
+
+def test_go_list_std_probe_is_contained(monkeypatch):
+    """GO-2026-4984: with GOTOOLCHAIN=auto the target repo's go.mod can name a
+    toolchain that `go` downloads and EXECUTES. Pin it and run outside the repo."""
+    import subprocess
+
+    from harness.grounding.go import stdlib as go_stdlib
+
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        seen["env"] = kw.get("env")
+        seen["cwd"] = kw.get("cwd")
+        # `internal` as the FINAL segment must not survive the filter.
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="fmt\nlog/internal\nvendor/x/y\ncrypto/brandnew\n", stderr="")
+
+    monkeypatch.setattr(go_stdlib.subprocess, "run", fake_run)
+    go_stdlib.stdlib_packages.cache_clear()
+    try:
+        pkgs = go_stdlib.stdlib_packages()
+    finally:
+        go_stdlib.stdlib_packages.cache_clear()
+
+    assert seen["argv"] == ["go", "list", "std"]
+    assert seen["cwd"] is not None and seen["cwd"] not in ("", ".")
+    assert seen["env"]["GOTOOLCHAIN"] == "local"
+    assert seen["env"]["GOWORK"] == "off"
+    assert seen["env"]["GOFLAGS"] == "-mod=mod"
+    assert "PATH" in seen["env"]                       # inherits, not replaces
+    assert "crypto/brandnew" in pkgs                   # live output still merged
+    assert "log/internal" not in pkgs
+    assert "vendor/x/y" not in pkgs
 
 
 def test_detect_language():
@@ -116,7 +186,7 @@ import "example.com/myapp/util"
 func main() { util.Multiply(4, 5) }
 ''')
     assert not r.ok
-    v = [x for x in r.ungrounded if x.kind == "member"][0]
+    v = next(x for x in r.ungrounded if x.kind == "member")
     assert "Multiply" in v.message
 
 
@@ -199,7 +269,7 @@ import (
 ''')
     paths = {i.path for i in claims.imports}
     assert paths == {"fmt", "strings", "net/http", "embed"}
-    http = [i for i in claims.imports if i.path == "net/http"][0]
+    http = next(i for i in claims.imports if i.path == "net/http")
     assert http.alias == "alias"
 
 
@@ -402,3 +472,46 @@ def test_unexported_member_cross_package_is_ungrounded(tmp_path):
     report = _ground(root, code)
     assert not report.ok
     assert any("unexported" in v.message for v in report.verdicts)
+
+
+def test_outdated_toolchain_warns_but_still_merges_the_live_package_set(monkeypatch):
+    """The go floors (GO-2026-4984 & co.) are build-time RCE in `cmd/go`, and
+    harness runs `go` inside repos it does not own — but a stale toolchain is a
+    WARNING only: it must never cost the operator the live std package set."""
+    import logging
+    import subprocess
+
+    from harness import config
+    from harness.grounding.go import stdlib as go_stdlib
+
+    monkeypatch.setattr(config.shutil, "which", lambda b: f"/usr/bin/{b}")
+    monkeypatch.setattr(config, "_probe_version_text",
+                        lambda name, cli: "go version go1.26.0 linux/amd64")
+    monkeypatch.setattr(
+        go_stdlib.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 0, stdout="fmt\ncrypto/brandnew\n", stderr=""))
+    # Own sink on the harness logger: `harness.log.configure_logging` sets
+    # propagate=False on it, so caplog (a root-logger fixture) may see nothing
+    # depending on which other tests ran first.
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    sink = _Sink()
+    logging.getLogger("harness").addHandler(sink)
+    config.tool_version.cache_clear()
+    go_stdlib.stdlib_packages.cache_clear()
+    try:
+        pkgs = go_stdlib.stdlib_packages()
+    finally:
+        logging.getLogger("harness").removeHandler(sink)
+        go_stdlib.stdlib_packages.cache_clear()
+        config.tool_version.cache_clear()
+
+    # 1.26.0 is NEWER than the 1.25.10 floor yet misses the backports.
+    warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+    assert any("1.26.0" in m for m in warnings), warnings
+    assert "crypto/brandnew" in pkgs and "fmt" in pkgs

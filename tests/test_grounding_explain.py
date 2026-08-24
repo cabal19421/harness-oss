@@ -1,9 +1,19 @@
 """The --explain trace: every arity rule generated is recorded, fresh per run."""
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
+import pytest
+
 from harness.grounding import Preflight
+
+# z3 is an OPTIONAL extra (`pip install -e ".[z3]"`) — without it `solver="z3"`
+# degrades to the builtin backend by design, so a test that asserts the z3
+# backend was actually used has to skip, not fail. Same guard as
+# tests/test_grounding_z3.py and tests/test_grounding.py.
+z3_only = pytest.mark.skipif(importlib.util.find_spec("z3") is None,
+                             reason="z3 not installed")
 
 
 def _proj(tmp_path: Path, add_params: str) -> Path:
@@ -61,6 +71,7 @@ def test_trace_is_deterministic(tmp_path):
     assert runs[0] == runs[1] == runs[2]   # identical rules every run
 
 
+@z3_only
 def test_z3_and_builtin_agree_on_the_trace(tmp_path):
     proj = _proj(tmp_path, "a, b")
     tb: list = []

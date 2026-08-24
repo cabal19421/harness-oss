@@ -6,7 +6,7 @@ from pathlib import Path
 
 from harness.grounding import Preflight
 from harness.grounding.knowledge import KnowledgeBase
-from harness.pipeline import PipelineConfig, PipelineOrchestrator, store
+from harness.pipeline import PipelineConfig, PipelineOrchestrator
 from harness.pipeline.backends import register_backend
 from harness.pipeline.backends.base import CodingBackend, ImplementOutcome
 
@@ -73,9 +73,10 @@ class _InstantBackend(CodingBackend):
 
     def implement(self, ctx):
         (ctx.worktree / "out.txt").write_text(ctx.task.id + "\n")
-        subprocess.run(["git", "add", "-A"], cwd=ctx.worktree, capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=ctx.worktree, capture_output=True,
+                       check=False)
         subprocess.run(["git", "commit", "-q", "-m", ctx.task.id], cwd=ctx.worktree,
-                       capture_output=True)
+                       capture_output=True, check=False)
         return ImplementOutcome(status="implemented", iterations=1,
                                 oracle_passed=True, grounding_ok=True)
 
@@ -85,10 +86,11 @@ def _chain_repo(tmp_path):
     repo.mkdir()
     for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
                  ["config", "user.name", "t"]):
-        subprocess.run(["git", *args], cwd=repo, capture_output=True)
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, check=False)
     (repo / "README.md").write_text("# r\n")
-    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, check=False)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo,
+                   capture_output=True, check=False)
     (repo / "designs").mkdir()
     (repo / "designs" / "d.md").write_text(
         "# D\n## Tasks\n- [ ] task a (id: a)\n- [ ] task b (id: b) (depends: a)\n")
@@ -97,7 +99,7 @@ def _chain_repo(tmp_path):
 
 def test_explicit_task_waits_for_unfinished_dependency(tmp_path):
     repo = _chain_repo(tmp_path)
-    register_backend("instant-b5", lambda: _InstantBackend())
+    register_backend("instant-b5", _InstantBackend)
     cfg = PipelineConfig(repo=repo, designs_dir="designs", backend="instant-b5",
                          worktree_root=tmp_path / "wt", verify=False)
     orch = PipelineOrchestrator(cfg)
@@ -109,7 +111,7 @@ def test_explicit_task_waits_for_unfinished_dependency(tmp_path):
 
 def test_explicit_chain_drains_across_waves(tmp_path):
     repo = _chain_repo(tmp_path)
-    register_backend("instant-b5b", lambda: _InstantBackend())
+    register_backend("instant-b5b", _InstantBackend)
     cfg = PipelineConfig(repo=repo, designs_dir="designs", backend="instant-b5b",
                          worktree_root=tmp_path / "wt", verify=False)
     orch = PipelineOrchestrator(cfg)

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Parallel fan-out: one agent per independent task, each in its own git worktree so
-# they never touch the same working copy. The harness pipeline (harness/pipeline/)
-# productizes this with a managed worktree lifecycle; this is the raw version.
+# they never touch the same working copy.
 #
 # Usage:  ./orchestrate.sh        (edit the tasks array below first)
 
@@ -32,10 +31,10 @@ run_agent() {
   local id="$1" task="$2" wt="../wt-$id"
   git worktree add -q "$wt" -b "agent/$id" "$base"
   ( cd "$wt"
-    claude -p "$task
+    "${AGENT_CLI:-gemini}" -p "$task
 When done, run the full test suite. Commit ONLY if it is green." \
-      --allowedTools "Read,Edit,Bash(npm:*),Bash(git:*)" \
-      --permission-mode acceptEdits \
+      --allowed-tools "run_shell_command(npm),run_shell_command(git)" \
+      --approval-mode auto_edit \
       --output-format json > "../result-$id.json" )
 }
 

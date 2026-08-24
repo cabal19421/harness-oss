@@ -17,7 +17,6 @@ from __future__ import annotations
 import ast
 import builtins
 from dataclasses import dataclass, field
-from typing import Optional
 
 from harness.log import get_logger
 
@@ -35,7 +34,7 @@ _BUILTINS = set(dir(builtins)) | {
 @dataclass(frozen=True)
 class ImportClaim:
     owner_module: str          # e.g. "os.path"  (for `import a.b.c`, the full module)
-    member: Optional[str]      # e.g. "join"     (None for a plain `import x`)
+    member: str | None      # e.g. "join"     (None for a plain `import x`)
     lineno: int
 
 
@@ -43,7 +42,7 @@ class ImportClaim:
 class MemberClaim:
     path: str                  # full dotted access path, head substituted (e.g. "numpy.array")
     called: bool
-    argc: Optional[int]        # positional arg count, or None if it can't be counted
+    argc: int | None        # positional arg count, or None if it can't be counted
     has_kwargs: bool           # call passes keyword args (so a "too few positional" check is unsafe)
     lineno: int
     expr: str                  # human-readable source, e.g. "np.array(...)"
@@ -52,9 +51,9 @@ class MemberClaim:
 @dataclass(frozen=True)
 class LocalCallClaim:
     name: str
-    argc: Optional[int]
+    argc: int | None
     has_kwargs: bool
-    expected_arity: Optional[tuple[int, Optional[int]]]
+    expected_arity: tuple[int, int | None] | None
     lineno: int
 
 
@@ -64,12 +63,38 @@ class NameClaim:
     lineno: int
 
 
+@dataclass(frozen=True)
+class GuardClaim:
+    """One branch condition of an ``if``/``elif`` chain, kept as raw source text.
+
+    The text (not the AST node) is what the constraint solver consumes: it
+    re-parses it with its own restricted grammar, so the decidable subset lives
+    in exactly one place and the claim layer stays a plain fact carrier.
+    """
+
+    source: str        # e.g. "x < 0 and x > 10"
+    lineno: int        # the line of the `if` / `elif` keyword
+
+
+@dataclass(frozen=True)
+class GuardChainClaim:
+    """A whole ``if``/``elif`` chain: the branch guards, in evaluation order.
+
+    Order matters — branch *i* runs only when guard *i* holds and every earlier
+    guard failed, which is what makes a subsumed ``elif`` provably dead.
+    """
+
+    conditions: tuple[GuardClaim, ...]
+    lineno: int        # the chain head
+
+
 @dataclass
 class Claims:
     imports: list[ImportClaim] = field(default_factory=list)
     members: list[MemberClaim] = field(default_factory=list)
     local_calls: list[LocalCallClaim] = field(default_factory=list)
     names: list[NameClaim] = field(default_factory=list)
+    guard_chains: list[GuardChainClaim] = field(default_factory=list)
 
 
 def extract_claims(code: str) -> Claims:
@@ -78,11 +103,14 @@ def extract_claims(code: str) -> Claims:
     ex = _Extractor()
     ex.collect(tree)
     ex.reference(tree)
+    ex.guards(tree, code)
     logger.debug("extracted claims from %d-char source: imports=%d members=%d "
-                 "local_calls=%d names=%d (bound=%d, module aliases=%d, from-imports=%d)",
+                 "local_calls=%d names=%d guard_chains=%d (bound=%d, module aliases=%d, "
+                 "from-imports=%d)",
                  len(code), len(ex.claims.imports), len(ex.claims.members),
                  len(ex.claims.local_calls), len(ex.claims.names),
-                 len(ex.bound), len(ex.module_alias), len(ex.from_alias))
+                 len(ex.claims.guard_chains), len(ex.bound), len(ex.module_alias),
+                 len(ex.from_alias))
     return ex.claims
 
 
@@ -95,14 +123,14 @@ class _Extractor:
         self.module_alias: dict[str, str] = {}            # name -> dotted module (import .. as)
         self.from_alias: dict[str, tuple[str, str]] = {}  # name -> (owner_module, member)
         self.plain_roots: set[str] = set()                # `import a.b` binds root `a`
-        self.local_arity: dict[str, Optional[tuple[int, Optional[int]]]] = {}
+        self.local_arity: dict[str, tuple[int, int | None] | None] = {}
         self.local_classes: set[str] = set()              # locally-defined class names
         self._dup_defs: set[str] = set()
         self.assigned: set[str] = set()
 
     # -- pass A: collect bindings -------------------------------------------------
 
-    def collect(self, tree: ast.AST) -> None:
+    def collect(self, tree: ast.Module) -> None:
         # Only MODULE-LEVEL defs supply arity facts: a class method or a nested
         # function does not shadow module scope, so a bare-name call elsewhere
         # in the file targets the builtin/import/module def, not it. Recording
@@ -259,7 +287,7 @@ class _Extractor:
             self._ref_attribute(func, called=True, argc=argc, has_kwargs=has_kwargs)
 
     def _ref_attribute(self, node: ast.Attribute, *, called: bool,
-                       argc: Optional[int] = None, has_kwargs: bool = False) -> None:
+                       argc: int | None = None, has_kwargs: bool = False) -> None:
         path = self._substitute_head(_dotted(node))
         if path is None:
             return
@@ -272,7 +300,50 @@ class _Extractor:
             return
         self.claims.names.append(NameClaim(name, node.lineno))
 
-    def _substitute_head(self, dotted: Optional[str]) -> Optional[str]:
+    # -- pass C: branch guards ----------------------------------------------------
+
+    def guards(self, tree: ast.AST, source: str) -> None:
+        """Capture ``if``/``elif`` chains whose conditions are pure numeric guards.
+
+        Only the *shape* is filtered here — names, numeric literals, comparisons
+        and ``and``/``or``/``not``. Deciding what those guards imply is the
+        solver's job (:meth:`ConstraintSolver.analyze_guards`).
+
+        Conditions that call a function, touch an attribute, index a container or
+        test bare truthiness are skipped outright rather than surfaced as
+        ``unverified`` noise: they are not numeric constraints at all, so no
+        backend could ever decide them and reporting them would drown the signal.
+        """
+        # An `elif` is represented as an If nested in the parent's `orelse`; a
+        # hand-written `else:` + `if` block is the same evaluation order (the
+        # inner test is only reached when the outer one failed), so both join the
+        # chain and neither starts one of its own.
+        chained = {id(n.orelse[0]) for n in ast.walk(tree)
+                   if isinstance(n, ast.If) and len(n.orelse) == 1
+                   and isinstance(n.orelse[0], ast.If)}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If) or id(node) in chained:
+                continue
+            branches = _chain_branches(node)
+            tests = [test for test, _ in branches]
+            if not all(_is_guard_shaped(t) for t in tests):
+                logger.debug("skipping if-chain at L%d: not a numeric guard chain "
+                             "(no backend can constrain it)", node.lineno)
+                continue
+            if not any(isinstance(n, ast.Compare) for t in tests for n in ast.walk(t)):
+                # A chain of pure constants (`if False:` / `if 0:`) is a
+                # deliberate toggle — CPython's own stdlib uses `if False:` to
+                # hide type-checking-only imports — not a claim about program
+                # state. Nothing to constrain, so don't manufacture a verdict.
+                logger.debug("skipping constant-only if-chain at L%d (deliberate toggle)",
+                             node.lineno)
+                continue
+            self.claims.guard_chains.append(GuardChainClaim(
+                tuple(GuardClaim(_source_of(test, source), lineno)
+                      for test, lineno in branches),
+                node.lineno))
+
+    def _substitute_head(self, dotted: str | None) -> str | None:
         """Substitute the head of a dotted chain via the import map.
 
         Returns the fully-qualified path (e.g. ``st.session_state.messages`` →
@@ -298,7 +369,71 @@ class _Extractor:
         return ".".join([base, *rest]) if rest else base
 
 
-def _dotted(node: ast.AST) -> Optional[str]:
+# Comparison operators that state a numeric constraint. `is`/`in` are identity
+# and membership — not constraints any arithmetic solver can decide.
+_GUARD_CMP_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)
+
+
+def _chain_branches(head: ast.If) -> list[tuple[ast.expr, int]]:
+    """``(condition, lineno)`` for every branch of the chain starting at *head*.
+
+    The lineno is the ``if``/``elif`` keyword's, not the condition's, so a
+    finding points at the branch a reader would look for.
+    """
+    branches, cur = [], head
+    while True:
+        branches.append((cur.test, cur.lineno))
+        if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
+            cur = cur.orelse[0]
+        else:
+            return branches
+
+
+def _is_guard_shaped(node: ast.AST) -> bool:
+    """Is this condition built only from numeric comparisons and and/or/not?
+
+    A cheap structural pre-filter; the solver re-validates (and may still
+    abstain, e.g. on the NaN-sensitive ``x != x``) when it translates the text.
+    """
+    if isinstance(node, ast.BoolOp):
+        return all(_is_guard_shaped(v) for v in node.values)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _is_guard_shaped(node.operand)
+    if isinstance(node, ast.Compare):
+        return (all(isinstance(op, _GUARD_CMP_OPS) for op in node.ops)
+                and all(_is_guard_term(o) for o in [node.left, *node.comparators]))
+    # ``if False:`` / ``if 0:`` — a constant guard is the classic dead branch.
+    return isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float))
+
+
+def _is_guard_term(node: ast.AST) -> bool:
+    """A guard operand: a plain name or a (possibly signed) numeric literal."""
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        node = node.operand
+    return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool))
+
+
+def _source_of(node: ast.AST, source: str) -> str:
+    """The condition's source text — faithful, single-line, comment-free.
+
+    Prefers what the author actually wrote, but falls back to ``ast.unparse``
+    when the segment spans lines or carries a ``#``: flattening those to one
+    line can truncate the expression at the comment, and a guard the solver
+    reads differently from the code is far worse than a canonical rendering.
+    """
+    try:
+        seg = ast.get_source_segment(source, node)
+    except Exception:      # noqa: BLE001 - malformed offsets must not break extraction
+        seg = None
+    if seg and "#" not in seg and "\n" not in seg:
+        return seg.strip()
+    return ast.unparse(node)
+
+
+def _dotted(node: ast.AST) -> str | None:
     """Return the dotted-name string of a pure Name/Attribute chain, else None."""
     parts: list[str] = []
     cur = node
@@ -321,7 +456,7 @@ def _all_args(args: ast.arguments) -> list[str]:
     return names
 
 
-def _call_args(node: ast.Call) -> tuple[Optional[int], bool]:
+def _call_args(node: ast.Call) -> tuple[int | None, bool]:
     """Return ``(positional_argc, has_kwargs)``.
 
     ``positional_argc`` is ``None`` when ``*args`` spreads make it unknowable.

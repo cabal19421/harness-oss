@@ -3,17 +3,24 @@
 # Python standard library alone — no install of this file is required to use it.
 #
 # Optional Python packages (install to unlock a feature; see INSTALL.md):
-#   pip install -e ".[z3]"     # z3-accelerated grounding constraint solver
+#   pip install -e ".[z3]"     # SMT grounding: call-binding + guard-exclusivity checks
+#                              # (without it those abstain; arity still decided)
+#   pip install -e ".[proc]"   # psutil: terminate processes still running inside a
+#                              # worktree before removing it. Optional on Linux (there
+#                              # is a /proc fallback); on macOS/Windows it is the ONLY
+#                              # implementation — without it the sweep is a no-op.
 #   pip install -e ".[dev]"    # test toolchain (pytest)
 #
 # Optional external tools (install via your OS package manager / vendor):
 #   git      — required for the design-docs → PRs pipeline (worktrees, branches)
 #   gh       — `harness pipeline --pr github` (open real GitHub PRs)
 #   tmux     — `harness pipeline tmux` cockpit (run several features at once)
-#   claude   — the claude-code backend (unattended ralph loop); https://code.claude.com
+#   gemini   — Gemini CLI, the agent-cli backend's default binary (unattended ralph
+#              loop); https://github.com/google-gemini/gemini-cli
 #   go       — augments the Go grounding stdlib set via `go list std`
-#   node/npm — JS/TS repos the pipeline validates via an `npm test` oracle
+#   npm      — JS/TS repos the pipeline validates via an autodetected `npm test` oracle
 #
 # Run `harness status` to see which of the above are present on this machine.
 
 # z3-solver  # optional — or use:  pip install -e ".[z3]"
+# psutil     # optional — or use:  pip install -e ".[proc]"

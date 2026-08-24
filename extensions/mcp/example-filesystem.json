@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "filesystem": {
+      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-      "transport": "stdio"
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path/to/allowed/dir"]
     }
   }
 }

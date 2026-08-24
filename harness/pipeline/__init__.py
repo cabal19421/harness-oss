@@ -21,15 +21,21 @@ Public API::
     report = orch.run()         # ground → implement → review → PR
     print(report.render())
 
-Backends (``ide-handoff`` for editor-driven work in any IDE, ``claude-code`` /
-``openai`` / ``gemini`` for the unattended loop) are selected by name and
-pluggable via :func:`harness.pipeline.backends.register_backend`.
+The two backends (``ide-handoff`` for agentic IDEs like Google Antigravity or
+VSCodium/Copilot, ``agent-cli`` for the unattended loop) are selected by name
+and pluggable via :func:`harness.pipeline.backends.register_backend`.
 """
 
 from __future__ import annotations
 
 from .grounding_gate import GateResult, GroundingGate
-from .ingest import DesignDoc, discover_designs, parse_design, plan_from_designs, tasks_from_doc
+from .ingest import (
+    DesignDoc,
+    discover_designs,
+    parse_design,
+    plan_from_designs,
+    tasks_from_doc,
+)
 from .notes import RunLog
 from .orchestrator import PipelineOrchestrator, RunReport, TaskRun
 from .review import ReviewGate, ReviewResult
@@ -44,26 +50,26 @@ from .supervisor import Supervisor, TaskLiveness
 from .worktree import Worktree, WorktreeManager
 
 __all__ = [
+    "DesignDoc",
+    "GateResult",
+    "GroundingGate",
     "PipelineConfig",
     "PipelineOrchestrator",
-    "RunReport",
-    "TaskRun",
     "Plan",
-    "Task",
-    "RiskLevel",
-    "slugify",
-    "DesignDoc",
-    "plan_from_designs",
-    "parse_design",
-    "tasks_from_doc",
-    "discover_designs",
-    "GroundingGate",
-    "GateResult",
     "ReviewGate",
     "ReviewResult",
-    "WorktreeManager",
-    "Worktree",
-    "Supervisor",
-    "TaskLiveness",
+    "RiskLevel",
     "RunLog",
+    "RunReport",
+    "Supervisor",
+    "Task",
+    "TaskLiveness",
+    "TaskRun",
+    "Worktree",
+    "WorktreeManager",
+    "discover_designs",
+    "parse_design",
+    "plan_from_designs",
+    "slugify",
+    "tasks_from_doc",
 ]

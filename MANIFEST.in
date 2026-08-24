@@ -1,7 +1,5 @@
 include README.md
-include LICENSE
 include requirements.txt
-include INSTALL.md PIPELINE.md ARCHITECTURE.md EXTENSIONS.md LOGGING.md CONTRIBUTING.md
 
 global-exclude *.pyc *.pyo *.bak *.tmp *.lock
 prune **/__pycache__

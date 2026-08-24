@@ -7,7 +7,7 @@ orchestration with harness's grounding gate:
         → ingest + plan            (deterministic markdown decomposition)
         → per task, in an isolated worktree:
               preflight grounding   (advisory: ground the design's code)
-              → implement           (claude-code ralph loop  |  ide-handoff packet)
+              → implement           (agent-cli ralph loop  |  ide-handoff packet)
               → review gate         (validate + ground changes + assign risk)
               → open PR             (--pr local | --pr github)
         → persist plan + return a run report
@@ -22,14 +22,16 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import cast
 
+from harness.grounding import Z3Unavailable
 from harness.log import get_logger, log_context, redact, step, trunc
 
-from . import gitutil, store
+from . import gitutil, nosleep, shutdown, store, worktree
 from .backends import get_backend
 from .backends.base import ImplementContext
 from .grounding_gate import GroundingGate
@@ -39,7 +41,7 @@ from .review import ReviewGate, ReviewResult
 from .spec import PipelineConfig, Plan, Task
 from .supervisor import Supervisor
 from .trace import Tracer, new_run_id
-from .worktree import WorktreeManager
+from .worktree import WorktreeInUse, WorktreeManager
 
 Logger = Callable[[str], None]
 
@@ -82,7 +84,7 @@ class RunReport:
 class PipelineOrchestrator:
     """Owns one repo's plan and drives tasks through the loop."""
 
-    def __init__(self, config: PipelineConfig, *, log: Optional[Logger] = None) -> None:
+    def __init__(self, config: PipelineConfig, *, log: Logger | None = None) -> None:
         self.config = config
         self.log: Logger = log or (lambda _m: None)
         self._git_lock = threading.Lock()      # serialises repo-level git mutations
@@ -97,13 +99,25 @@ class PipelineOrchestrator:
                 config.base_branch = "main"
                 logger.debug("base branch not configured and %s is not a git repo — "
                              "defaulting to 'main'", config.repo)
-        self._wt = WorktreeManager(config.repo, config.worktree_root, config.base_branch)
+        # worktree_root is Optional only pre-construction: PipelineConfig's
+        # __post_init__ always derives a default, so it is a Path by the time a
+        # config reaches the orchestrator. cast, not assert: no new crash path.
+        self._wt = WorktreeManager(config.repo, cast("Path", config.worktree_root),
+                                   config.base_branch)
         self._tracer = Tracer(config.state_dir, run_id=new_run_id(),
                               enabled=config.trace)
         logger.debug("orchestrator ready: repo=%s, backend=%s, base_branch=%s, "
                      "run_id=%s, trace=%s",
                      config.repo, config.backend, config.base_branch,
                      self._tracer.run_id, config.trace)
+        if config.validation_baseline:
+            # Never silent: this changes what "the gate passed" means for every
+            # task in the run.
+            logger.warning("validation_baseline is ON — every task runs its oracle "
+                           "against the diff base first, and a command already failing "
+                           "there will NOT fail the gate. This costs a second full "
+                           "validation run per task and can hide a pre-existing failure "
+                           "a reviewer would want to see.")
 
     # ── plan phase ────────────────────────────────────────────────────────────
 
@@ -117,6 +131,14 @@ class PipelineOrchestrator:
             self.config.repo, self.config.designs_dir,
             default_validation=self.config.default_validation(),
         )
+        # Pin the versions of the tools that oracle actually runs. A verdict flip
+        # caused by a tool upgrade (mypy 2.0's default flips, pytest's config
+        # precedence changes) is otherwise indistinguishable from a genuine
+        # regression in an agent's diff.
+        fresh.tool_versions = dict(getattr(self.config, "tool_versions", {}) or {})
+        if fresh.tool_versions:
+            logger.debug("plan: oracle tool versions %s",
+                         ", ".join(f"{k}={v}" for k, v in sorted(fresh.tool_versions.items())))
         # The whole read-merge-write runs under the plan-file lock (the same one
         # save_merged uses), so a concurrent per-task process's locked merge
         # can't land between our read and our write and be clobbered.
@@ -175,7 +197,8 @@ class PipelineOrchestrator:
             sup.recover(plan)
         return sup.render(plan)
 
-    def prune(self, *, force: bool = False) -> dict[str, list[str]]:
+    def prune(self, *, allow_dirty: bool = False, allow_unlanded: bool = False,
+              force: bool | None = None) -> dict[str, list[str]]:
         """Reclaim finished tasks' worktrees, then delete merged ``agent/*`` branches.
 
         Removing a *done* task's worktree first is what makes ``prune_merged``
@@ -184,32 +207,146 @@ class PipelineOrchestrator:
         forever and worktrees leaked disk unboundedly across nightly runs. Only
         tasks the plan records as ``done`` (reviewed, PR opened, work committed)
         are reclaimed — anything mid-flight keeps its worktree.
+
+        A second pass **reconciles the directories** git actually has registered
+        under ``worktree_root`` against the plan: a worktree whose task was
+        dropped from the designs, renamed, or whose plan JSON was lost (see
+        ``store.load_plan``'s ``.json.corrupt`` path) is invisible to the
+        plan-driven sweep above and would leak disk forever while pinning its
+        branch as ``kept_active``. Registered-but-unplanned worktrees are
+        reclaimed under the same gates: **landed**, **clean** and **idle**.
+
+        Nothing is bulldozed. A worktree that is dirty, in use, or unlanded is
+        reported in ``worktrees_skipped`` with its reason and left where it is;
+        ``allow_dirty`` / ``allow_unlanded`` are the two separate opt-ins that
+        override those refusals (``force`` is a deprecated alias for both).
         """
+        if force is not None:
+            logger.debug("prune(force=%s) is deprecated — mapping it to "
+                         "allow_dirty=%s, allow_unlanded=%s", force, force, force)
+            allow_dirty = allow_dirty or bool(force)
+            allow_unlanded = allow_unlanded or bool(force)
+        in_use = (worktree.IN_USE_KILL if self.config.kill_worktree_procs
+                  else worktree.IN_USE_REFUSE)
         plan = self.load_or_plan()
         removed: list[str] = []
+        skipped: list[str] = []
+
+        def _reclaim(task_id: str, wt: Path, why: str) -> None:
+            try:
+                self._wt.remove(task_id, allow_dirty=allow_dirty,
+                                allow_unlanded=allow_unlanded, in_use=in_use)
+            except WorktreeInUse as exc:
+                # Refuse-and-report: a deliberate no-op, not a failure.
+                logger.info("prune: keeping worktree %s (%s) — %s: %s",
+                            wt, why, exc.reason, exc)
+                self._tracer.for_task(task_id).span(
+                    "prune", action="skip", path=str(wt), reason=exc.reason, why=why)
+                skipped.append(f"{wt} ({exc.reason})")
+                self.log(f"  ⏭️  keeping worktree {wt} — {exc.reason}")
+            except Exception as exc:  # noqa: BLE001 - keep pruning the rest
+                # Swallowed so the rest of the prune proceeds; this worktree
+                # stays on disk and keeps its branch pinned (never pruned).
+                logger.warning("prune: could not remove worktree %s (%s): %s: %s "
+                               "— it stays on disk and pins its branch",
+                               wt, why, type(exc).__name__, exc)
+                self._tracer.for_task(task_id).span(
+                    "prune", action="error", path=str(wt),
+                    reason=type(exc).__name__, why=why)
+                skipped.append(f"{wt} ({type(exc).__name__}: {exc})")
+                self.log(f"  ⚠️  could not remove worktree {wt}: {exc}")
+            else:
+                removed.append(str(wt))
+                logger.debug("prune: removed worktree %s (%s)", wt, why)
+                self._tracer.for_task(task_id).span(
+                    "prune", action="remove", path=str(wt), why=why)
+
         for task in plan.by_status("done"):
             wt = self._wt.path_for(task.id)
             if not wt.is_dir():
                 continue
-            try:
-                self._wt.remove(task.id, kill_processes=self.config.kill_worktree_procs)
-                removed.append(str(wt))
-                logger.debug("prune: removed worktree %s of done task %s", wt, task.id)
-            except Exception as exc:  # noqa: BLE001 - keep pruning the rest
-                # Swallowed so the rest of the prune proceeds; this worktree
-                # stays on disk and keeps its branch pinned (never pruned).
-                logger.warning("prune: could not remove worktree %s of done task %s: "
-                               "%s: %s — it stays on disk and pins its branch",
-                               wt, task.id, type(exc).__name__, exc)
-                self.log(f"  ⚠️  could not remove worktree for done task {task.id}: {exc}")
-        out = self._wt.prune_merged(force=force)
+            _reclaim(task.id, wt, "done task")
+
+        # Reconcile the registered directories against the plan.
+        planned = {self._wt.path_for(t.id).resolve() for t in plan.tasks}
+        for wt in self._wt.list_registered():
+            if wt in planned:
+                continue                      # the plan owns it (mid-flight or handled above)
+            task_id = self._wt.task_id_for(wt)
+            if task_id is None:
+                logger.info("prune: leaving registered worktree %s alone — its "
+                            "directory name is not a pipeline `wt-<task-id>` "
+                            "(not ours to reclaim)", wt)
+                skipped.append(f"{wt} (not a pipeline worktree)")
+                continue
+            if not allow_unlanded and not self._wt.is_landed(task_id):
+                logger.info("prune: keeping unplanned worktree %s — branch %s has "
+                            "not landed in %s (allow_unlanded reclaims it anyway)",
+                            wt, self._wt.branch_for(task_id), self._wt.base)
+                self._tracer.for_task(task_id).span(
+                    "prune", action="skip", path=str(wt), reason="unlanded",
+                    why="unplanned worktree")
+                skipped.append(f"{wt} (unlanded)")
+                continue
+            logger.warning("prune: worktree %s is registered but its task %s is "
+                           "not in the plan — its branch has landed, so reclaiming "
+                           "it if it is also clean and idle", wt, task_id)
+            _reclaim(task_id, wt, "unplanned worktree")
+
+        out = self._wt.prune_merged(allow_unlanded=allow_unlanded)
         if removed:
             out["worktrees_removed"] = removed
+        if skipped:
+            out["worktrees_skipped"] = skipped
         return out
 
     # ── run phase ─────────────────────────────────────────────────────────────
 
-    def run(self, *, task_ids: Optional[list[str]] = None, open_pr: bool = True) -> RunReport:
+    def run(self, *, task_ids: list[str] | None = None, open_pr: bool = True) -> RunReport:
+        """Drain the ready set, keeping the host awake and Ctrl-C survivable.
+
+        Two run-wide context managers wrap the whole thing:
+
+        * :func:`harness.pipeline.shutdown.guard` — a signal must terminate the
+          *agents* (they are detached, so Ctrl-C never reaches them on its own)
+          and stop the wave loop deliberately, instead of killing this process
+          and leaving them editing worktrees. It nests with each backend's guard.
+        * :func:`harness.pipeline.nosleep.prevent_sleep` — a laptop that suspends
+          mid-iteration loses the night *and* reads downstream as a stalled
+          heartbeat, which can trip the ``worktree_stale_seconds`` recovery path
+          against a healthy run. Best-effort; never blocks a run.
+
+        Before either of those, the run takes the state dir's
+        :class:`~harness.pipeline.store.RunLock` for its whole lifetime — a
+        plan-wide run exclusively, a ``--task``-scoped run shared (the tmux
+        cockpit runs several of those at once by design; their plan writes
+        already merge under ``save_merged``'s file lock). A second conflicting
+        run on the same state dir would interleave plan mutations and re-plan
+        under this one — the concurrent-save clobber class — so it fails fast
+        instead. The flock dies with its holder, so a stale lock file refuses
+        nobody; there is deliberately no bypass flag.
+        """
+        run_lock = store.RunLock(self.config.state_dir)
+        if not run_lock.acquire(exclusive=not task_ids):
+            detail = (f"another `harness pipeline` run is live on "
+                      f"{self.config.state_dir} (run.lock is flock-held by a "
+                      "live process) — a second run would interleave plan "
+                      "mutations and re-plan under it; wait for that run to "
+                      "finish, or stop it, then retry")
+            logger.error("run refused: %s", detail)
+            self.log(f"⛔ {detail}")
+            self._tracer.span("run_end", ok=False,
+                              reason="run.lock held by a live process")
+            report = RunReport(plan_file=str(self.config.plan_file))
+            report.add(TaskRun("(run-lock)", "locked", detail=detail))
+            return report
+        try:
+            with shutdown.guard(), nosleep.prevent_sleep(self.config.prevent_sleep):
+                return self._run(task_ids=task_ids, open_pr=open_pr)
+        finally:
+            run_lock.release()
+
+    def _run(self, *, task_ids: list[str] | None = None, open_pr: bool = True) -> RunReport:
         t0 = time.monotonic()
         with log_context(run_id=self._tracer.run_id):
             plan = self.load_or_plan()
@@ -234,6 +371,25 @@ class PipelineOrchestrator:
                 self._tracer.span("run_end", ok=False, reason=f"backend unavailable: {reason}")
                 report = RunReport(plan_file=str(self.config.plan_file))
                 report.add(TaskRun("(backend)", "unavailable", detail=reason))
+                return report
+
+            # Same shape as the backend check, and for the same reason: a run
+            # that CANNOT satisfy --require-z3 must say so once, before any task
+            # spends LLM budget on an implementation pass whose grounding oracle
+            # is going to raise. Without this the first failure surfaces per task
+            # as a generic "unexpected orchestrator error".
+            # The flag is passed exactly as the per-task gate passes it
+            # (ImplementContext.gate) — an explicit False in the config pins the
+            # requirement off there, so it must not abort the run here either.
+            try:
+                GroundingGate(self.config.repo, require_z3=self.config.require_z3)
+            except Z3Unavailable as exc:
+                logger.error("grounding solver unavailable: %s — aborting run "
+                             "before any task", exc)
+                self.log(f"⚠️  grounding solver unavailable: {exc}")
+                self._tracer.span("run_end", ok=False, reason=f"z3 required: {exc}")
+                report = RunReport(plan_file=str(self.config.plan_file))
+                report.add(TaskRun("(grounding)", "unavailable", detail=str(exc)))
                 return report
 
             report = RunReport(plan_file=str(self.config.plan_file))
@@ -267,6 +423,15 @@ class PipelineOrchestrator:
                             wave, len(batch), ", ".join(t.id for t in batch))
                 self._run_batch(plan, batch, backend, open_pr, report)
                 self._save(plan)
+                if shutdown.requested():
+                    # A wave is the natural stopping point: every task in it has
+                    # already been recorded, and the ones never started stay
+                    # `pending` for the next run.
+                    logger.warning("shutdown requested (%s) — not starting "
+                                   "another wave", shutdown.signame())
+                    self.log(f"⏹ interrupted by {shutdown.signame()} — stopping "
+                             "after this wave; untouched tasks stay pending")
+                    break
 
             if task_ids:
                 # An explicitly-requested task that never became ready (its
@@ -277,7 +442,7 @@ class PipelineOrchestrator:
                     t = plan.get(tid)
                     if t is not None and tid not in ran and t.status == "pending":
                         unmet = [d for d in t.depends_on
-                                 if plan.get(d) is not None and plan.get(d).status != "done"]
+                                 if (dep := plan.get(d)) is not None and dep.status != "done"]
                         detail = ("waiting on dependencies: " + ", ".join(unmet)
                                   if unmet else "never became ready")
                         logger.warning("requested task %s did not run — %s", tid, detail)
@@ -287,8 +452,10 @@ class PipelineOrchestrator:
                 self._report_stall(plan)
             self._save(plan)
             self._tracer.span("run_end", ok=all(
-                r.status not in ("failed", "blocked", "error", "waiting-dependency")
+                r.status not in ("failed", "blocked", "error", "waiting-dependency",
+                                 "interrupted")
                 for r in report.runs),
+                interrupted=shutdown.requested(),
                 outcomes={r.task_id: r.status for r in report.runs})
             counts = Counter(r.status for r in report.runs)
             logger.info("run end: %d task(s) attempted in %.1fs — %s",
@@ -305,6 +472,11 @@ class PipelineOrchestrator:
                      self.config.parallel)
         if parallelism == 1:
             for task in batch:
+                if shutdown.requested():
+                    logger.warning("shutdown requested — %d task(s) of this batch "
+                                   "were never started and stay pending",
+                                   len(batch) - batch.index(task))
+                    break
                 report.add(self._run_one(plan, task, backend, open_pr))
                 self._save(plan)
         else:
@@ -348,13 +520,161 @@ class PipelineOrchestrator:
             self.log(f"⚠️  {len(pending)} task(s) pending but none are ready "
                      "(check their dependencies).")
 
+    def requeue(self, task_ids: list[str], *, reset_attempts: bool = False,
+                force: bool = False) -> dict[str, str]:
+        """Return task(s) to ``pending`` so the next run picks them up.
+
+        Returns ``{task_id: outcome}`` where outcome is one of ``requeued``,
+        ``already-pending``, ``unknown``, ``claimed``, ``refused-done`` or
+        ``refused-in-flight``.
+
+        ``awaiting-human`` (set by an abstention) and ``blocked`` (attempt budget
+        exhausted) are in NEITHER branch of :meth:`_select_tasks`, so nothing ever
+        re-selects them — which is why tasks had to be recovered by hand-editing
+        ``pipeline.json``. ``pipeline complete`` is not a substitute: it goes
+        straight to the review gate and can mark a task ``done`` without the work
+        ever being performed.
+
+        Deliberately conservative: ``done`` is refused without *force* so a
+        requeue can never silently discard a recorded PR, in-flight statuses are
+        refused because a plain ``pipeline run`` already resumes them, and a task
+        a live process holds is refused outright. Never touches a worktree, a
+        branch or a claim — only status/attempts, so the requeued task resumes
+        through the ordinary ``pending`` → :meth:`Plan.ready` path.
+        """
+        out: dict[str, str] = {}
+        # Same locked read-modify-write shape plan() uses. NOTE: store.plan_lock
+        # and store.save_merged take the SAME lock file, so nesting them would
+        # self-deadlock on a second fd — hence plan_lock + load_plan + mutate +
+        # save_plan, exactly as plan() does.
+        #
+        # …which is exactly why the no-plan-file fallback is built HERE, OUTSIDE
+        # the lock: self.plan() takes the same plan_lock, and `fcntl.flock` is
+        # per open-file-description, so a second acquisition from this very
+        # process blocks forever. Calling it inside the `with` below hung
+        # `pipeline requeue` on any repo that has no `pipeline.json` yet (fresh
+        # clone, pruned state dir) — a silent hang, not an error. plan() releases
+        # its own lock before returning, so this is safe.
+        fallback = None if store.load_plan(self.config) else self.plan(persist=False)
+        with store.plan_lock(self.config):
+            # Re-read under the lock (the probe above is unsynchronised); the
+            # fallback is used only if there is still nothing on disk.
+            plan = store.load_plan(self.config) or fallback
+            if plan is None:                  # plan file vanished between the two
+                for tid in task_ids:
+                    out[tid] = "unknown"
+                logger.warning("requeue: no plan at %s — nothing to requeue (run "
+                               "`pipeline plan` first)", self.config.plan_file)
+                self.log("⚠️  requeue: no plan file — run `pipeline plan` first")
+                return out
+            changed = False
+            for tid in task_ids:
+                t = plan.get(tid)
+                if t is None:
+                    out[tid] = "unknown"
+                    logger.warning("requeue: no task %r in the plan — nothing to "
+                                   "requeue", tid)
+                    self.log(f"⚠️  requeue: unknown task '{tid}'")
+                    continue
+                if TaskClaim.held_elsewhere(self.config.state_dir, tid):
+                    out[tid] = "claimed"
+                    logger.warning("requeue: task %s is claimed by a live process — "
+                                   "refusing (a status flip under a running agent "
+                                   "corrupts its worktree)", tid)
+                    self.log(f"⚠️  requeue: '{tid}' is claimed by a live process")
+                    continue
+                if t.status == "pending":
+                    # An already-pending task still honours --reset-attempts: an
+                    # operator who requeued without it, saw the "the cap will
+                    # re-park this" warning, and ran it again must not be told
+                    # "already-pending" and left with the budget still exhausted.
+                    if reset_attempts and t.attempts:
+                        was_att = t.attempts
+                        t.attempts = 0
+                        t.touch(note="attempts reset by `pipeline requeue "
+                                     "--reset-attempts` (already pending)")
+                        changed = True
+                        logger.info("requeue: task %s was already pending — attempts "
+                                    "%d -> 0", tid, was_att)
+                        self.log(f"↺ {tid}: already pending (attempts {was_att} → 0)")
+                        out[tid] = "attempts-reset"
+                        continue
+                    out[tid] = "already-pending"
+                    logger.debug("requeue: task %s is already pending — no change", tid)
+                    continue
+                if t.status == "done" and not force:
+                    out[tid] = "refused-done"
+                    logger.warning("requeue: task %s is 'done' (pr=%s) — refusing "
+                                   "without force; a requeue must not discard a "
+                                   "recorded result", tid, t.pr_url or "(none)")
+                    self.log(f"⚠️  requeue: '{tid}' is done (pr={t.pr_url or 'none'}) "
+                             f"— pass --force to requeue it anyway")
+                    continue
+                if t.status in ("implementing", "review") and not force:
+                    out[tid] = "refused-in-flight"
+                    logger.warning("requeue: task %s is %r and is already resumable "
+                                   "by a plain `pipeline run` — refusing without "
+                                   "force", tid, t.status)
+                    self.log(f"⚠️  requeue: '{tid}' is {t.status} — already resumable "
+                             f"by `pipeline run`; pass --force to override")
+                    continue
+                was, was_att = t.status, t.attempts
+                if reset_attempts:
+                    t.attempts = 0
+                t.touch("pending",
+                        note=f"requeued from '{was}' by `pipeline requeue`"
+                             + (" (attempts reset)" if reset_attempts else ""))
+                changed = True
+                cap = self.config.max_task_attempts
+                # Not decorative: requeueing a `blocked` task without resetting
+                # leaves attempts over the cap, so the budget re-parks it at
+                # `blocked` on the very next run.
+                capped = bool(cap and not reset_attempts and t.attempts >= cap)
+                logger.info("requeue: task %s %s -> pending (attempts %d -> %d; "
+                            "branch %s and worktree %s left intact)%s",
+                            tid, was, was_att, t.attempts, t.branch or "(none)",
+                            t.worktree or "(none)",
+                            (f" — WARNING: attempts {t.attempts} is at/over the cap "
+                             f"of {cap}, so the attempt budget will re-park this "
+                             f"task immediately; pass --reset-attempts" if capped
+                             else ""))
+                if reset_attempts:
+                    tail = f" (attempts {was_att} → 0)"
+                else:
+                    tail = f" (attempts stay at {t.attempts}"
+                    if capped:
+                        tail += (f" — at/over the cap of {cap}, so the budget will "
+                                 f"re-park it; pass --reset-attempts")
+                    tail += ")"
+                self.log(f"↺ {tid}: {was} → pending{tail}")
+                out[tid] = "requeued"
+            if changed:
+                store.save_plan(self.config, plan)
+            else:
+                logger.debug("requeue: nothing changed — plan file left untouched")
+        return out
+
     def complete(self, task_id: str, *, open_pr: bool = True) -> TaskRun:
         """Finish an ``awaiting-human`` task: re-ground, review, open the PR.
 
         Also accepts the mid-flight resume states ``review``/``failed``; any
         other state (notably ``done``) is a no-op, so re-running ``complete`` on
         a finished task can't silently demote it or lose its recorded PR.
+
+        Wrapped in the same two run-wide context managers as :meth:`run`, for
+        the same two reasons: the review gate spawns a *detached* verifier agent
+        (:meth:`_verifier_ask_structured` → ``ask_oneshot_structured``, which
+        registers it with :func:`~harness.pipeline.shutdown.killable`), and that
+        registration is inert without a guard on the stack — Ctrl-C would kill
+        this process and leave a billing agent behind. The gate also runs the
+        task's full validation suite while holding a ``TaskClaim`` and beating a
+        heartbeat, which is exactly the state a mid-flight host suspend
+        corrupts, so it holds the sleep inhibitor too.
         """
+        with shutdown.guard(), nosleep.prevent_sleep(self.config.prevent_sleep):
+            return self._complete(task_id, open_pr=open_pr)
+
+    def _complete(self, task_id: str, *, open_pr: bool = True) -> TaskRun:
         with log_context(run_id=self._tracer.run_id, task_id=task_id):
             plan = self.load_or_plan()
             task = plan.get(task_id)
@@ -407,6 +727,15 @@ class PipelineOrchestrator:
             # check-then-act gap of heartbeat heuristics — and covering the
             # explicit `run --task <id>` path, which used to bypass them
             # entirely and launch a second agent in the same worktree.
+            if shutdown.requested():
+                # Dispatched before the signal, reached after it: starting the
+                # agent now would only be interrupted, and the attempt budget
+                # would be charged for work that never ran.
+                logger.info("task %s: not started — run interrupted by %s",
+                            task.id, shutdown.signame())
+                return TaskRun(task.id, "interrupted", risk=task.risk,
+                               detail=f"not started — run interrupted by "
+                                      f"{shutdown.signame()}")
             claim = TaskClaim(self.config.state_dir, task.id)
             if not claim.acquire():
                 logger.warning("task %s: claimed by another live process — not "
@@ -417,11 +746,11 @@ class PipelineOrchestrator:
                                       "not starting a second agent in its worktree")
             try:
                 return self._run_one_inner(plan, task, backend, open_pr)
-            except Exception as exc:  # noqa: BLE001 - one task must never kill the fleet
+            except Exception as exc:
                 # Swallowed so sibling tasks keep running; this task is marked
                 # failed and the exception surfaces only in the run report.
-                logger.error("task %s: unexpected orchestrator error — marking failed: %s: %s",
-                             task.id, type(exc).__name__, exc, exc_info=True)
+                logger.exception("task %s: unexpected orchestrator error — marking failed: %s: %s",
+                                 task.id, type(exc).__name__, exc)
                 with self._state_lock:
                     task.touch("failed", note=f"orchestrator error: {exc}")
                 return TaskRun(task.id, "failed", detail=f"unexpected error: {exc}")
@@ -453,7 +782,12 @@ class PipelineOrchestrator:
         #    worktree so the agent builds ON its dependencies instead of
         #    re-creating their types — the fix for cross-branch divergence.
         with self._git_lock:
-            wt = self._wt.ensure(task.id)
+            wt = self._wt.ensure(
+                task.id,
+                reset_on_reuse=self.config.reset_worktree_on_reuse,
+                in_use=(worktree.IN_USE_KILL if self.config.kill_worktree_procs
+                        else worktree.IN_USE_REFUSE),
+            )
             seed_ref = self._seed_dependencies(task, wt, plan)
         logger.debug("task %s: worktree ready at %s (branch %s), diff base %s",
                      task.id, wt.path, wt.branch, seed_ref)
@@ -467,17 +801,18 @@ class PipelineOrchestrator:
             else:
                 # Cross-run attempt budget: park a task that keeps failing at the
                 # terminal `blocked` status instead of retrying forever under an
-                # outer overnight loop (reset status/attempts by hand to retry).
+                # outer overnight loop (`pipeline requeue <id> --reset-attempts` to retry).
                 task.attempts += 1
                 cap = self.config.max_task_attempts
                 if cap and task.attempts > cap:
                     logger.warning("task %s: attempt budget exhausted (%d attempt(s), "
-                                   "cap %d) — parking at terminal 'blocked'; reset "
-                                   "status/attempts by hand to retry",
-                                   task.id, task.attempts, cap)
+                                   "cap %d) — parking at terminal 'blocked'; run "
+                                   "`pipeline requeue %s --reset-attempts` to retry",
+                                   task.id, task.attempts, cap, task.id)
                     task.touch("blocked",
                                note=f"attempt budget exhausted ({cap} implement cycles) — "
-                                    "inspect .harness/runs notes, then reset status to retry")
+                                    "inspect .harness/runs notes, then "
+                                    "`pipeline requeue` --reset-attempts to retry")
                     self._tracer.for_task(task.id).span(
                         "task_status", status="blocked",
                         reason=f"attempt budget exhausted ({cap} cycles)")
@@ -501,7 +836,8 @@ class PipelineOrchestrator:
                                    "terminal 'blocked'", task.id, task.attempts, cap)
                     task.touch("blocked",
                                note=f"attempt budget exhausted ({cap} cycles, review/PR "
-                                    "kept failing) — fix the PR step, then reset status")
+                                    "kept failing) — fix the PR step, then "
+                                    "`pipeline requeue --reset-attempts`")
                     self._tracer.for_task(task.id).span(
                         "task_status", status="blocked",
                         reason=f"attempt budget exhausted ({cap} cycles) in review resume")
@@ -535,7 +871,7 @@ class PipelineOrchestrator:
                      f"design-provided validation command(s) (untrusted mode): "
                      f"{', '.join(ctx.rejected_validation)[:160]}")
 
-        # 2. Implement (claude-code loop or ide-handoff packet).
+        # 2. Implement (agent-cli loop or ide-handoff packet).
         t_start = self._tracer.timed()
         with step(logger, "implement", task=task.id, backend=backend.name,
                   max_iters=self.config.max_iters):
@@ -597,16 +933,35 @@ class PipelineOrchestrator:
         yields the full transitive closure.
 
         Returns the worktree HEAD after seeding — the point the task's own work is
-        measured from (``ImplementContext.diff_base``). Idempotent: a task already
-        seeded in a prior run keeps its recorded ``start_ref`` and is not
-        re-merged. Best-effort: a dependency that will not merge cleanly is
-        aborted and skipped with a warning rather than failing the whole task.
+        measured from (``ImplementContext.diff_base``). Best-effort: a dependency
+        that will not merge cleanly is aborted and skipped with a warning rather
+        than failing the whole task.
+
+        Idempotent on ANCESTRY, not on the existence of a recorded base. Keying the
+        skip on ``task.start_ref`` being set (as this used to) meant a design doc
+        amended between attempts to ADD dependencies left every later attempt in a
+        tree that never merged them, while the plan and the prompt both claimed
+        they were there — ``start_ref`` is written on every run, and ``plan()``
+        preserves it while refreshing ``depends_on``. The same early return also
+        hid a dependency that merely completed *after* the first seed.
+
+        Maintains this invariant, which ``diff_base`` and everything downstream of
+        it (``changed_files``, grounding, the verifier diff, mutation targets,
+        ``commits_ahead``, ``discard_changes``) assume: *the returned ref contains
+        every completed dependency and none of the task's own work.* The one
+        exception is the loud fallback in case C, which is a documented superset.
         """
-        if task.start_ref:
-            logger.debug("task %s: already seeded in a prior run (start_ref %s) — "
-                         "not re-merging dependencies", task.id, task.start_ref)
-            return task.start_ref            # already seeded (resume) — don't re-merge
         repo = self.config.repo
+        prior = task.start_ref
+        # A recorded base that no longer resolves (worktree or branch recreated,
+        # objects gone) is not a base — treat this as a first seed.
+        if prior and not gitutil.ref_exists(wt.path, prior):
+            logger.warning("task %s: recorded start_ref %s no longer resolves in %s "
+                           "— re-seeding from scratch", task.id, prior, wt.path)
+            prior = ""
+
+        wanted: list[tuple[str, str]] = []    # (dep_id, branch) — all completed deps
+        missing: list[tuple[str, str]] = []   # …those not yet ancestors of HEAD
         for dep_id in task.depends_on:
             dep = plan.get(dep_id)
             if dep is None or dep.status != "done":
@@ -614,15 +969,129 @@ class PipelineOrchestrator:
                              task.id, dep_id,
                              "not in plan" if dep is None else "status=" + dep.status)
                 continue
-            branch = self._wt.branch_for(dep_id)
+            # The dep record's branch field is authoritative when set: a task can
+            # land on a non-conventional branch name (observed in production:
+            # 'agent/gx-operator-register-open'), and deriving `agent/<task-id>`
+            # here skipped that done dep — its work never reached this worktree.
+            branch = dep.branch or self._wt.branch_for(dep_id)
             if not gitutil.git(["rev-parse", "--verify", branch], cwd=repo).ok:
-                logger.debug("task %s: dependency %s is done but branch %r does not "
-                             "exist — nothing to seed", task.id, dep_id, branch)
+                # A dep branch that was pruned or rewritten away must not crash
+                # and must not look silently satisfied. Always a WARNING, even on
+                # a first seed: the debug-level skip left no trace and the agent
+                # re-hit the exact problem the dependency had already fixed.
+                logger.warning(
+                    "task %s: dependency %s is done but branch %r does not exist "
+                    "— cannot seed it", task.id, dep_id, branch)
                 continue
-            if gitutil.git(["merge-base", "--is-ancestor", branch, "HEAD"], cwd=wt.path).ok:
-                logger.debug("task %s: worktree already contains dependency %s "
-                             "(branch %r is an ancestor of HEAD)", task.id, dep_id, branch)
-                continue                     # worktree already contains this dependency
+            wanted.append((dep_id, branch))
+            if not gitutil.is_ancestor(wt.path, branch, "HEAD"):
+                missing.append((dep_id, branch))
+
+        # CASE A — nothing new to merge. This is the optimisation the old guard
+        # existed for, now keyed on real ancestry: byte-identical to today's
+        # behaviour for every resume where the design was not amended.
+        if not missing:
+            if prior:
+                # The case-C fail-open below keeps a base that PREDATES the
+                # dependency code it merged, and that state is STICKY: on every
+                # later attempt the deps are already ancestors of HEAD, so we land
+                # here and would otherwise say nothing at all — the one loud
+                # warning would scroll past in the attempt that caused it and the
+                # inflated diff would look unexplained for the rest of the task's
+                # life. Re-state it every time it is true. Log-only.
+                stale = [d for d, b in wanted
+                         if not gitutil.is_ancestor(wt.path, b, prior)]
+                if stale:
+                    logger.warning(
+                        "task %s: diff base %s PREDATES dependency branch(es) %s "
+                        "that are already merged into this worktree — so this "
+                        "attempt's review diff, grounding scope and mutation "
+                        "targets are a SUPERSET that also contains their code "
+                        "(left over from a seed that could not build a clean "
+                        "base). Over-reviewed, never under-reviewed.",
+                        task.id, prior, ", ".join(stale))
+                logger.debug("task %s: all %d completed dependency branch(es) are "
+                             "already ancestors of HEAD — not re-merging; keeping "
+                             "start_ref %s", task.id, len(wanted), prior)
+                return prior
+            return gitutil.head_sha(wt.path)
+
+        own = gitutil.commits_ahead(wt.path, prior, "HEAD") if prior else 0
+        logger.info("task %s: %d dependency branch(es) not yet in this worktree (%s) "
+                    "— re-seeding (prior start_ref %s, %d own commit(s) ahead of it)",
+                    task.id, len(missing), ", ".join(d for d, _ in missing),
+                    prior or "(none)", own)
+
+        # CASE B — first seed, or a resume with no work of its own on the branch
+        # (the common case: reset_on_failure hard-resets to diff_base on
+        # abstain/fail). Merge in place and recompute the base, as a first seed does.
+        if not own:
+            newly = self._merge_deps_in_place(task, wt, missing)
+            ref = gitutil.head_sha(wt.path)
+            logger.info("task %s: seeded %s — start_ref %s -> %s",
+                        task.id, ", ".join(newly) or "(none)", prior or "(none)", ref)
+            if prior:
+                self.log(f"  ↻ {task.id}: seeded dependency branch(es) "
+                         f"{', '.join(newly)} — diff base now {ref[:12]}")
+            return ref
+
+        # CASE C — the task already has its own commits ahead of `prior`. Neither
+        # naive base survives review: keeping `prior` leaks the dependency's code
+        # into the review diff, and using the post-merge HEAD deletes the prior
+        # attempt's work from it. Build a commit that holds base+deps and none of
+        # the task's work, with plumbing that never touches the working tree, then
+        # merge that single commit in and measure from it.
+        seed = gitutil.seed_commit(repo, prior, [b for _, b in wanted],
+                                   message=f"seed dependencies for {task.id}")
+        if seed:
+            res = gitutil.merge(wt.path, seed,
+                                message=f"seed dependencies for {task.id}")
+            if res.ok:
+                logger.info("task %s: seeded %d dependency branch(es) via seed commit "
+                            "%s — start_ref %s -> %s (the task's own %d commit(s) stay "
+                            "in the review diff)", task.id, len(missing), seed[:12],
+                            prior, seed[:12], own)
+                self.log(f"  ↻ {task.id}: seeded {len(missing)} new dependency "
+                         f"branch(es) — diff base now {seed[:12]}")
+                return seed
+            gitutil.git(["merge", "--abort"], cwd=wt.path)
+
+        # Fail SAFE and loudly: merge what we can in place and KEEP the old base.
+        # The review diff is then a SUPERSET (it also contains the seeded
+        # dependency code) — over-reviewed, never under-reviewed.
+        newly = self._merge_deps_in_place(task, wt, missing)
+        if newly:
+            logger.warning("task %s: could not build a clean seed commit — merged %s "
+                           "in place and KEPT start_ref %s; this attempt's review "
+                           "diff also contains the seeded dependency code (expect an "
+                           "inflated changed-file list and wider grounding/mutation "
+                           "scope)", task.id, ", ".join(newly), prior)
+            self.log(f"  ⚠️  {task.id}: re-seeded without a clean diff base — review "
+                     f"diff includes dependency code")
+        else:
+            # Nothing landed, so nothing leaked into the diff either. Saying
+            # "merged (none) in place … review diff contains the dependency code"
+            # sent a reader looking for code that is not there; the REAL problem
+            # here is that the agent is about to run WITHOUT its dependencies.
+            logger.warning("task %s: NO dependency could be merged (%s) and the "
+                           "diff base %s is unchanged — this attempt runs WITHOUT "
+                           "the declared dependency code; resolve the conflict on "
+                           "the branch, or requeue the task once the dependencies "
+                           "settle", task.id,
+                           ", ".join(d for d, _ in missing), prior)
+            self.log(f"  ⚠️  {task.id}: dependencies could NOT be seeded — this "
+                     f"attempt runs without them")
+        return prior
+
+    def _merge_deps_in_place(self, task: Task, wt,
+                             deps: list[tuple[str, str]]) -> list[str]:
+        """Merge each ``(dep_id, branch)`` into *wt*; return the ids that landed.
+
+        Best-effort per dependency, as before: a conflict is aborted and skipped
+        with a warning rather than failing the whole task.
+        """
+        merged: list[str] = []
+        for dep_id, branch in deps:
             # Sign-safe merge: without _NO_SIGN a commit.gpgsign=true repo fails to
             # sign the seed merge commit and we'd silently skip dependency seeding.
             res = gitutil.merge(wt.path, branch, message=f"seed dependency {branch}")
@@ -639,7 +1108,8 @@ class PipelineOrchestrator:
             else:
                 logger.debug("task %s: seeded dependency %s by merging branch %r",
                              task.id, dep_id, branch)
-        return gitutil.head_sha(wt.path)
+                merged.append(dep_id)
+        return merged
 
     def _review_and_record(self, plan: Plan, task: Task, ctx: ImplementContext,
                            open_pr: bool) -> ReviewResult:
@@ -653,8 +1123,9 @@ class PipelineOrchestrator:
                     task.id, self.config.pr_mode, open_pr)
         # The oracle (validation + grounding) runs LOCK-FREE; only the PR push is
         # serialised, via the git_lock handed to the gate.
-        ask = self._verifier_ask(ctx)
-        gate = ReviewGate(pr_mode=self.config.pr_mode, git_lock=self._git_lock, ask=ask)
+        ask, ask_structured = self._verifier_ask(ctx), self._verifier_ask_structured(ctx)
+        gate = ReviewGate(pr_mode=self.config.pr_mode, git_lock=self._git_lock,
+                          ask=ask, ask_structured=ask_structured)
         result = gate.review(ctx, open_pr=open_pr)
         # (The "review" span below mirrors the full reasons list into the debug log.)
         logger.info("task %s: review %s — risk=%s, grounding_ok=%s, %d changed file(s)",
@@ -663,7 +1134,11 @@ class PipelineOrchestrator:
 
         self._tracer.for_task(task.id).span(
             "review", passed=result.passed, risk=result.risk,
-            files=len(result.changed_files), reasons="; ".join(result.reasons))
+            files=len(result.changed_files),
+            # The commit this verdict is ABOUT — a risk level means nothing
+            # unless you can tell which tree earned it (see push_guard).
+            head=result.reviewed_sha[:12],
+            reasons="; ".join(result.reasons))
         if result.pr is not None:
             if result.pr.ok:
                 logger.info("task %s: PR opened (%s mode): %s",
@@ -689,6 +1164,18 @@ class PipelineOrchestrator:
                                f"{result.pr.detail if result.pr else 'n/a'}")
             else:
                 task.touch("failed", note=result.summary)
+                # Blind-retry fix: the summary above is all a retry used to
+                # inherit ("verifier fail, confidence=0.72"), so an agent could
+                # fail the mutation gate three times on the same survivors
+                # without ever seeing them. The run notes feed
+                # RunLog.memory_digest — the review-failure detail must live
+                # there to reach the next attempt's prompt.
+                RunLog(self.config.state_dir, task.id).append(
+                    "review-fail",
+                    f"review FAIL (risk={result.risk}): "
+                    + ("; ".join(result.reasons) or "see detail"),
+                    detail=result.failure_notes_detail(),
+                    iteration=task.iterations)
                 # Loss-free feedback for the editor-driven (ide-handoff) flow: write
                 # the exact findings back into the worktree's TASK.md so the human's
                 # next edit pass has the full, accumulating history to act on.
@@ -708,7 +1195,7 @@ class PipelineOrchestrator:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _verifier_ask(self, ctx: ImplementContext) -> Optional[Callable[[str], str]]:
+    def _verifier_ask(self, ctx: ImplementContext) -> Callable[[str], str] | None:
         """Bind a one-shot model call for the review verifier, or ``None`` to skip.
 
         The independent verifier gate needs a model call in a context that never
@@ -731,6 +1218,28 @@ class PipelineOrchestrator:
             return None
         return lambda prompt: backend.ask_oneshot(ctx, prompt)
 
+    def _verifier_ask_structured(self, ctx: ImplementContext):
+        """Bind the *schema-validated* one-shot call, or ``None`` to fall back.
+
+        Preferred over :meth:`_verifier_ask` when the backend has it: the verdict
+        comes back as an object the CLI validated against harness's schema, so
+        the gate stops depending on a prose ``VERDICT:`` trailer that an output
+        format change could silently break.
+        """
+        if not self.config.verify:
+            return None
+        try:
+            backend = get_backend(self.config.backend)
+        except Exception as exc:  # noqa: BLE001 — unknown backend must not crash review
+            logger.debug("structured verifier ask unavailable (%s: %s)",
+                         type(exc).__name__, exc)
+            return None
+        avail, _reason = backend.available()
+        if not avail:
+            return None
+        return lambda prompt, schema: backend.ask_oneshot_structured(
+            ctx, prompt, schema=schema)
+
     def _context(self, task: Task) -> ImplementContext:
         return ImplementContext(
             task=task,
@@ -741,6 +1250,9 @@ class PipelineOrchestrator:
             start_ref=task.start_ref,
             log=self.log,
             trace=self._tracer.for_task(task.id),
+            # The oracle's baseline probe does `git worktree add/remove` against
+            # the main repo — a repo-level mutation, serialised like the others.
+            git_lock=self._git_lock,
         )
 
     def _design_text(self, task: Task) -> str:
@@ -759,15 +1271,15 @@ class PipelineOrchestrator:
                      "stored description", task.id, path)
         return task.description
 
-    def _select_tasks(self, plan: Plan, task_ids: Optional[list[str]]) -> list[Task]:
+    def _select_tasks(self, plan: Plan, task_ids: list[str] | None) -> list[Task]:
         if task_ids:
             picked = [plan.get(tid) for tid in task_ids]
-            missing = [tid for tid, t in zip(task_ids, picked) if t is None]
+            missing = [tid for tid, t in zip(task_ids, picked, strict=True) if t is None]
             if missing:
                 logger.warning("unknown task id(s) requested: %s — not in the plan, "
                                "they will not run", ", ".join(missing))
                 self.log(f"⚠️  unknown task id(s): {', '.join(missing)}")
-            runnable = [t for t in picked if t is not None and t.status not in ("done",)]
+            runnable = [t for t in picked if t is not None and t.status != "done"]
             # Explicit selection previously bypassed dependency ordering
             # entirely — launching a task in parallel with (or before) its
             # unfinished dependency, unseeded. Hold dep-waiting tasks back;
@@ -789,10 +1301,51 @@ class PipelineOrchestrator:
         # Default: every task that still needs work and whose deps are satisfied.
         ready = plan.ready()
         # Also resume tasks that stalled mid-flight (implementing/review/failed).
-        resumable = plan.by_status("implementing", "review", "failed")
-        logger.debug("selection: %d ready pending task(s), %d resumable mid-flight "
-                     "task(s) (implementing/review/failed)",
-                     len(ready), len(resumable))
+        # `implementing`/`review` are NEVER dependency-gated: they hold work in
+        # flight, and `review` in particular holds GREEN work whose only remaining
+        # step is the PR — gating that on a newly-added dependency would strand it
+        # forever. A `failed` task is different: relaunching it runs an agent from
+        # scratch, so an unmet dependency means it would run WITHOUT that code
+        # seeded. The explicit-selection path above already filters this way.
+        done_ids = {t.id for t in plan.tasks if t.status == "done"}
+        all_ids = {t.id for t in plan.tasks}
+        inflight = plan.by_status("implementing", "review")
+        retryable: list[Task] = []
+        # A dependency parked at one of these is not coming back on its own: no
+        # run re-selects it. "Waits on X" is then a permanent stall, not a wait,
+        # and saying "re-selected in a later wave once they land" would be a lie
+        # that hides it — the whole point of gating `failed` was to stop silent
+        # wrong behaviour, so the gate must not introduce a silent stall of its own.
+        stuck_status = ("awaiting-human", "blocked")
+        by_id = {t.id: t for t in plan.tasks}
+        for t in plan.by_status("failed"):
+            unmet = [d for d in t.depends_on if d in all_ids and d not in done_ids]
+            if unmet:
+                stuck = [d for d in unmet
+                         if getattr(by_id.get(d), "status", "") in stuck_status]
+                if stuck:
+                    logger.warning(
+                        "failed task %s is held back by dependenc(ies) %s that are "
+                        "parked at a status NO run re-selects (%s) — this is a "
+                        "permanent stall, not a wait: `pipeline requeue %s` (add "
+                        "--reset-attempts for 'blocked') to unstick it",
+                        t.id, ", ".join(stuck),
+                        ", ".join(f"{d}={by_id[d].status}" for d in stuck),
+                        " ".join(stuck))
+                    self.log(f"⛔ {t.id} (failed) is STUCK behind "
+                             f"{', '.join(stuck)} — requeue them to make progress")
+                else:
+                    logger.info("failed task %s is held back: dependencies not done "
+                                "(%s) — relaunching it now would run WITHOUT their "
+                                "code seeded; it is re-selected in a later wave once "
+                                "they land", t.id, ", ".join(unmet))
+                    self.log(f"⏳ {t.id} (failed) waits on {', '.join(unmet)}")
+            else:
+                retryable.append(t)
+        resumable = inflight + retryable
+        logger.debug("selection: %d ready pending task(s), %d resumable "
+                     "(%d in-flight implementing/review, %d failed with deps met)",
+                     len(ready), len(resumable), len(inflight), len(retryable))
         seen: set[str] = set()
         out: list[Task] = []
         for t in ready + resumable:

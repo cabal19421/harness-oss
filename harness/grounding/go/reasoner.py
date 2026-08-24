@@ -11,31 +11,39 @@ confident, so valid Go never trips the gate:
 * **members** — ``pkg.Symbol`` where ``pkg`` is an imported **repo** package and
   the symbol doesn't exist → ungrounded; stdlib/third-party members stay unknown.
 * **arity** — a call to a repo (or same-file) function with the wrong number of
-  arguments → contradicted, with the usual variadic / multi-value guards.
+  arguments → contradicted, with the usual variadic / multi-value guards. It
+  goes through the same constraint solver as Python: one ``call_binding`` model
+  per call site when the backend decides that kind (z3), the imperative arity
+  rule otherwise, and ``unverified`` when it decides neither. Go has no keyword
+  arguments, so the binding model reduces to ``lo ≤ argc ≤ hi``.
 """
 
 from __future__ import annotations
 
 import difflib
 import logging
-from typing import Optional
 
 from harness.grounding.report import GroundingReport, Verdict
-from harness.grounding.solver import ConstraintSolver, get_solver
+from harness.grounding.solver import (
+    KIND_ARITY,
+    KIND_CALL_BINDING,
+    ConstraintSolver,
+    get_solver,
+)
 from harness.log import get_logger, step
 
 from .claims import GoClaims, extract_go_claims
-from .knowledge import GoKnowledgeBase, _parse_func, _scrub, _TOP_FUNC
+from .knowledge import _TOP_FUNC, GoKnowledgeBase, _parse_func, _scrub
 
 logger = get_logger(__name__)
 
 
-def ground_go(code: str, kb: GoKnowledgeBase, solver: Optional[ConstraintSolver] = None,
-              *, trace: Optional[list] = None) -> GroundingReport:
+def ground_go(code: str, kb: GoKnowledgeBase, solver: ConstraintSolver | None = None,
+              *, trace: list | None = None) -> GroundingReport:
     """Ground Go *code* against *kb* and return a :class:`GroundingReport`.
 
-    When *trace* is supplied, each arity constraint generated is recorded for
-    ``--explain`` (same shape as the Python reasoner's trace).
+    When *trace* is supplied, each call-binding/arity constraint generated is
+    recorded for ``--explain`` (same shape as the Python reasoner's trace).
     """
     solver = solver or get_solver()
     report = GroundingReport(backend=solver.backend, project_root=str(kb.root))
@@ -103,7 +111,7 @@ def _ground_imports(claims: GoClaims, kb: GoKnowledgeBase, report: GroundingRepo
 
 def _ground_members(claims: GoClaims, kb: GoKnowledgeBase, alias_map: dict[str, str],
                     solver: ConstraintSolver, report: GroundingReport,
-                    trace: Optional[list] = None) -> None:
+                    trace: list | None = None) -> None:
     for sel in claims.selectors:
         if sel.owner in claims.shadowed:
             continue  # a local binding shadows the package name → not the package
@@ -150,7 +158,7 @@ def _ground_members(claims: GoClaims, kb: GoKnowledgeBase, alias_map: dict[str, 
 
 def _ground_local_calls(claims: GoClaims, kb: GoKnowledgeBase, own_funcs: dict[str, tuple],
                         solver: ConstraintSolver, report: GroundingReport,
-                        trace: Optional[list] = None) -> None:
+                        trace: list | None = None) -> None:
     for call in claims.local_calls:
         if call.name in claims.shadowed:
             # A func parameter / ``:=`` variable legally shadows the package-
@@ -170,25 +178,49 @@ def _ground_local_calls(claims: GoClaims, kb: GoKnowledgeBase, own_funcs: dict[s
 
 
 def _check_arity(report: GroundingReport, solver: ConstraintSolver, expr: str, name: str,
-                 lineno: int, argc: Optional[int], arity: tuple[int, Optional[int]],
-                 has_spread: bool, single_call_arg: bool, trace: Optional[list] = None) -> None:
+                 lineno: int, argc: int | None, arity: tuple[int, int | None],
+                 has_spread: bool, single_call_arg: bool, trace: list | None = None) -> None:
+    """Decide one Go call site through the same constraint solver as Python.
+
+    Go has no keyword arguments, so ``has_kwargs`` is constantly False and the
+    call-binding model collapses to "``lo ≤ argc ≤ hi``" — but it is still the
+    *solver* that decides it, via one model per call site when the backend
+    claims ``call_binding``. A backend that claims neither kind abstains, which
+    surfaces as ``unverified`` (never a pass, never a contradiction).
+    """
     if argc is None or has_spread or single_call_arg:
         return  # can't bound: variadic spread, or single arg may be multi-value return
     lo, hi = arity
-    too_many = hi is not None and argc > hi
-    ok = (not too_many) and solver.arity_satisfies(argc, lo, hi)
+    kind = KIND_CALL_BINDING if solver.decides(KIND_CALL_BINDING) else KIND_ARITY
+    if solver.decides(KIND_CALL_BINDING):
+        # Go's call binding: no keywords, so every parameter must be filled
+        # positionally (`has_kwargs=False`).
+        ok: bool | None = solver.call_binding_satisfiable(argc, lo, hi, has_kwargs=False)
+        constraint = (solver.explain_call_binding(argc, lo, hi, False)[0]
+                      if trace is not None else "")
+    elif solver.decides(KIND_ARITY):
+        too_many = hi is not None and argc > hi
+        ok = (not too_many) and solver.arity_satisfies(argc, lo, hi)
+        constraint = solver.explain(argc, lo, hi)[0] if trace is not None else ""
+    else:
+        logger.debug("%s @L%d: backend=%s decides neither '%s' nor '%s' -> unverified",
+                     expr, lineno, solver.backend, KIND_CALL_BINDING, KIND_ARITY)
+        ok, constraint = None, "(abstained: backend does not decide 'arity')"
     if trace is not None:
-        constraint, _sat = solver.explain(argc, lo, hi)
-        trace.append({"site": f"{expr} @L{lineno}", "argc": argc, "lo": lo, "hi": hi,
-                      "constraint": constraint, "ok": ok, "backend": solver.backend, "note": ""})
-    if not ok:
+        trace.append({"site": f"{expr} @L{lineno}", "kind": kind, "argc": argc, "lo": lo,
+                      "hi": hi, "constraint": constraint, "ok": ok,
+                      "backend": solver.backend, "note": ""})
+    if ok is None:
+        report.add(Verdict("unverified", "arity", name, lineno,
+                           f"{expr} (arity not decided by the {solver.backend} backend)"))
+    elif not ok:
         logger.debug("%s @L%d: argc=%d violates expected arity [%d, %s] -> contradicted "
                      "(backend=%s)", expr, lineno, argc, lo, hi, solver.backend)
         report.add(Verdict("contradicted", "arity", name, lineno,
                            f"{expr} called with {argc} arg(s); expects {_arity_text(lo, hi)}"))
 
 
-def _arity_text(lo: int, hi: Optional[int]) -> str:
+def _arity_text(lo: int, hi: int | None) -> str:
     if hi is None:
         return f"at least {lo}"
     if lo == hi:

@@ -21,7 +21,9 @@ harness/data/*.lock
 .harness/
 .harness-wt/
 
+# Agent CLI local settings (per-user, never committed)
+.gemini/settings.local.json
+
 # Editor / OS
-.idea/
 .DS_Store
 *.swp

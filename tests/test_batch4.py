@@ -5,14 +5,14 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from harness.pipeline import PipelineConfig, PipelineOrchestrator, Plan, Task, store
+from harness.pipeline import PipelineConfig, PipelineOrchestrator, Task, store
 from harness.pipeline.backends.base import parse_abstention, run_validation
 from harness.pipeline.looptools import ProgressLedger
 from harness.pipeline.notes import RunLog
 
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _repo(tmp_path: Path, design: str) -> Path:
@@ -170,7 +170,7 @@ def test_harness_repo_env_is_honoured(tmp_path, monkeypatch):
 def test_cockpit_pane_propagates_base_branch(tmp_path):
     from harness.pipeline.cockpit import _run_cmd
     cfg = PipelineConfig(repo=tmp_path, designs_dir="designs", base_branch="release-1")
-    cmd = _run_cmd(cfg, "t1", "claude-code", "local")
+    cmd = _run_cmd(cfg, "t1", "agent-cli", "local")
     assert "--base release-1" in cmd
 
 
@@ -187,16 +187,16 @@ def test_verifier_prompt_says_not_run_without_validation():
 
 
 def test_retry_spend_accumulates(tmp_path, monkeypatch):
-    from harness.pipeline.backends.claude_code import ClaudeCodeBackend
+    from harness.pipeline.backends.agent_cli import AgentCliBackend
     from harness.pipeline.backends.base import ImplementContext
 
-    backend = ClaudeCodeBackend()
+    backend = AgentCliBackend()
     runs = iter([
-        ClaudeCodeBackend._Run(False, detail="connection reset", tokens=100, cost=0.5),
-        ClaudeCodeBackend._Run(False, detail="connection reset", tokens=100, cost=0.5),
-        ClaudeCodeBackend._Run(True, tokens=50, cost=0.25),
+        AgentCliBackend._Run(False, detail="connection reset", tokens=100, cost=0.5),
+        AgentCliBackend._Run(False, detail="connection reset", tokens=100, cost=0.5),
+        AgentCliBackend._Run(True, tokens=50, cost=0.25),
     ])
-    monkeypatch.setattr(ClaudeCodeBackend, "_run_agent", lambda self, *a, **k: next(runs))
+    monkeypatch.setattr(AgentCliBackend, "_run_agent", lambda self, *a, **k: next(runs))
     cfg = PipelineConfig(repo=tmp_path, designs_dir="designs",
                          max_agent_retries=2, backoff_base_seconds=0)
     ctx = ImplementContext(task=Task(id="t", title="t", design_doc="d"),

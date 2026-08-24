@@ -4,11 +4,18 @@ Harness has two observability channels that answer different questions:
 
 | Channel | File | Question it answers |
 |---|---|---|
-| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able. |
+| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able — 21 documented span types. |
 | **Verbose logs** (`harness/log.py`) | stderr / `HARNESS_LOG_FILE` | *Right-now:* why did routing pick that agent, what exact git command ran and what did it print, which fallback fired, where did 40 seconds go? |
 
 Spans are the flight recorder; logs are the cockpit voice channel. Every span
-is mirrored into the debug log automatically, so `-vv` interleaves both.
+is mirrored into the debug log automatically, so `-vv` interleaves both. Neither
+channel may change a run: tracing swallows every write failure, and no exception
+may escape a log call.
+
+The span vocabulary (what each type means and which fields it carries) is
+tabulated in
+[PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) and
+defined in `harness/pipeline/trace.py`'s module docstring.
 
 ## Turning it on
 
@@ -49,6 +56,13 @@ HARNESS_LOG_FILE=/tmp/h.log harness pipeline run --task t3; grep '|t3]' /tmp/h.l
 
 # What did every gate decide? (spans, not logs)
 harness pipeline trace --task t3
+harness pipeline trace --type verify -n 20        # the last 20 verifier verdicts
+
+# Why was a PR withheld even though review passed?
+jq 'select(.type=="push_guard")' .harness/trace.jsonl
+
+# Which validation legs were excused, and why did the loop sleep?
+jq 'select(.type=="validation_infra" or .type=="quota_wait")' .harness/trace.jsonl
 
 # Which subprocess calls were slow?
 grep -E '✔ .*\([0-9]{2,}\.[0-9]+s\)' /tmp/h.log
@@ -94,13 +108,28 @@ logger = get_logger(__name__)
    `"t3: implementing → review (oracle green after 4 iterations)"`.
 6. **Secrets never.** Route env/config/design-derived text through
    `redact()`; clip payloads with `trunc()`. Log lengths, hashes, and paths
-   instead of contents where possible.
-7. **Logging must never change behaviour** — no exception may escape a log
+   instead of contents where possible. `redact()` masks token shapes
+   (`sk-…`, `gh[pousr]_…`, `github_pat_…`, JWTs, `AKIA…`, `key=value`) **and**
+   rewrites URL userinfo — `https://alice:s3cr3t@github.com/o/r.git` →
+   `https://redacted@github.com/o/r.git`, which no token shape would catch.
+7. **Someone else's bytes are not terminal-safe.** Subprocess output, agent
+   text and design docs can carry ANSI escapes that repaint or overwrite the
+   operator's terminal. Both `redact()` and `trunc()` run
+   `sanitize_control()` (C0 minus `\t`/`\n`, DEL, C1 → `?`), so anything
+   clipped or redacted is already safe; call `sanitize_control()` directly if
+   you log external text through neither.
+8. **Logging must never change behaviour** — no exception may escape a log
    call; never log inside a hot inner loop (per-token, per-AST-node).
-8. Correlate pipeline work with `log_context(run_id=…, task_id=…)` — it's a
+9. Correlate pipeline work with `log_context(run_id=…, task_id=…)` — it's a
    `contextvars` scope, so it survives threads only if entered *inside* the
    worker function.
+10. **Span types are `snake_case`, and the vocabulary — 21 types — lives in
+    `trace.py`'s module docstring** (`validation_infra`, `push_guard`,
+    `quota_wait`, `recovery_skipped`, `freeze`, …), reproduced with meanings in
+    [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl). Add
+    a span there *first*: a type spelled any other way, or added without
+    documenting it, is a span nobody's saved `jq`/`--type` query will ever find.
 
 **Helpers** (`harness/log.py`): `step(logger, "desc", **fields)` timed block ·
 `fmt_cmd(cmd, cwd)` · `trunc(text, limit)` · `redact(text)` ·
-`log_context(run_id=, task_id=)`.
+`sanitize_control(text)` · `log_context(run_id=, task_id=)`.

@@ -7,8 +7,8 @@
 #
 # Usage:  ./ralph.sh
 # Tune via env vars, e.g.  MAX_ITERS=25 TEST_CMD="pytest -q" ./ralph.sh
-# CLAUDE_BARE=1 adds --bare (faster start, but it skips OAuth credential
-# loading, so it ONLY works with ANTHROPIC_API_KEY exported).
+# AGENT_CLI picks the agent binary (default: gemini); AGENT_FLAGS appends extra
+# flags to every invocation, e.g. AGENT_FLAGS="-m <model>".
 
 set -euo pipefail
 
@@ -25,14 +25,8 @@ if [ ! -f PROMPT.md ]; then
   exit 2
 fi
 
-CLAUDE_FLAGS=()
-if [ "${CLAUDE_BARE:-0}" = "1" ]; then
-  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "error: CLAUDE_BARE=1 needs ANTHROPIC_API_KEY (--bare skips OAuth)" >&2
-    exit 2
-  fi
-  CLAUDE_FLAGS+=(--bare)
-fi
+# Extra agent CLI flags, whitespace-split from the environment (empty by default).
+read -r -a AGENT_FLAGS <<< "${AGENT_FLAGS:-}"
 
 fails=0
 for i in $(seq 1 "$MAX_ITERS"); do
@@ -48,10 +42,10 @@ for i in $(seq 1 "$MAX_ITERS"); do
   # commits only if its checks pass, then exits. A transient agent failure
   # (429/overload/network) must NOT kill the overnight loop — back off and retry,
   # but give up after a run of consecutive failures (a dead key won't recover).
-  if claude -p "$(cat PROMPT.md)" \
-      "${CLAUDE_FLAGS[@]}" \
-      --allowedTools "Read,Edit,Bash(npm:*),Bash(git:*)" \
-      --permission-mode acceptEdits; then
+  if "${AGENT_CLI:-gemini}" -p "$(cat PROMPT.md)" \
+      "${AGENT_FLAGS[@]}" \
+      --allowed-tools "run_shell_command(npm),run_shell_command(git)" \
+      --approval-mode auto_edit; then
     fails=0
   else
     fails=$((fails + 1))

@@ -21,11 +21,10 @@ import ast
 import importlib
 import importlib.machinery
 import importlib.util
-import os
 import inspect
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from harness.log import get_logger, step
 
@@ -34,7 +33,7 @@ logger = get_logger(__name__)
 # Arity is represented as (min_positional, max_positional). ``max_positional``
 # is ``None`` when the symbol accepts ``*args`` (unbounded), and the whole arity
 # is ``None`` when it could not be determined.
-Arity = Optional[tuple[int, Optional[int]]]
+Arity = tuple[int, int | None] | None
 
 _SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", ".pytest_cache", "build", "dist", "node_modules"}
 
@@ -46,7 +45,7 @@ _MODULE_DUNDERS = frozenset({
 })
 
 
-def _detect_site_packages(*roots: "Path | None") -> list[str]:
+def _detect_site_packages(*roots: Path | None) -> list[str]:
     """Site-packages dirs of the target project's venv(s), plus an env override.
 
     Pure path inspection — no target interpreter is launched and no target
@@ -68,7 +67,12 @@ def _detect_site_packages(*roots: "Path | None") -> list[str]:
     extra = os.environ.get("HARNESS_TARGET_SITE_PACKAGES", "")
     out.extend(p for p in extra.split(os.pathsep) if p)
     seen: set[str] = set()
-    return [p for p in out if not (p in seen or seen.add(p))]
+    deduped: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,7 @@ class PathResolution:
     status: str  # "grounded" | "ungrounded" | "unknown"
     arity: Arity = None
     is_callable: bool = False
-    missing: Optional[str] = None
+    missing: str | None = None
     suggestions: tuple[str, ...] = ()
 
 
@@ -529,7 +533,7 @@ def _arity_of_funcdef(node, *, drop_self: bool = False) -> Arity:
         n -= 1
     defaults = len(a.defaults)
     lo = max(n - defaults, 0)
-    hi: Optional[int] = None if a.vararg is not None else n
+    hi: int | None = None if a.vararg is not None else n
     return (lo, hi)
 
 
@@ -541,7 +545,7 @@ def _arity_of_object(obj) -> Arity:
                      "call-arity checks skipped for it", type(obj).__name__, exc)
         return None  # C functions / builtins without signatures -> unknown
     lo = 0
-    hi: Optional[int] = 0
+    hi: int | None = 0
     for p in sig.parameters.values():
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
             if hi is not None:

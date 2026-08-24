@@ -2,8 +2,7 @@
 # Agent review gate — run this BEFORE you read the diff yourself.
 #
 # A fresh agent reviews a branch, rebases it, runs the tests, updates docs, opens a
-# PR, and assigns a risk level you can route on. The harness pipeline's review
-# stage (harness/pipeline/) is the productized version; this is the raw one.
+# PR, and assigns a risk level you can route on.
 #
 # Usage:  ./review.sh agent/0
 
@@ -23,7 +22,7 @@ trap restore EXIT
 
 git checkout -q "$BRANCH"
 
-claude -p "You are reviewing branch '$BRANCH' before a human sees it.
+"${AGENT_CLI:-gemini}" -p "You are reviewing branch '$BRANCH' before a human sees it.
 
 1. Review the diff against the main branch for bugs, security issues, and missing
    edge cases. Fix anything you are confident about; leave a clear note for anything
@@ -36,12 +35,23 @@ claude -p "You are reviewing branch '$BRANCH' before a human sees it.
      - low:    mechanical, fully covered by tests
      - medium: non-trivial logic; human review recommended
      - high:   touches auth, data, money, or migrations — REQUIRES human review" \
-  --allowedTools "Read,Edit,Bash(npm:*),Bash(git:*),Bash(gh:*)" \
-  --permission-mode acceptEdits \
+  --allowed-tools "run_shell_command(npm),run_shell_command(git),run_shell_command(gh)" \
+  --approval-mode auto_edit \
   --output-format json | tee "review-${BRANCH//\//-}.json"
 
-# Tip: the agent's text (including the RISK: line) is inside the JSON `result`
-# field — extract it with e.g.:
-#   jq -r '.result' "review-${BRANCH//\//-}.json" | grep -oE 'RISK: (low|medium|high)'
+# The checkout above puts the agent's cwd inside the branch it is reviewing, so
+# that branch supplies the reviewing agent's own project config — the agent
+# CLI's settings file (e.g. `.gemini/settings.json`, which can register MCP
+# servers) and its context file (`GEMINI.md` / `AGENTS.md`). If the branch comes
+# from a source you don't fully trust, run this script in a container or a
+# throwaway clone, and extend the invocation above with whatever
+# settings-isolation flags your agent CLI offers. Better: the pipeline's
+# `--untrusted` review path fails CLOSED when the installed CLI cannot suppress
+# repo-supplied config (see PIPELINE.md) — prefer it over this raw script for
+# branches you don't control.
+
+# Tip: the agent's text (including the RISK: line) is inside the JSON envelope
+# (Gemini CLI puts it in the `response` field) — extract it with e.g.:
+#   jq -r '.response' "review-${BRANCH//\//-}.json" | grep -oE 'RISK: (low|medium|high)'
 # then auto-merge `low`, queue `medium`, and page yourself for `high`. That
 # routing is what lets you stop reading every diff.

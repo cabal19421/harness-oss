@@ -1,9 +1,7 @@
 {
-  // Optional convenience for VS Code-family editors (VS Code, VSCodium, …):
-  // task-runner entries for the harness design-docs → PRs pipeline. Run any of
-  // these from the Command Palette → "Tasks: Run Task", or bind one to a
-  // keybinding. The same commands work from any terminal:
-  //   .venv/bin/python -m harness.cli pipeline ...
+  // VSCodium / VS Code task runner for the harness design-docs → PRs pipeline.
+  // Run any of these from the Command Palette → "Tasks: Run Task", or bind one
+  // to a button/keybinding. No tmux, no manual CLI — drive the whole loop here.
   "version": "2.0.0",
   "options": {
     // Use the project's virtualenv interpreter and keep output uncoloured so
@@ -27,15 +25,8 @@
       "id": "backend",
       "type": "pickString",
       "description": "Code-writing backend",
-      "options": ["ide-handoff", "claude-code", "openai", "gemini"],
+      "options": ["ide-handoff", "agent-cli"],
       "default": "ide-handoff"
-    },
-    {
-      "id": "autoBackend",
-      "type": "pickString",
-      "description": "Unattended code-writing backend",
-      "options": ["claude-code", "openai", "gemini"],
-      "default": "claude-code"
     }
   ],
   "tasks": [
@@ -62,10 +53,10 @@
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
     },
     {
-      "label": "Harness: Run — auto (agent loop)",
-      "detail": "Unattended: the chosen backend writes code in each worktree, grounded + verified, then PRs.",
+      "label": "Harness: Run — auto (agent-cli loop)",
+      "detail": "Unattended: the agent CLI (gemini by default) writes code in each worktree, grounded + verified, then PRs.",
       "type": "shell",
-      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline run --repo ${workspaceFolder} --designs designs --backend ${input:autoBackend} --pr ${input:prMode}",
+      "command": "${workspaceFolder}/.venv/bin/python -m harness.cli pipeline run --repo ${workspaceFolder} --designs designs --backend agent-cli --pr ${input:prMode}",
       "problemMatcher": [],
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
     },

@@ -51,8 +51,8 @@ your contributions are valued.
 
 ```bash
 # 1. Fork and clone the repository
-git clone https://github.com/YOUR_USERNAME/harness.git
-cd harness
+git clone https://github.com/YOUR_USERNAME/harness-oss.git
+cd harness-oss
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
@@ -60,7 +60,10 @@ source .venv/bin/activate  # Linux/macOS
 # .venv\Scripts\activate   # Windows
 
 # 3. Install in editable mode with dev + grounding extras
-pip install -e ".[dev,z3]"   # z3 accelerates grounding; the stdlib solver works without it
+pip install -e ".[dev,z3,proc]"  # z3 adds the call-binding + guard-exclusivity checks
+                                 # (without it those abstain and the stdlib solver decides
+                                 # arity); proc adds psutil, without which the psutil half
+                                 # of procutil.py is never exercised locally
 
 # 4. Verify installation (grounding solver, backends, dependencies, extensions)
 harness status
@@ -73,21 +76,43 @@ pytest --cov=harness --cov-report=html
 ```
 
 > The core needs no third-party packages; the extras above are for contributors.
-> Optional external tools (`gh`, `tmux`, `claude`, `go`) unlock specific features —
+> Optional external tools (`gh`, `tmux`, `gemini`, `go`, `npm`) unlock specific features —
 > see **[INSTALL.md](INSTALL.md)** for the full dependency matrix.
 
 ### Development Dependencies
 
 Installing with `[dev]` extras adds:
 
-| Package | Purpose |
-|---|---|
-| `pytest` | Test runner |
-| `pytest-cov` | Coverage reporting |
-| `pytest-mock` | Mocking utilities |
-| `mypy` | Static type checking |
-| `ruff` | Linting and formatting |
-| `pre-commit` | Git hook management |
+| Package | Floor | Purpose |
+|---|---|---|
+| `pytest` | `>=9.1.1` | Test runner |
+| `pytest-cov` | `>=4.0` | Coverage reporting |
+| `pytest-mock` | `>=3.10` | Mocking utilities |
+| `mypy` | `>=2.0,<3` | Static type checking (config in `mypy.ini`) |
+| `ruff` | `>=0.1` | Linting (config in `ruff.toml` — pinned families, same reproducibility rationale as `mypy.ini`) |
+| `pre-commit` | `>=3.0` | Git hook management |
+
+Two of those floors are load-bearing rather than cosmetic, and both are about
+the **oracle** rather than about features:
+
+* **`pytest>=9.1.1`.** Below 9.0.3 the temporary-directory root
+  (`/tmp/pytest-of-<user>`) is predictable and pre-creatable by a local attacker
+  (CVE-2025-71176). The extra step to 9.1.1 buys the more interesting fix:
+  9.0.x silently ignores `--strict-markers` / `--strict-config` when they arrive
+  via `addopts`, so a gated repo that encodes its strictness there gets a
+  quietly weaker oracle — precisely the class of silent regression these gates
+  exist to catch. 9.1.0 is skipped: it drops initial conftests under a `test*`
+  directory on an argument-less run, which is this repo's own layout.
+* **`mypy>=2.0,<3`.** The cap is the point. mypy 2.0 turned `local_partial_types`
+  and `strict_bytes` on by default and started rejecting `--python-version 3.9`
+  outright; an uncapped floor lets the *next* major do the same to you between
+  one `pip install` and the next. `mypy.ini` states every flipped default
+  explicitly so 1.x and 2.x agree on this codebase.
+
+`psutil` is **not** a dev dependency — it is the optional `[proc]` extra
+(`pip install -e ".[proc]"`). Install it if you are touching
+`harness/pipeline/procutil.py`: without it the psutil branch of that module is
+never exercised locally and only the Linux `/proc` fallback runs.
 
 ### Pre-commit Hooks
 
@@ -99,10 +124,11 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-**Use the grounding gate on the harness itself** — block a commit that references
-symbols that don't exist. The harness grounds cleanly against its own source (the
-only expected finding is an optional `psutil` import, flagged only when `psutil`
-isn't installed):
+**Dogfood the grounding gate** — block a commit that references symbols that
+don't exist. The harness grounds cleanly against its own source: zero
+unresolved symbols across every module, provided the optional extras are
+installed (`pip install -e ".[z3,proc]"` — otherwise the `z3` and `psutil`
+imports are reported, correctly, as unresolved):
 
 ```bash
 # .git/hooks/pre-commit (or a pre-commit-hooks entry)
@@ -126,44 +152,50 @@ harness/
 │   │   ├── knowledge.py        # Index the project's real symbols (ast/importlib)
 │   │   ├── claims.py           # Extract the symbols a change references
 │   │   ├── reasoner.py         # Datalog reasoning over knowledge + claims
-│   │   ├── solver.py           # z3 / builtin arity-constraint backend
+│   │   ├── solver.py           # Constraint backends: z3 (call binding, guard
+│   │   │                       #   exclusivity, arity) / builtin (arity only)
 │   │   ├── datalog.py          # Rule definitions
 │   │   ├── preflight.py        # Orchestrates a grounding run
 │   │   ├── report.py           # Findings → human/JSON report
-│   │   └── go/                 # Go-language grounding support (go.mod-aware)
+│   │   └── go/                 # Go-language grounding (go.mod + bundled stdlib;
+│   │                           #   no toolchain required)
 │   └── pipeline/               # Design-docs → PRs loop (see PIPELINE.md)
 │       ├── ingest.py           # designs/*.md → deterministic task plan
-│       ├── spec.py             # Task / Plan / PipelineConfig (+ safety/trust knobs)
+│       ├── spec.py             # Task / Plan / PipelineConfig (every knob + its env var)
 │       ├── grounding_gate.py   # grounding as preflight + per-change oracle
-│       ├── verifier.py         # independent fresh-context verifier gate
-│       ├── looptools.py        # unattended-safety: classifier, backoff, budget, no-progress
-│       ├── review.py           # review gate + advisory risk routing
-│       ├── mutation.py         # self-consistency / mutation checks (opt-in)
-│       ├── worktree.py         # per-task worktree; fail-closed teardown, prune, warm reuse
+│       ├── verifier.py         # independent fresh-context verifiers (>=2 votes/diff)
+│       ├── looptools.py        # unattended-safety: classifier, backoff, quota wait, budget, progress ledger
+│       ├── review.py           # review gate, advisory risk routing, reviewed-SHA freeze
+│       ├── mutation.py         # mutation scoring of the change (opt-in)
+│       ├── worktree.py         # per-task worktree; refuse-and-report teardown, prune, warm reuse
 │       ├── gitutil.py          # git plumbing: landed-proof, force-with-lease, no-sign
-│       ├── backends/           # code-writers: ide-handoff, claude-code, openai, gemini
-│       ├── notes.py            # append-only run notes + liveness heartbeat
-│       ├── trace.py            # span traces → .harness/trace.jsonl
+│       ├── backends/           # code-writers: ide-handoff, agent-cli, openai, gemini
+│       ├── notes.py            # append-only run notes, liveness heartbeat + TaskClaim (flock)
+│       ├── trace.py            # the span vocabulary → .harness/trace.jsonl
 │       ├── supervisor.py       # liveness (supervise) + crash recovery
 │       ├── procutil.py         # terminate processes inside a worktree before teardown
+│       ├── shutdown.py         # graceful Ctrl-C/SIGTERM (terminate the detached agent, record it)
+│       ├── nosleep.py          # hold a host sleep inhibitor for the length of a run
 │       ├── sanitize.py         # scrub untrusted design text (secrets + injection)
 │       ├── trust.py            # fail-closed validation-command allowlist
-│       ├── pr.py               # local-branch / GitHub PR creation
+│       ├── pr.py               # local-branch / GitHub PR creation + the push guard
 │       ├── cockpit.py          # tmux cockpit
 │       ├── orchestrator.py     # ties the loop together; recovery + supervise/prune
 │       └── store.py            # repo-local plan persistence (.harness/pipeline.json)
-├── tests/                      # Test suite (flat; pytest, 276 tests)
+├── tests/                      # Test suite (flat; pytest, config in pytest.toml)
 │   ├── conftest.py             # Shared fixtures (isolated cwd per test)
-│   ├── test_grounding.py  test_grounding_explain.py
+│   ├── test_grounding.py  test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py  test_grounding_precision.py
 │   ├── test_pipeline.py  test_api_backends.py  test_verify_hook.py
-│   ├── test_antihallucination.py  test_trace_and_mutation.py
-│   └── test_extensions.py  test_hardening.py  test_deep_review_fixes.py
+│   ├── test_antihallucination.py  test_trace_and_mutation.py  test_liveness.py
+│   ├── test_extensions.py  test_hardening.py  test_deep_review_fixes.py
+│   └── test_pr_github.py  test_acceptance_version.py  test_batch4.py  test_batch5.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
 ├── loopeng/                    # Shell-script loop the pipeline grew from
 ├── README.md  INSTALL.md  PIPELINE.md  EXTENSIONS.md
 ├── ARCHITECTURE.md  LOGGING.md  CONTRIBUTING.md
+├── pytest.toml  mypy.ini  ruff.toml  # suite + type + lint config (no pyproject.toml, on purpose)
 └── setup.py  requirements.txt  MANIFEST.in
 ```
 
@@ -174,42 +206,118 @@ harness/
 The grounding gate is the neuro-symbolic check (Datalog + z3 over `ast` /
 `importlib`) that every symbol a change references actually exists. It is
 surfaced through `harness verify FILE` and the editor side-car
-`harness verify --hook` (a Claude-Code PostToolUse event on stdin).
+`harness verify --hook` (a PostToolUse-style hook event on stdin — the JSON
+shape agentic CLIs emit from an after-edit hook).
 
 The engine lives in `harness/grounding/` and reads as a pipeline:
 
 1. **`knowledge.py`** indexes the real symbols in the project.
 2. **`claims.py`** extracts the symbols a change *claims* to use.
 3. **`reasoner.py` / `datalog.py` / `solver.py`** discharge the claims against
-   the knowledge base, generating arity constraints for the z3 (or builtin)
-   solver.
+   the knowledge base. Datalog derives the relational layer; the constraint
+   layer goes to the solver — **one z3 model per call site** (`call_binding`)
+   and per `if`/`elif` chain (`guard_exclusivity`) when z3 is installed, the
+   stdlib arity rule otherwise.
 4. **`preflight.py`** orchestrates a run and **`report.py`** renders findings.
-5. **`go/`** provides Go-language support (go.mod-aware; imports resolve against
-   the bundled Go stdlib set + the module's `require`s — no Go toolchain needed,
-   though `go list std` augments the stdlib set when `go` is on PATH).
+5. **`go/`** provides Go-language support. It never shells out to `go build` —
+   it is a source + `go.mod` symbolic scan: `knowledge.py` parses the `module`
+   and `require` directives, and `stdlib.py` serves a **bundled** `go list std`
+   snapshot (Go 1.26). A Go toolchain is optional: when `go` is on PATH the
+   bundled set is *augmented* by a live `go list std`, but Go grounding works
+   without one. (The `go build` you will see elsewhere in the docs is the
+   pipeline's *type-check oracle leg* — a different subsystem.)
 
 **When contributing here:**
 
 - Add a fixture that reproduces the miss and a test in the matching
   `tests/test_grounding*.py` file (precision regressions belong in
   `test_grounding_precision.py`).
-- Keep the two solver backends in lockstep — a new rule must behave identically
-  under `--solver builtin` and `--solver z3`. `harness verify --explain` prints
-  every arity constraint generated for a run, which is the fastest way to debug
-  a rule.
-- The optional `z3` extra only *accelerates* grounding; never make correctness
-  depend on it.
+- Keep the two solver backends in lockstep — where both decide a kind, they must
+  answer identically under `--solver builtin` and `--solver z3`; where only one
+  can decide it, the other must **abstain** (see the contract below).
+  `harness verify --explain` prints every constraint generated for a run (rule,
+  inputs, sat/unsat/abstained), which is the fastest way to debug a rule.
+- The optional `z3` extra is a **capability**, not a speed-up (an SMT query costs
+  more than two integer comparisons). Without it, `call_binding` and
+  `guard_exclusivity` abstain to `unverified`, which never fails a gate — so a
+  z3-less machine loses findings, never gains false ones. Runs that must have
+  the full checks set `--require-z3` / `HARNESS_REQUIRE_Z3=1` and fail loudly
+  instead of degrading silently.
+
+### Adding a constraint kind (the equivalence contract)
+
+A grounding verdict must **never** depend on which optional package happens to
+be installed: the same code has to ground the same way on a laptop without z3
+and in CI with it. Two mechanisms enforce that — keep both intact.
+
+The kinds that exist today, and who decides them:
+
+| Kind | builtin | z3 | Question it answers |
+|---|---|---|---|
+| `arity` | ✅ | ✅ | Does `lo ≤ argc ≤ hi` hold for one call? |
+| `call_binding` | — (abstains) | ✅ | Is there **any** assignment of a call's arguments to the callee's parameters satisfying positional capacity *and* required-parameter coverage *and* the unknown number of parameters its keyword arguments may bind? One model per call site. |
+| `guard_exclusivity` | — (abstains) | ✅ | Over symbolic conditions (`x < 0`, `not (n >= 10)`, `a < b`): can this `if`/`elif` branch ever run? Proves dead branches and pairwise-exclusive guards. |
+
+**1. Equivalence is locked by test.** `TestSolverEquivalence` in
+`tests/test_grounding.py` runs every backend over a generated matrix of arity
+cases (including the degenerate ones: zero args, unbounded `*args`, `hi < lo`)
+and asserts they agree on every point. A divergence is a test failure, not a
+silent drift. Extend `_arity_matrix()` when you add a case a backend could
+plausibly get wrong.
+
+For a kind only one backend claims, the differential test pins the *reasoner's*
+two paths together instead:
+`tests/test_grounding_z3.py::TestCallBindingEquivalence` asserts that the z3
+binding model and `reasoner._legacy_call_ok` — the imperative rule an
+arity-only backend still uses — agree on every `argc × lo × hi × kwargs` point.
+Adding capability must not change any verdict a weaker machine already reaches.
+
+**2. Abstain rather than guess.** Each backend declares the kinds it can decide
+in `ConstraintSolver.capabilities`; `solver.decides(kind)` gates the reasoner.
+A kind a backend does **not** claim is reported `unverified` — never answered by
+a weaker rule, and never treated as a pass or a `contradicted`.
+
+So when you add a constraint kind, do **one** of these:
+
+- implement it in *every* backend (and extend the equivalence test), **or**
+- implement it only where it can be decided, and leave it out of the weaker
+  backend's `capabilities` — that backend will abstain, and the gate stays
+  honest instead of environment-dependent. If the reasoner keeps a fallback path
+  for the abstaining backend (as `call_binding` does), pin the two together with
+  a differential test.
+
+What you must not do is add a rule to one backend and a rough approximation of
+it to the other. `TestSolverAbstention` covers the abstention path end to end
+(including its `--explain` trace); both classes are mutation-tested, so a broken
+contract fails loudly.
+
+**3. Prove it, or abstain — never approximate.** A `contradicted` verdict blocks
+a change, so it must be a proof. Two conventions keep the SMT layer honest:
+guard variables are encoded as **Reals, not Ints** (unsat over ℝ implies unsat
+over ℤ, but not the reverse — Ints would "prove" that `0 < x < 1` is dead for a
+float), and anything outside the decidable grammar (a call, an attribute, a
+subscript, the NaN-sensitive `x != x`) abstains. A sweep of 800 stdlib files
+produced 1476 guard verdicts, 0 contradictions and 1 abstention — the NaN check
+in `json/encoder.py`.
 
 ---
 
 ## Contributing to the Pipeline
 
 The pipeline (`harness/pipeline/`) turns `designs/*.md` into reviewed PRs. Its
-CLI surface is `harness pipeline {plan, run, status, complete, supervise, prune,
-trace, verify-diff, backends}`. Design docs are ingested deterministically
+CLI surface is `harness pipeline {plan, run, status, tmux, complete, supervise,
+prune, trace, verify-diff, backends}`. Design docs are ingested deterministically
 (`ingest.py`) into a `Plan` of `Task`s (`spec.py`), each implemented in an
-isolated worktree by a **backend** (`ide-handoff`, `claude-code`, `openai`,
+isolated worktree by a **backend** (`ide-handoff`, `agent-cli`, `openai`,
 `gemini`).
+
+**`spec.py` is the single home of a default.** A knob added anywhere else — a
+literal in a backend, a fallback in the orchestrator — is a default nobody can
+find or document. Add the field to `PipelineConfig` with the comment explaining
+*why* that value, wire it in `from_env` if it deserves an env var, and add the
+row to
+[PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference)
+in the same change.
 
 Most of the interesting work is in the **anti-hallucination gates** that guard
 the hardened ralph loop:
@@ -218,12 +326,18 @@ the hardened ralph loop:
   oracle. The oracle also runs the repo's validation command; its **type-checker
   leg is conditional** (only when `mypy`/`pyright` is installed *and* configured,
   or Go's `go build`), so don't describe it as a universal type check.
-- **`verifier.py`** — an independent, fresh-context verifier that re-checks a
-  change without the implementer's context.
-- **`looptools.py`** — the unattended-safety layer: output classifier, backoff,
-  cost/token budget (`--max-cost` is honoured only on the `claude-code` backend;
-  `openai`/`gemini` track tokens only), and the **no-progress / oscillation
-  detector**.
+- **`verifier.py`** — independent, fresh-context verifiers that re-check a change
+  without the implementer's context. **At least two of them vote on every diff**
+  whenever the gate is on (`verify_samples` is floored at 2); the majority
+  verdict wins and a split with no strict majority abstains to a human. Only
+  turning the gate off (`verify: False` / `HARNESS_VERIFY=0` / `--no-verify` /
+  per-task `(verify: off)`) skips them.
+- **`looptools.py`** — the unattended-safety layer: the three-regime failure
+  classifier (permanent / quota-window / transient), jittered `Retry-After`-aware
+  backoff, cost/token budget (`--max-cost` works on every backend — on
+  `agent-cli` USD is parsed best-effort from the CLI's JSON envelope, a
+  per-model estimate on `openai`/`gemini`, which report tokens only), and the
+  **no-progress / oscillation detector**.
 - **`review.py`** — the review gate plus **risk routing**. Risk (`low` / `medium`
   / `high`) is **advisory routing metadata only** — harness never auto-merges on
   it; a human or an external runner decides what to do with the label.
@@ -237,8 +351,10 @@ it in tests or docs.
 
 **When contributing here:** add tests to `test_pipeline.py` (loop + lifecycle),
 `test_api_backends.py` (backend adapters), `test_antihallucination.py` (the
-gates above), `test_hardening.py` (unattended safety), and
-`test_trace_and_mutation.py`. Read **[PIPELINE.md](PIPELINE.md)** first.
+gates above), `test_hardening.py` (unattended safety), `test_liveness.py`
+(heartbeat / claim / recovery classification), `test_pr_github.py` (the `gh`
+path and the push guard), and `test_trace_and_mutation.py`. Read
+**[PIPELINE.md](PIPELINE.md)** first.
 
 ---
 
@@ -257,7 +373,7 @@ extensions/
 ```
 
 Discovery and listing are all the harness itself does — an external **runner**
-(a Claude-Code hook or a git hook) is what actually executes an automation.
+(an agent hook or a git hook) is what actually executes an automation.
 There is no drop-in *tool* mechanism. See **[EXTENSIONS.md](EXTENSIONS.md)** for
 the manifest formats and runner wiring.
 
@@ -354,7 +470,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests (276 of them)
+# Run all tests — 783 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -364,7 +480,7 @@ pytest -v
 pytest tests/test_grounding.py
 
 # Run a specific test
-pytest tests/test_pipeline.py::test_worktree_create_reuse_remove
+pytest tests/test_pipeline.py::test_oracle_adds_mypy_only_when_configured
 
 # Run with coverage
 pytest --cov=harness --cov-report=html --cov-report=term-missing
@@ -388,7 +504,32 @@ pytest --cov=harness --cov-report=html --cov-report=term-missing
 - Mock external dependencies (filesystem, subprocess, network)
 - Test both success and failure paths
 - Use the `tmp_path` fixture for filesystem tests
-- Mark slow tests with `@pytest.mark.slow`
+- Mark slow tests with `@pytest.mark.slow` — registered in `pytest.toml`, which
+  also sets `strict_markers`, so a typo'd mark is a **collection error** rather
+  than a mark that silently does nothing. Adding a new mark means adding it to
+  the `markers` list in `pytest.toml` first.
+
+### `pytest.toml`
+
+The suite is configured by a standalone `pytest.toml` at the repo root (pytest
+9.0+), not by `pyproject.toml` — this repo deliberately ships none. It pins
+`testpaths`, registers markers, and turns on `strict_markers` +
+`strict_config`, so an unrecognised ini key (a typo, or an option from a newer
+pytest than the one installed) fails loudly instead of leaving the suite
+silently unconfigured. Two options worth adopting — `max_warnings` and
+`assertion_text_diff_style` — are documented in the file with the reasons they
+matter to the oracle. Neither is blocked on the pytest version any more: the dev
+floor is already `pytest>=9.1.1` (see the table above), so `strict_config` would
+accept both keys today. What remains is that each is a **behaviour change to the
+oracle** rather than a configuration tidy-up, and neither has been measured — so
+they stay unset deliberately. `pytest.toml` carries the full reasoning.
+
+A `mypy.ini` sits alongside it. It states `python_version` and the mypy 2.0
+default flips (`local_partial_types`, `strict_bytes`, `allow_redefinition`)
+explicitly, so `mypy harness/` gives the same verdict on either side of the
+mypy 1.x/2.x boundary — and so `PipelineConfig._has_mypy_config()` sees harness
+as mypy-configured and gives harness's own dogfood run the type-check leg it
+used to skip.
 
 **Shared Fixtures** (in `tests/conftest.py`):
 
@@ -462,7 +603,25 @@ Harness has two observability channels (full guide in **[LOGGING.md](LOGGING.md)
    ```
 
 6. **Update documentation** (PIPELINE.md, EXTENSIONS.md, LOGGING.md, etc.) if
-   your change affects them.
+   your change affects them — and update it *coherently*, not by appending a
+   paragraph. The docs are meant to read as one description of the system, so a
+   change that adds a knob touches the config reference, a change that adds a
+   span touches `trace.py`'s docstring **and** the span table, and a change to a
+   default touches every place that quotes it. Concretely, keep these in sync:
+
+   | If you change… | Also update |
+   |---|---|
+   | a `PipelineConfig` field or `HARNESS_*` var | [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference) (+ the README env table if it is one most runs touch) |
+   | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) |
+   | a CLI flag | ARCHITECTURE.md's subcommand tree + the run-book snippet that uses it |
+   | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md |
+   | the test count | the README badge and the counts in this file |
+
+   Numbers in docs are claims: quote the real `pytest -q` line, the real
+   `harness status` output, the real defaults from `spec.py`. And keep the
+   honesty standard — describe the capability exactly, never oversold; if a
+   thing does not work, say so (the README's *What this does not do* section and
+   PIPELINE.md's do-not-adopt ledger exist for that).
 
 ### PR Checklist
 
@@ -517,7 +676,7 @@ If you experience or witness unacceptable behaviour, please report it by emailin
 
 If you have questions about contributing:
 
-- 💬 Open a [GitHub Discussion](https://github.com/cabal19421/harness-oss/discussions)
+- 💬 Open a [GitHub Discussion](https://github.com/your-org/harness-oss/discussions)
 - 📧 Email the maintainers
 - 📖 Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design context
 - 🔨 Read [PIPELINE.md](PIPELINE.md) for the design-docs → PRs loop

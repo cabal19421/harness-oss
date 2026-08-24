@@ -20,7 +20,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from harness.log import get_logger, step
 
@@ -28,11 +27,11 @@ from .stdlib import is_stdlib_package
 
 logger = get_logger(__name__)
 
-Arity = tuple[int, Optional[int]]  # (min_positional, max_positional|None for variadic)
+Arity = tuple[int, int | None]  # (min_positional, max_positional|None for variadic)
 
 _SKIP_DIRS = {".git", "vendor", "testdata", "node_modules", ".harness", ".harness-wt"}
 
-_MODULE_RE = re.compile(r'^\s*module\s+(\S+)', re.M)
+_MODULE_RE = re.compile(r'^\s*module\s+(\S+)', re.MULTILINE)
 _TOP_FUNC = re.compile(r'(?m)^func\b')
 _TOP_TYPE = re.compile(r'(?m)^type\s+([A-Za-z_]\w*)')
 _TOP_CONST = re.compile(r'(?m)^const\s+([A-Za-z_]\w*)')
@@ -112,7 +111,7 @@ class GoKnowledgeBase:
             logger.debug("go.mod at %s has no module directive — module path stays unknown",
                          gomod)
         # require directives (block and single-line forms)
-        for block in re.findall(r'require\s*\((.*?)\)', text, re.S):
+        for block in re.findall(r'require\s*\((.*?)\)', text, re.DOTALL):
             for line in block.splitlines():
                 tok = line.strip().split()
                 if tok and not tok[0].startswith("//"):
@@ -126,7 +125,7 @@ class GoKnowledgeBase:
         logger.debug("parsed go.mod: module=%r, %d require directive(s)",
                      self.module_path, len(self.requires))
 
-    def _import_path_for(self, rel: Path) -> Optional[str]:
+    def _import_path_for(self, rel: Path) -> str | None:
         """Map a file's directory to its import path via the module path."""
         if not self.module_path:
             return None
@@ -195,7 +194,7 @@ class GoKnowledgeBase:
                 line = s[m.start(): eol if eol != -1 else len(s)]
                 pkg.members.update(_decl_names(line.split(None, 1)[1] if " " in line else ""))
         for kw in ("const", "var"):
-            for block in re.findall(r'(?m)^' + kw + r'\s*\((.*?)^\)', s, re.S):
+            for block in re.findall(r'(?m)^' + kw + r'\s*\((.*?)^\)', s, re.DOTALL):
                 for line in block.splitlines():
                     pkg.members.update(_decl_names(line))
 
@@ -213,10 +212,10 @@ class GoKnowledgeBase:
             return "dep"
         return "unknown"
 
-    def repo_package(self, path: str) -> Optional[GoPackage]:
+    def repo_package(self, path: str) -> GoPackage | None:
         return self.packages_by_path.get(path)
 
-    def local_func_arity(self, pkg_name: str, func: str) -> Optional[Arity]:
+    def local_func_arity(self, pkg_name: str, func: str) -> Arity | None:
         """Arity of a top-level func *func* defined in repo dirs of *pkg_name*.
 
         The caller only knows the proposed file's package NAME, not its
@@ -260,13 +259,13 @@ def _decl_names(line: str) -> set[str]:
     return names
 
 
-def _parse_func(s: str, after_func: int) -> Optional[tuple[str, Optional[str], Arity]]:
+def _parse_func(s: str, after_func: int) -> tuple[str, str | None, Arity] | None:
     """Parse ``func [(recv)] Name(params)`` starting just after the ``func`` token.
 
     Returns ``(name, receiver_type_or_None, arity)`` or None if unparized.
     """
     i = _skip_ws(s, after_func)
-    recv: Optional[str] = None
+    recv: str | None = None
     if i < len(s) and s[i] == "(":
         recv_text, i = _balanced(s, i)
         recv = _receiver_type(recv_text)
@@ -311,8 +310,8 @@ def _struct_fields(s: str, after_type_name: int) -> set[str]:
         return set()
     body, _ = _balanced(s, i, open_ch="{", close_ch="}")
     fields: set[str] = set()
-    for line in body[1:-1].splitlines():
-        line = line.strip()
+    for raw_line in body[1:-1].splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("//"):
             continue
         # "Name Type", "A, B Type", or embedded "Type" — take leading identifiers
@@ -324,7 +323,7 @@ def _struct_fields(s: str, after_type_name: int) -> set[str]:
     return fields
 
 
-def _receiver_type(recv_text: str) -> Optional[str]:
+def _receiver_type(recv_text: str) -> str | None:
     inner = recv_text[1:-1].strip()
     if not inner:
         return None

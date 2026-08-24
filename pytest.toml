@@ -1,0 +1,60 @@
+# pytest configuration for harness's own suite.
+#
+# A standalone `pytest.toml` (pytest 9.0) rather than a `[tool.pytest.ini_options]`
+# block, because this repo deliberately ships no pyproject.toml — setup.py is the
+# packaging entry point. `pytest.toml` also takes the HIGHEST precedence in
+# rootdir discovery (ahead of pytest.ini, pyproject.toml, tox.ini and setup.cfg),
+# so there is no ambiguity about which file configured a run.
+#
+# It doubles as the fixture for `PipelineConfig._is_python_repo`: harness is a
+# repo whose *only* unambiguous "this is pytest-driven" marker is this file, and
+# the autodetector must classify it correctly.
+[pytest]
+# Only ever collect the suite. The repo root also holds `extensions/`,
+# `designs/` and `build/` output; none of them are harness's tests, and a stray
+# collectible file there must not silently join the gate that guards this repo.
+testpaths = ["tests"]
+norecursedirs = [
+    ".git", ".venv", ".harness", ".harness-wt", ".pytest_cache",
+    "build", "dist", "*.egg-info", "node_modules",
+]
+
+# CONTRIBUTING.md tells contributors to mark slow tests `@pytest.mark.slow`.
+# Until this file existed, that instruction told them to write a
+# PytestUnknownMarkWarning — and, the moment anyone turned on strict markers, a
+# hard collection error. Register the marks the docs promise, then hold the
+# suite to them.
+markers = [
+    "slow: a test that takes long enough to be worth deselecting (`-m 'not slow'`)",
+]
+# A typo'd mark (`@pytest.mark.slwo`) silently does nothing — the test still
+# runs, and the deselection you thought you configured quietly stops working.
+strict_markers = true
+# Likewise for this file itself: an ini key pytest doesn't recognise (a typo, or
+# an option from a newer pytest than the one installed) must fail loudly instead
+# of being ignored while the suite pretends to be configured.
+strict_config = true
+
+# Still deliberately NOT set. The original blocker is gone — setup.py's dev floor
+# is now `pytest>=9.1.1` (CVE-2025-71176, plus 9.0.x silently ignoring
+# `--strict-markers`/`--strict-config` from `addopts`), so `strict_config` would
+# no longer reject either key. What remains is that both are behaviour changes to
+# the oracle rather than configuration tidy-ups, and neither has been measured:
+#
+#   max_warnings              — run_validation is purely exit-code driven, so a
+#                               change that silently doubles the deprecation
+#                               warning count passes the gate clean today.
+#                               Turning warning volume into the exit code the
+#                               loop already reads is the cheapest strengthening
+#                               of the oracle available. Set it for THIS suite
+#                               first; a `--max-warnings` opt-in for the
+#                               autodetected oracle is a behaviour change for
+#                               third-party repos and needs measuring first.
+#   assertion_text_diff_style — harness feeds only the last 40 lines of
+#                               validation output back to the agent (`_tail`)
+#                               and hashes only the last 2000 chars for the
+#                               anti-loop signature (`_normalize_output`).
+#                               Default ndiff on a long string mismatch can push
+#                               the actual failing assertion out of BOTH
+#                               windows, starving the repair prompt and making
+#                               an identical failure look novel.

@@ -7,13 +7,76 @@ Every load-bearing event in the pipeline appends one JSON line — a *span* —
 to ``<repo>/.harness/trace.jsonl``:
 
     {"ts": "...", "run_id": "...", "task_id": "...", "type": "agent",
-     "backend": "claude-code", "ok": true, "duration_s": 212.4,
+     "backend": "agent-cli", "ok": true, "duration_s": 212.4,
      "tokens": 48211, "cost_usd": 0.61, ...}
 
-Span types: ``run_start``/``run_end``, ``task_status``, ``agent``,
-``validation``, ``grounding``, ``review``, ``mutation``, ``verify`` (independent
-verifier), ``dep_blame`` (dependency-blame gate), ``abstain`` (backend abstained),
-``pr``, ``recovery``.
+This module docstring is the **authoritative span vocabulary** — 21 types. Adding
+a span means adding it here first; PIPELINE.md's span table and LOGGING.md both
+point at this list, and a type that exists only in a call site is one no
+documented ``jq`` query or ``--type`` filter will ever find.
+
+Run / lifecycle
+    ``run_start``, ``run_end`` — one orchestrator run opens / closes (``run_end``
+    carries the abort reason when it did not finish).
+    ``task_status`` — a lifecycle transition, with its cause and (on a retry) the
+    attempt number.
+
+Agent invocation
+    ``agent`` — a backend invocation. Emitted from four sites, and the payload
+    differs by site, so a query must not assume one shape:
+
+    * ``backends/agent_cli.py`` — **per iteration**: ``ok``, ``permanent``,
+      ``tokens``, ``cost_usd``, ``duration_s``, ``detail`` (on failure).
+    * ``backends/api_base.py`` (response path) — **per iteration**: ``ok``,
+      ``tokens``, ``cost_usd``, ``issue`` (the classified problem kind, ``""``
+      when clean), ``duration_s``.
+    * ``backends/api_base.py`` (HTTP/transport-error path) — ``ok=False``,
+      ``failure_kind``, ``retry_after_s``, ``duration_s``, ``detail``. This is
+      the **only** site that emits ``failure_kind``; the agent-cli backend
+      signals a non-retryable failure as ``permanent=True`` instead.
+    * ``orchestrator.py`` — **one per task**, summarising the whole
+      ``implement`` step: ``status``, ``iterations``, ``grounding_ok``,
+      ``duration_s``, ``detail``. It carries **no** ``tokens``/``cost_usd``;
+      sum the per-iteration backend spans for those.
+
+    ``backend`` and ``duration_s`` are the only fields every site emits
+    (``iteration`` is present on the three per-iteration sites).
+
+    ``quota_wait`` — the loop is sleeping out an exhausted subscription quota
+    window (``wait_s``).
+    ``shutdown`` — a Ctrl-C/SIGTERM stopped the loop: the detached agent was
+    terminated and the task left resumable.
+    ``abstain`` — the backend emitted the ``ABSTAIN`` sentinel and handed the
+    task to a human.
+
+Gates
+    ``validation`` — the oracle's validation leg verdict.
+    ``validation_infra`` — one validation command was *excused* from the verdict:
+    it could not run at all, or was already failing at the diff base.
+    ``grounding`` — the grounding gate's verdict on the changed files.
+    ``verify`` — the independent-verifier gate (``verdict``, ``confidence``,
+    ``votes``, ``agreement``, and ``error`` when the gate's own output contract
+    broke rather than the diff being wrong).
+    ``dep_blame`` — the dependency-blame gate fired.
+    ``freeze`` — a frozen acceptance test was modified; review fails outright.
+    ``mutation`` — the mutation gate's score for the change.
+    ``review`` — the review gate's verdict (``passed``, ``risk``, ``files``).
+
+Git / delivery
+    ``git`` — a repo-level git operation worth auditing (today: seeding a
+    dependency's work into a worktree).
+    ``push_guard`` — HEAD is no longer the reviewed commit (nor a descendant of
+    it), so the PR was withheld.
+    ``pr`` — a PR was opened or refused.
+
+Fleet
+    ``recovery`` — a provably-crashed task was rolled back and re-armed.
+    ``recovery_skipped`` — a stale-*looking* task was left alone: liveness could
+    not be established, and a rollback needs positive proof of death.
+    ``prune`` — a worktree was reclaimed, refused-and-reported, or errored.
+
+Span types are ``snake_case`` without exception: they are jq keys and grep
+targets, and one hyphenated outlier is a span nobody's saved query ever finds.
 
 The file is append-only across runs (each run gets a fresh ``run_id``), one
 line per span, so it stays greppable/jq-able:
@@ -29,13 +92,14 @@ every write failure is swallowed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from harness.log import get_logger
 
@@ -78,7 +142,7 @@ class Tracer:
     def path(self) -> Path:
         return Path(self.state_dir) / "trace.jsonl"
 
-    def for_task(self, task_id: str) -> "Tracer":
+    def for_task(self, task_id: str) -> Tracer:
         return Tracer(self.state_dir, run_id=self.run_id,
                       task_id=task_id, enabled=self.enabled)
 
@@ -89,21 +153,19 @@ class Tracer:
         rec: dict[str, Any] = {"ts": _now_iso(), "run_id": self.run_id,
                                "task_id": self.task_id, "type": span_type}
         rec.update({k: _clip(v) for k, v in fields.items()})
-        try:
+        # Both suppress(Exception) blocks: observability is best-effort — a
+        # failed mirror line or span write must never break the run.
+        with contextlib.suppress(Exception):
             # Mirror every span into the debug log so `-vv` interleaves gate
             # decisions with the surrounding narrative (same never-raise rule).
             logger.debug("span %s%s  %s", span_type,
                          f" [{self.task_id}]" if self.task_id else "",
                          "  ".join(f"{k}={v}" for k, v in fields.items()))
-        except Exception:  # noqa: BLE001 - observability is best-effort
-            pass
-        try:
+        with contextlib.suppress(Exception):
             line = json.dumps(rec, ensure_ascii=False, default=str)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        except Exception:  # noqa: BLE001 - observability is best-effort
-            pass
 
     # ── conveniences for the common spans ─────────────────────────────────────
 
@@ -123,8 +185,8 @@ def read_spans(state_dir: Path, *, task_id: str = "",
     if not path.is_file():
         return []
     out: list[dict] = []
-    for ln in path.read_text(encoding="utf-8").splitlines():
-        ln = ln.strip()
+    for raw_ln in path.read_text(encoding="utf-8").splitlines():
+        ln = raw_ln.strip()
         if not ln:
             continue
         try:
@@ -152,12 +214,11 @@ def render_spans(spans: list[dict]) -> str:
     return "\n".join(lines) if lines else "(no spans)"
 
 
-_disabled_singleton: Optional[Tracer] = None
+# Construction is side-effect-free and cheap, so the singleton is built
+# eagerly at import time (no `global` rebinding needed).
+_disabled_singleton = Tracer(Path("."), enabled=False)
 
 
 def noop_tracer() -> Tracer:
     """A disabled tracer for callers without config (keeps call sites simple)."""
-    global _disabled_singleton
-    if _disabled_singleton is None:
-        _disabled_singleton = Tracer(Path("."), enabled=False)
     return _disabled_singleton

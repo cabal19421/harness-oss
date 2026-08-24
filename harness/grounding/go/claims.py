@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 from harness.log import get_logger, redact, trunc
 
@@ -42,7 +41,7 @@ _BUILTINS = frozenset({
 })
 
 _IMPORT_SPEC = re.compile(r'^\s*(?:(\.|_|[A-Za-z_]\w*)\s+)?"([^"]+)"')
-_PACKAGE = re.compile(r'^\s*package\s+([A-Za-z_]\w*)', re.M)
+_PACKAGE = re.compile(r'^\s*package\s+([A-Za-z_]\w*)', re.MULTILINE)
 _SELECTOR = re.compile(r'(?<![\w.])([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)')
 _LOCAL_CALL = re.compile(r'(?<![\w.])([A-Za-z_]\w*)\s*\(')
 _IDENT_BEFORE = re.compile(r'([A-Za-z_]\w*)\s*$')
@@ -60,7 +59,7 @@ class GoSelector:
     owner: str           # identifier before the dot (candidate package alias)
     member: str
     called: bool
-    argc: Optional[int]
+    argc: int | None
     has_spread: bool          # f(xs...) — variadic spread, suppress arity check
     single_call_arg: bool     # f(g()) — g may return multiple values
     lineno: int
@@ -70,7 +69,7 @@ class GoSelector:
 @dataclass(frozen=True)
 class GoLocalCall:
     name: str
-    argc: Optional[int]
+    argc: int | None
     has_spread: bool
     single_call_arg: bool
     lineno: int
@@ -160,7 +159,7 @@ def _add_import(imports: list[GoImport], spec: str, lineno: int) -> None:
                      "be grounded or flagged", lineno, trunc(redact(spec), 80))
         return
     alias_tok, path = m.group(1), m.group(2)
-    alias = alias_tok if alias_tok else path.rsplit("/", 1)[-1]
+    alias = alias_tok or path.rsplit("/", 1)[-1]
     imports.append(GoImport(path=path, alias=alias, lineno=lineno))
 
 
@@ -176,7 +175,7 @@ def _extract_calls(code: str, scrubbed: str, claims: GoClaims) -> None:
         owner, member = m.group(1), m.group(2)
         end = m.end()
         called = _next_nonspace(scrubbed, end) == "("
-        argc = has_spread = single = None  # type: ignore[assignment]
+        argc = has_spread = single = None
         has_spread = False
         single = False
         if called:

@@ -23,10 +23,10 @@ from .reasoner import ground_go
 from .stdlib import is_stdlib_package, stdlib_packages
 
 __all__ = [
-    "GoKnowledgeBase",
-    "ground_go",
-    "extract_go_claims",
     "GoClaims",
+    "GoKnowledgeBase",
+    "extract_go_claims",
+    "ground_go",
     "is_stdlib_package",
     "stdlib_packages",
 ]

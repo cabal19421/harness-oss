@@ -24,7 +24,6 @@ import ast
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from harness.log import get_logger, trunc
 
@@ -48,7 +47,7 @@ class MutationReport:
     skipped_reason: str = ""
 
     @property
-    def score(self) -> Optional[float]:
+    def score(self) -> float | None:
         return None if self.total == 0 else self.killed / self.total
 
     def summary(self) -> str:
@@ -147,9 +146,9 @@ class _Mutator(ast.NodeTransformer):
         if node.value is True or node.value is False:
             if self._hit():
                 return ast.copy_location(ast.Constant(value=not node.value), node)
-        elif isinstance(node.value, int) and not isinstance(node.value, bool):
-            if self._hit():
-                return ast.copy_location(ast.Constant(value=node.value + 1), node)
+        elif (isinstance(node.value, int) and not isinstance(node.value, bool)
+              and self._hit()):
+            return ast.copy_location(ast.Constant(value=node.value + 1), node)
         return node
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
@@ -174,7 +173,7 @@ def collect_sites(source: str) -> list[MutantSite]:
     return collector.sites
 
 
-def mutated_source(source: str, site_index: int) -> Optional[str]:
+def mutated_source(source: str, site_index: int) -> str | None:
     """*source* with exactly the ``site_index``-th mutation applied."""
     tree = ast.parse(source)
     mutator = _Mutator(site_index)

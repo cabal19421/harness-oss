@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy the 'hooks' block into your agent CLI's project settings — this is for agent CLIs that support after-edit (PostToolUse-style) hooks; Gemini CLI currently has none, so use the side-car/manual invocation path in the README instead. After every Edit/Write, the harness grounding gate runs on the changed .py/.go file; if it references a symbol that doesn't exist (or wrong call arity), the finding is SURFACED to the agent (exit 2 -> stderr) as the reason to fix it. A PostToolUse-style hook cannot block — the tool already ran — so the model may or may not act on it; wire the same command to PostToolBatch if you want it to halt the loop. Requires `harness` on PATH (or use the full venv path to it).",
+  "_notes": [
+    "matcher: exact tool names, '|'-separated. MultiEdit is the legacy tool and is gone from the agent's toolset; NotebookEdit only ever writes .ipynb, which this gate skips anyway.",
+    "if: one permission rule, evaluated before the command runs, so a .md/.json/.ts edit no longer pays for an interpreter start + a whole-project symbol index. Written as Edit(...) on purpose: an Edit rule covers every built-in file-editing tool, while the same rule written for Write(...)/MultiEdit(...) is accepted and then never consulted. It is best-effort (fails open), which is why cli.py keeps its own suffix check.",
+    "asyncRewake: runs the pass in the background and still wakes the agent on exit 2 with harness's stderr attached, so a cold or large repo cannot stall the edit loop. Plain 'async' would be wrong here: its output is ignored, so the findings would vanish.",
+    "timeout: seconds. The default for a command hook is 600 — up to ten minutes of silent stall per edit.",
+    "${HARNESS_PROJECT_DIR}: the braced form is the placeholder hook runtimes substitute before any shell runs. The unbraced $HARNESS_PROJECT_DIR is a POSIX shell expansion and evaluates to EMPTY under PowerShell, which silently grounds against the wrong project root."
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Edit(*.py)",
+            "asyncRewake": true,
+            "timeout": 60,
+            "command": "harness verify --hook --project \"${HARNESS_PROJECT_DIR}\""
+          },
+          {
+            "type": "command",
+            "if": "Edit(*.go)",
+            "asyncRewake": true,
+            "timeout": 60,
+            "command": "harness verify --hook --project \"${HARNESS_PROJECT_DIR}\""
+          }
+        ]
+      }
+    ]
+  }
+}

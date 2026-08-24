@@ -17,21 +17,24 @@ Public API::
 """
 
 from .knowledge import KnowledgeBase, Symbol, SymbolTable
-from .preflight import Preflight, detect_language, preflight_check, SUPPORTED_LANGUAGES
-from .report import GroundingReport, Verdict
+from .preflight import SUPPORTED_LANGUAGES, Preflight, detect_language, preflight_check
 from .reasoner import ground
-from .solver import get_solver
+from .report import GroundingReport, Verdict
+from .solver import GuardAnalysis, Z3Unavailable, get_solver, require_z3_enabled
 
 __all__ = [
-    "Preflight",
-    "preflight_check",
-    "detect_language",
     "SUPPORTED_LANGUAGES",
-    "ground",
+    "GroundingReport",
+    "GuardAnalysis",
     "KnowledgeBase",
+    "Preflight",
     "Symbol",
     "SymbolTable",
-    "GroundingReport",
     "Verdict",
+    "Z3Unavailable",
+    "detect_language",
     "get_solver",
+    "ground",
+    "preflight_check",
+    "require_z3_enabled",
 ]

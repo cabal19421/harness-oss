@@ -9,12 +9,19 @@ run with your shell's privileges. That is a classic supply-chain hole:
 shell-executing config must never be taken verbatim from a source you do not
 control.
 
-So when ``PipelineConfig.untrusted_designs`` is set, every
-validation command a design proposes is filtered through an allowlist of known,
-side-effect-free build/test/lint runners. Anything else is dropped (fail
-*closed*) with a recorded reason, instead of executed. Commands the operator
-sets explicitly on the CLI / config (``--test-cmd`` etc.) are always trusted —
-they come from you, not the design.
+So when ``PipelineConfig.untrusted_designs`` is set, every validation command a
+design proposes is filtered through an allowlist of known, side-effect-free
+build/test/lint runners. Anything else is dropped (fail *closed*) with a
+recorded reason, instead of executed. Commands the operator sets explicitly on
+the CLI / config (``--test-cmd`` etc.) are always trusted — they come from you,
+not the design.
+
+Filtering is only half the boundary, because the allowlist bounds *what* may run
+and not whether what runs checks anything: ``pytest tests/smoke_test.py`` and
+``go test ./internal/empty`` are allowlisted *and* trivially green. So in
+untrusted mode a design's commands are also **additive** — they are appended to
+the operator's oracle rather than substituted for it, and can only lengthen what
+a pass means. See :func:`compose_untrusted_validation`.
 
 Allowlisting the *executable* alone is not enough, because three things below it
 also choose what runs: the first argument of a multiplexer (``go run`` is not
@@ -250,3 +257,84 @@ def filter_validation(commands: list[str]) -> tuple[list[str], list[str]]:
         logger.debug("untrusted-design validation filter: %d allowed, %d dropped "
                      "of %d command(s)", len(allowed), len(rejected), len(commands))
     return allowed, rejected
+
+
+def dedup_commands(commands: list[str]) -> list[str]:
+    """*commands* with blanks dropped and repeats removed, order preserved.
+
+    Dropping a whitespace-only command is not tidiness. Such a "command" has no
+    argv at all: ``run_validation`` sees no metacharacters, hands the empty
+    string to the runner, and it exits 0 — a **passed** leg that ran nothing,
+    which is precisely the vacuous green the oracle exists to prevent. It also
+    hides the orchestrator's "no validation oracle configured" warning, because
+    the command list is no longer empty. ``--test-cmd "   "`` is all it takes.
+
+    Repeats are dropped on the *stripped* command line, keeping the first
+    spelling, so a design that re-declares a command the operator already runs
+    does not run it twice.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        key = command.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(command)
+    return out
+
+
+def compose_untrusted_validation(
+        operator: list[str], design: list[str]) -> tuple[list[str], list[str]]:
+    """The oracle for an untrusted design — ``(effective, rejected)``.
+
+    *operator* is the operator's own oracle (``config.default_validation()``:
+    ``--test-cmd``/``--type-cmd``/``--lint-cmd`` or the autodetected suite);
+    *design* is what the design doc declared. The result is the operator's
+    commands followed by the allowlisted design commands, de-duplicated with
+    the operator side kept first.
+
+    Additive, not substitutive. :func:`is_safe_validation_command` bounds *what*
+    a design may run; it cannot bound whether what runs checks anything —
+    ``pytest tests/smoke_test.py``, ``go test ./internal/empty`` and a ``mypy .``
+    over an empty package all pass the allowlist and are trivially green. So while
+    a design's list was allowed to *replace* the operator's, a contributed design
+    could displace the operator's suite with an allowlisted no-op and still be
+    published as "oracle all green" — the allowlist never fires, and nothing in the
+    oracle covers the gap (the mutation gate re-runs these same commands, the
+    verifier fails open, grounding judges symbols rather than test strength).
+    Appending instead means a contributed design can only ever *lengthen* what a
+    pass means: a gate a contribution brings with it is an additive check inserted
+    after the core steps, never a substitute for one of them.
+
+    The operator half goes in **unfiltered** and survives even when every design
+    command is rejected. It is trusted by contract — it comes from the operator,
+    not the design — and it is not allowlist-shaped: ``.venv/bin/python -m pytest
+    -q``, the ordinary spelling of a project-local interpreter, is rejected by the
+    allowlist (``leading runner '.venv/bin/python' is not on the allowlist``).
+    That matters beyond this union, because a design that declares no validation
+    at all is *seeded* with the operator's commands at plan time
+    (``ingest.tasks_from_doc``); running the seeded copy through the filter
+    dropped the operator's own oracle and left nothing to disprove, i.e. the
+    vacuous pass of ``run_validation_report([])``. A design command that repeats
+    one of the operator's is likewise trusted rather than filtered, so it is never
+    reported as "dropped" while the identical operator command runs.
+
+    Both sides go through :func:`dedup_commands` first, so a blank command
+    (``--test-cmd "   "``) is neither run nor reported as a rejected design
+    command, and a repeat on either side runs once.
+
+    An operator who genuinely needs a *narrower* oracle (one package of a
+    monorepo) keeps the escape hatch they always had: set ``--test-cmd`` /
+    ``HARNESS_TEST_CMD`` (etc.) to the narrower command. That is the very half
+    this union re-asserts. A design can no longer choose it for them.
+    """
+    operator_side = dedup_commands(operator)
+    trusted = {c.strip() for c in operator_side}
+    allowed, rejected = filter_validation(
+        [c for c in dedup_commands(design) if c.strip() not in trusted])
+    effective = dedup_commands([*operator_side, *allowed])
+    logger.debug("untrusted-design oracle: %d operator command(s) + %d allowed "
+                 "design command(s) → %d after dedup (%d design command(s) dropped)",
+                 len(operator), len(allowed), len(effective), len(rejected))
+    return effective, rejected

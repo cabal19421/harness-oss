@@ -103,6 +103,28 @@ def _as_opt_float(v: Any) -> float | None:
         return None
 
 
+def _as_patterns(v: Any) -> tuple[str, ...]:
+    """Normalise a pattern list from env (``a,b``), CLI or a caller's sequence.
+
+    A bare string is SPLIT, never iterated: ``protected_paths=".env"`` iterated
+    per character would protect nothing and match everything — a silent
+    inversion of a fail-closed guard, so it is handled here rather than trusted
+    to every construction site.
+    """
+    if v is None or v == "":
+        return ()
+    if isinstance(v, str):
+        parts: list[str] = re.split(r"[,\n]", v)
+    else:
+        try:
+            parts = [str(p) for p in v]
+        except TypeError:
+            logger.debug("ignoring non-iterable pattern config value (type=%s) — "
+                         "treating as unset", type(v).__name__)
+            return ()
+    return tuple(p.strip() for p in parts if p and p.strip())
+
+
 # ── task ──────────────────────────────────────────────────────────────────────
 
 
@@ -320,6 +342,20 @@ class PipelineConfig:
     # When set, validation commands a *design doc* proposes are allowlist-filtered
     # (fail-closed) instead of executed — for gating contributions you didn't write.
     untrusted_designs: bool = False
+    # (env: HARNESS_PROTECTED_PATHS, comma-separated) Paths the pipeline's own
+    # catch-all `git add -A` must never sweep into a commit. The sweep is what
+    # turns "the agent dropped a file in the worktree" into "the file is on a
+    # remote" — a .env it wrote to make the suite pass, a credentials file it
+    # copied in to reproduce a bug, a 2 GB model download. A match REFUSES the
+    # automatic commit (review FAILs with the path and the rule in its reasons)
+    # and leaves index and worktree untouched; it never deletes or resets.
+    # Empty by default, so an unconfigured run behaves exactly as before —
+    # harness works in an isolated per-task worktree, which already bounds the
+    # blast radius, so this is opt-in rather than a default policy.
+    # Rules match repo-relative paths: an exact path, a glob, a directory
+    # prefix, or — for a rule naming no directory — the basename at any depth
+    # (`.env` catches `services/api/.env`).
+    protected_paths: tuple[str, ...] = ()
     # Terminate processes still running inside a worktree before removing it.
     # When off, a worktree with live processes inside is REFUSED and reported
     # (never bulldozed): `prune` leaves it on disk with a reason.
@@ -512,6 +548,9 @@ class PipelineConfig:
             self.worktree_root = self.repo.parent / ".harness-wt" / self.repo.name
         else:
             self.worktree_root = Path(self.worktree_root).resolve()
+        # A guard is only as good as its rule list: normalise here so a caller
+        # that passed a single string (or a list) still gets whole patterns.
+        self.protected_paths = _as_patterns(self.protected_paths)
         # Not dataclass fields (they are derived, not configured): the resolved
         # versions of the tools the autodetected oracle depends on, and the
         # process-local cache behind them.
@@ -529,13 +568,41 @@ class PipelineConfig:
     def default_validation(self) -> list[str]:
         """The oracle commands used when a design doc names none.
 
+        Under ``untrusted_designs`` they are used even when a design *does* name
+        its own: there these commands are the trusted half of every task's oracle,
+        unioned with the design's allowlisted ones rather than replaced by them,
+        because they come from the operator and a design nobody here wrote may only
+        lengthen what a pass means. See
+        :attr:`~harness.pipeline.backends.base.ImplementContext.validation`.
+
         Includes a **type checker** alongside tests where the repo supports one —
         a type checker closes the grounding gate's blind spot (it can't infer the
         type of a local variable, but a type checker can). A checker is only added
         when it's both installed *and* the repo is configured for it, so we never
         impose a failing check on a repo that isn't set up for it.
         """
-        cmds = [c for c in (self.test_cmd, self.type_cmd, self.lint_cmd) if c]
+        # `if c.strip()`, not `if c`: a whitespace-only override (`--test-cmd
+        # "   "`) is truthy but has no argv, and an empty command line exits 0
+        # as a *passed* leg that ran nothing — a vacuous green wearing an
+        # oracle's name, and one that also silences the "no validation oracle
+        # configured" warning by making the list non-empty.
+        configured = [(name, c) for name, c in (("test_cmd", self.test_cmd),
+                                                ("type_cmd", self.type_cmd),
+                                                ("lint_cmd", self.lint_cmd)) if c]
+        blank = [name for name, c in configured if not c.strip()]
+        cmds = [c for _name, c in configured if c.strip()]
+        if blank:
+            # Dropping it silently would be its own trap: the operator probably
+            # meant "no oracle", and a dropped override falls through to the
+            # AUTODETECTED suite below, which is emphatically not nothing.
+            logger.warning("configured %s is whitespace-only and has no command to "
+                           "run — dropping it (an empty command line exits 0 as a leg "
+                           "that judged nothing). %s",
+                           " / ".join(blank),
+                           "The other configured command(s) still stand." if cmds else
+                           "Nothing configured survives, so the oracle falls back to "
+                           "AUTODETECTION — which is not the same as running no "
+                           "checks at all.")
         if cmds:
             logger.debug("default validation: %d explicitly configured command(s)", len(cmds))
             return cmds
@@ -812,6 +879,8 @@ class PipelineConfig:
             "dependency_blame_gate": _as_bool(
                 overrides.get("dependency_blame_gate", env.get("HARNESS_DEP_BLAME_GATE", "1"))),
             "require_z3": _as_bool(overrides.get("require_z3", env.get("HARNESS_REQUIRE_Z3", "0"))),
+            "protected_paths": _as_patterns(
+                overrides.get("protected_paths", env.get("HARNESS_PROTECTED_PATHS"))),
             "validation_baseline": _as_bool(overrides.get(
                 "validation_baseline", env.get("HARNESS_VALIDATION_BASELINE", "0"))),
             "test_cmd": overrides.get("test_cmd", env.get("HARNESS_TEST_CMD")),

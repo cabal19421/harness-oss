@@ -16,6 +16,7 @@ import json
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,12 +69,37 @@ def head_bound_to_review(worktree: Path, reviewed_sha: str) -> tuple[bool, str]:
     return False, detail
 
 
+def _ahead_revs(repo: Path, base: str, branch: str) -> tuple[str, str]:
+    """*base* and *branch* as git **revisions**, for the ahead-count gate.
+
+    Both arrive here as short names, and both reach ``rev-list`` — where git's
+    disambiguation ranks ``refs/tags/<n>`` above ``refs/heads/<n>``. A tag
+    sharing either name therefore answers the "did this task produce anything?"
+    question for the branch it shadows: a tag on the base sitting ahead of the
+    branch, or a tag named ``agent/<task-id>`` pointing at the base, both read
+    as **0 ahead** — and this gate withholds the PR for work that is really
+    there. Same hazard, same fix as :func:`gitutil.qualify_ref` and
+    :meth:`~harness.pipeline.worktree.WorktreeManager._head_ref`.
+
+    The short names stay in every message and in ``gh pr create --base``, which
+    takes a branch name rather than a revision.
+    """
+    return gitutil.qualify_ref(repo, base), f"refs/heads/{branch}"
+
+
 class PrCreator(ABC):
     mode: str = "base"
 
     @abstractmethod
     def open(self, *, repo: Path, worktree: Path, branch: str, base: str,
-             title: str, body: str, reviewed_sha: str = "") -> PrResult:
+             title: str, body: str, reviewed_sha: str = "",
+             protected_paths: Sequence[str] = ()) -> PrResult:
+        """Open the PR. *protected_paths* vetoes this step's catch-all stage.
+
+        Empty (the default) keeps the historical behaviour exactly; a match
+        returns a failed :class:`PrResult` instead of committing, leaving index
+        and worktree as they were.
+        """
         ...
 
 
@@ -81,21 +107,33 @@ class LocalBranchPR(PrCreator):
     mode = "local"
 
     def open(self, *, repo: Path, worktree: Path, branch: str, base: str,
-             title: str, body: str, reviewed_sha: str = "") -> PrResult:
+             title: str, body: str, reviewed_sha: str = "",
+             protected_paths: Sequence[str] = ()) -> PrResult:
         # Commit any leftover work in the worktree so the branch is the PR.
         if gitutil.working_tree_dirty(worktree):
             logger.debug("local PR: worktree %s dirty — committing leftover "
                          "work so branch %r carries it", worktree, branch)
-            gitutil.add_all(worktree)
-            gitutil.commit(worktree, title)
+            try:
+                gitutil.add_all_guarded(worktree, protected_paths)
+            except gitutil.ProtectedPathError as exc:
+                logger.error("local PR not opened for %r: %s", branch, exc)
+                return PrResult(ok=False, detail=str(exc))
+            # Same index-not-status rule as the agent loops: dirt `git add -A`
+            # cannot stage (a dirty submodule) leaves an empty index, and the
+            # `git commit` that follows would fail for nothing. The real
+            # diagnosis is the `ahead == 0` check just below, which says what
+            # this branch actually carries.
+            if not gitutil.nothing_to_commit(worktree):
+                gitutil.commit(worktree, title)
 
         bound, why = head_bound_to_review(worktree, reviewed_sha)
         if not bound:
             return PrResult(ok=False, detail=why)
 
-        ahead = gitutil.commits_ahead(repo, base, branch)
-        logger.debug("local PR: branch %r is %d commit(s) ahead of %r",
-                     branch, ahead, base)
+        base_rev, branch_rev = _ahead_revs(repo, base, branch)
+        ahead = gitutil.commits_ahead(repo, base_rev, branch_rev)
+        logger.debug("local PR: branch %r is %d commit(s) ahead of %r "
+                     "(measured %s..%s)", branch, ahead, base, base_rev, branch_rev)
         if ahead == 0:
             logger.warning("local PR not opened: branch %r has no commits ahead "
                            "of %r — nothing was implemented or committed",
@@ -120,7 +158,8 @@ class GitHubPR(PrCreator):
     mode = "github"
 
     def open(self, *, repo: Path, worktree: Path, branch: str, base: str,
-             title: str, body: str, reviewed_sha: str = "") -> PrResult:
+             title: str, body: str, reviewed_sha: str = "",
+             protected_paths: Sequence[str] = ()) -> PrResult:
         if shutil.which("gh") is None:
             logger.warning("github PR not opened: `gh` CLI not found on PATH — "
                            "returning error result (use --pr local for offline "
@@ -150,14 +189,23 @@ class GitHubPR(PrCreator):
         if gitutil.working_tree_dirty(worktree):
             logger.debug("github PR: worktree %s dirty — committing leftover "
                          "work so the push carries it", worktree)
-            gitutil.add_all(worktree)
-            gitutil.commit(worktree, title)
+            try:
+                gitutil.add_all_guarded(worktree, protected_paths)
+            except gitutil.ProtectedPathError as exc:
+                # Refused BEFORE the push, like the auth preflight above: the
+                # remote side effect is the one harness cannot undo.
+                logger.error("github PR not opened for %r: %s", branch, exc)
+                return PrResult(ok=False, detail=str(exc))
+            # Same index-not-status rule as the agent loops — see LocalBranchPR.
+            if not gitutil.nothing_to_commit(worktree):
+                gitutil.commit(worktree, title)
         # Last check before the irreversible remote side effect: the commit we
         # are about to push must be the reviewed one (or descend from it).
         bound, why = head_bound_to_review(worktree, reviewed_sha)
         if not bound:
             return PrResult(ok=False, detail=why)
-        if gitutil.commits_ahead(repo, base, branch) == 0:
+        base_rev, branch_rev = _ahead_revs(repo, base, branch)
+        if gitutil.commits_ahead(repo, base_rev, branch_rev) == 0:
             logger.warning("github PR not opened: branch %r has no commits "
                            "ahead of %r — nothing to push", branch, base)
             return PrResult(ok=False, detail=f"branch '{branch}' has no commits ahead of '{base}'.")

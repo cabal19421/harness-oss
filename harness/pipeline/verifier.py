@@ -45,6 +45,17 @@ and an answer that ran but did not conform is a **fail**, not a skip: a gate tha
 silently opens on output-format drift is defeated by exactly the drift the schema
 exists to make impossible. Backends with no schema knob (the openai/gemini API
 backends) keep the prose regex and its fail-open behaviour.
+
+Nor does it fail open on a change it was never SHOWN. The caller hands this gate
+a diff *and* ``file_manifest`` — gitutil's authoritative ``<status> <path>``
+listing of the same change — and an empty diff beside a NON-EMPTY manifest is not
+"nothing to verify": it is a change whose body could not be rendered (the concrete
+case: a file whose content is not UTF-8 degrades its chunk to nothing in
+``gitutil._diff_body``). Skipping there would ship an unjudged change to a PR with
+zero verifiers asked and a DEBUG line as the only trace — a failure to run
+reported as a pass. So that case **abstains**, which raises the task to human
+review, naming the manifest entries that have no rendered hunks. ``skip`` survives
+only for the honest version: no diff and no manifest either.
 """
 
 from __future__ import annotations
@@ -57,6 +68,7 @@ from typing import Any
 
 from harness.log import get_logger
 
+from . import gitutil
 from .gitutil import DIFF_TRUNCATED, MANIFEST_CLIPPED
 
 logger = get_logger(__name__)
@@ -190,8 +202,10 @@ def verify_change(
     A clipped diff is otherwise indistinguishable from a change that is missing a
     file, and judges have failed changes on that mistake; with the manifest
     present a truncated diff additionally becomes a mandatory ABSTAIN rather than
-    a FAIL on absence grounds. Defaults to ``""`` — omit it and the prompt is
-    byte-identical to before.
+    a FAIL on absence grounds, and an EMPTY diff whose manifest is NOT empty is an
+    ``abstain`` rather than a ``skip``: what the diff could not render is unshown,
+    not absent, and no verifier saw it. Defaults to ``""`` — omit it and the
+    prompt is byte-identical to before.
 
     ``samples`` is the number of independent adversarial verifiers, FLOORED AT 2:
     an implementer's diff is never judged by a single agent while this gate runs.
@@ -211,8 +225,16 @@ def verify_change(
         return VerifierReport(verdict="skip",
                               reasons=["verifier unavailable for this backend"])
     if not diff.strip():
-        logger.debug("verifier skipped: empty diff (nothing to verify)")
-        return VerifierReport(verdict="skip", reasons=["empty diff — nothing to verify"])
+        # An empty diff is "nothing to verify" ONLY when the manifest is empty
+        # too. The manifest is the complete file list of the SAME change
+        # (gitutil.diff_manifest), so entries beside an empty body mean the body
+        # could not be rendered, not that nothing changed — and skipping would
+        # hand the PR a clean gate that never ran.
+        if not file_manifest.strip():
+            logger.debug("verifier skipped: empty diff (nothing to verify)")
+            return VerifierReport(verdict="skip",
+                                  reasons=["empty diff — nothing to verify"])
+        return _unrendered_change_abstain(file_manifest)
 
     # The floor is 2, not 1: at least two adversarial verifiers per implementer,
     # even if a config/env/per-task override asks for 1 (or 0). A lone judge that
@@ -348,7 +370,13 @@ def _build_prompt(title: str, intent: str, diff: str, grounding_summary: str,
     # clipped manifest arms the same ABSTAIN rule as a clipped body, and the
     # heading stops claiming authority.
     clipped = MANIFEST_CLIPPED in file_manifest
-    truncated = DIFF_TRUNCATED.strip() in diff or clipped
+    # A manifest entry with NO hunks in the body states the same fact a truncation
+    # marker does — "what you were shown is not the whole change" — and it is the
+    # one that survives when the body lost a file WITHOUT leaving a marker (a
+    # chunk gitutil could not render). Either arms the rule, so the prompt can
+    # never present an incomplete diff as a complete one.
+    unshown = _unshown_manifest_paths(file_manifest, diff)
+    truncated = _diff_is_incomplete(diff) or clipped or bool(unshown)
     heading = ("Files in this change (LIST CLIPPED — MORE FILES EXIST than are "
                "named here)" if clipped
                else "Every file in this change (COMPLETE and AUTHORITATIVE)")
@@ -359,9 +387,14 @@ def _build_prompt(title: str, intent: str, diff: str, grounding_summary: str,
     complete_claim = ("The file list above is itself CLIPPED, so it does not name "
                       "every file either." if clipped
                       else "The file list above IS complete.")
+    # Name the files the body never shows: "unshown" is only actionable for the
+    # judge if it knows WHICH files it cannot see.
+    unshown_claim = ("" if not unshown else
+                     " These file(s) are IN the change but have no hunks in the "
+                     "diff below — unshown, NOT absent: " + _name_list(unshown) + ".")
     truncation_rule = (f"""
 IMPORTANT — the evidence you were given is TRUNCATED. It does not show every file \
-or every line. {complete_claim} You must NOT conclude that a file, \
+or every line. {complete_claim}{unshown_claim} You must NOT conclude that a file, \
 a test, or a function is missing because you cannot see it here: if a question \
 turns on the ABSENCE of something, the diff is insufficient evidence and your \
 verdict MUST be ABSTAIN, never FAIL. FAIL only on something you can SEE and quote.
@@ -404,6 +437,211 @@ Use FAIL if the diff does not correctly implement the task. Use ABSTAIN if you \
 cannot tell from the diff (insufficient evidence)\
 {" — INCLUDING any question that turns on something being absent, because this diff is truncated" if truncated else ""}. \
 Use PASS only if the diff clearly and correctly implements the task."""
+
+
+def _unrendered_change_abstain(file_manifest: str) -> VerifierReport:
+    """The verdict for a change whose diff rendered as nothing at all.
+
+    ABSTAIN, not SKIP and not FAIL: the gate's contract is that a failure to RUN
+    is not a pass, and abstain is the verdict that says "I could not tell" — the
+    caller raises the task to ``high`` risk and a human reads it. FAIL would be a
+    lie in the other direction (nothing here judged the change wrong), and skip
+    is the bug this closes.
+    """
+    paths = _manifest_paths(file_manifest)
+    clipped = MANIFEST_CLIPPED in file_manifest
+    named = _name_list(paths) or "none of them named — the list is clipped"
+    logger.warning("verifier ABSTAIN: the diff is empty but the file manifest lists "
+                   "%d changed file(s) (%s) — the change was not rendered, so no "
+                   "verifier was asked and nothing was judged", len(paths), named)
+    return VerifierReport(
+        verdict="abstain",
+        reasons=[
+            f"the diff is EMPTY while the file manifest lists {len(paths)} changed "
+            f"file(s) with no rendered hunks ({named})"
+            + (", and the manifest is itself clipped, so more files exist"
+               if clipped else "")
+            + " — unshown is not absent: the change could not be rendered as a diff "
+              "(a file whose content is not UTF-8 renders as an empty chunk), so no "
+              "verifier was asked and nothing was judged. Abstaining to a human "
+              "rather than reporting a gate that never ran as a pass"],
+    )
+
+
+def _manifest_paths(file_manifest: str) -> list[str]:
+    """The paths of a ``<status> <path>`` manifest (:func:`gitutil.diff_manifest`).
+
+    The clip marker line is not a file, so it is dropped here; callers that care
+    test ``MANIFEST_CLIPPED`` separately. Nothing is stripped off a path: git
+    reports ``"trail2 "`` with its trailing space, and a "tidied" entry names a
+    file that does not exist.
+    """
+    paths: list[str] = []
+    for raw in file_manifest.splitlines():
+        if not raw.strip() or MANIFEST_CLIPPED in raw:
+            continue
+        status, sep, rest = raw.partition(" ")
+        path = rest if sep else status          # a bare line is taken as a path
+        if path.strip():
+            paths.append(path)
+    return paths
+
+
+# The lines that may appear in a chunk's HEADER region — between ``diff --git``
+# and that chunk's first ``@@``. Any other line ends the region, and that is what
+# stops hunk CONTENT from forging a header: a removed line whose text begins
+# "-- " renders as "--- …" and an added line beginning "++ " renders as "+++ …"
+# (ordinary SQL/Lua/Haskell comments, and routine in a fixture that embeds a
+# diff). A bare-prefix reader accepted such a line and reported a file the diff
+# never rendered as shown — a false clear, in the one direction this gate must
+# not fail.
+_DIFF_HEADER_LINE = re.compile(
+    r"^(?:index |old mode |new mode |new file mode |deleted file mode |"
+    r"similarity index |dissimilarity index |rename (?:from|to) |"
+    r"copy (?:from|to) |--- |\+\+\+ |Binary files |GIT binary patch)")
+_DIFF_GIT_PREFIX = "diff --git "
+_BINARY_PREFIX = "Binary files "
+_BINARY_SUFFIX = " differ"
+
+
+def _strip_diff_prefix(token: str) -> str:
+    """Drop git's ``a/``/``b/`` diff prefix — exactly one, only where grammar says
+    there is one, so a repository with a top-level ``a/`` directory keeps its
+    real path."""
+    return token[2:] if token[:2] in ("a/", "b/") else token
+
+
+def _paired_paths(rest: str, sep: str) -> list[str]:
+    """The paths of an ``a/<old><sep>b/<new>`` pair — ``[]`` when ambiguous.
+
+    A path may contain spaces, so this pair must NOT be split on whitespace:
+    ``diff --git a/my file.py b/my file.py`` came apart into "my" and "file.py",
+    which named a DIFFERENT file (``file.py``) as shown — so a change whose
+    file.py chunk really was missing read as fully rendered and the ABSTAIN rule
+    stayed disarmed. Every chunk but a rename/copy names the same path twice, and
+    that case is exact arithmetic: the midpoint is the only split that rebuilds
+    the line. Otherwise accept the split only when it is unambiguous (exactly two
+    parts) and name NOTHING rather than guess — the ``---``/``+++`` and
+    ``rename to`` lines carry spaced names losslessly, and an unnamed file merely
+    reads as unshown, which is the safe direction.
+    """
+    body = len(rest) - len("a/") - len(sep) - len("b/")
+    if body > 0 and body % 2 == 0:
+        candidate = rest[2:2 + body // 2]
+        if rest == f"a/{candidate}{sep}b/{candidate}":
+            return [candidate]
+    parts = rest.split(sep)
+    if len(parts) == 2:
+        return [_strip_diff_prefix(parts[0]), _strip_diff_prefix(parts[1])]
+    return []
+
+
+def _header_path(value: str) -> str:
+    """The path on a ``---``/``+++`` line, losslessly.
+
+    Git appends a TAB after a name that contains a space (``+++ b/my file.py\t``),
+    so the tab — never whitespace — ends the name. Trimming instead renames a file
+    whose name genuinely ends in a space (git renders ``trail2 `` as
+    ``+++ b/trail2 \t``) into one that does not exist; that reads as unshown,
+    which is safe but spends the gate's teeth for nothing.
+    """
+    return _strip_diff_prefix(value.split("\t", 1)[0])
+
+
+def _paths_named_in_diff(diff: str) -> set[str]:
+    """Every path the diff's chunk HEADERS name — hunks or not.
+
+    Read structurally rather than by line prefix: a line counts only inside a
+    chunk's header region (opened by ``diff --git``, closed by the first line
+    that is not a header line — normally the ``@@``), and a ``---`` counts only
+    as half of an ADJACENT ``---``/``+++`` pair. Hunk content can render lines
+    that look exactly like headers, and one forged header clears a file the diff
+    never showed.
+
+    A binary file counts as named: its ``Binary files a/x and b/x differ`` header
+    tells the judge the file is in the change, which is the question here. So
+    does a chunk with no hunks at all (a mode change), via its ``diff --git``.
+    """
+    named: set[str] = set()
+
+    def _add(path: str) -> None:
+        if path and path != "/dev/null":
+            named.add(path)
+
+    lines = diff.splitlines()
+    in_header = False
+    for i, line in enumerate(lines):
+        if line.startswith(_DIFF_GIT_PREFIX):
+            in_header = True
+            for path in _paired_paths(line[len(_DIFF_GIT_PREFIX):], " "):
+                _add(path)
+        elif not in_header or not _DIFF_HEADER_LINE.match(line):
+            in_header = False                   # a hunk, or content: names nothing
+        elif line.startswith(("rename from ", "rename to ",
+                              "copy from ", "copy to ")):
+            _add(line.split(" ", 2)[2])
+        elif line.startswith(_BINARY_PREFIX) and line.endswith(_BINARY_SUFFIX):
+            for path in _paired_paths(
+                    line[len(_BINARY_PREFIX):-len(_BINARY_SUFFIX)], " and "):
+                _add(path)
+        elif (line.startswith("--- ") and i + 1 < len(lines)
+                and lines[i + 1].startswith("+++ ")):
+            _add(_header_path(line[4:]))
+            _add(_header_path(lines[i + 1][4:]))
+    return named
+
+
+def _unshown_manifest_paths(file_manifest: str, diff: str) -> list[str]:
+    """Manifest entries the diff never names — the "unshown, not absent" set.
+
+    Conservative in one direction only: a body and a manifest that SPELL a name
+    differently (git still C-quotes a path containing ``"`` or a control byte in
+    the body, which the manifest un-quotes) reads as unshown and arms the abstain
+    rule — a little of the gate's teeth spent, never a file hidden. Spaces and
+    trailing spaces are NOT in that bucket: :func:`_paths_named_in_diff` parses
+    those losslessly, because over-arming on every change that carries such a
+    file is a cost with no payer.
+
+    Empty when there is no manifest, and empty when the diff names no file at
+    all: a body with no file headers is not a rendered unified diff (a caller's
+    free-form text, as several callers and tests pass), so there is nothing to
+    compare and the prompt stays exactly as it was. The case that actually ships
+    — a body rendered as NOTHING — never reaches here: :func:`verify_change`
+    settles it before a prompt is built.
+    """
+    entries = _manifest_paths(file_manifest)
+    if not entries:
+        return []
+    named = _paths_named_in_diff(diff)
+    if not named:
+        return []
+    return [p for p in entries if p not in named]
+
+
+def _diff_is_incomplete(diff: str) -> bool:
+    """True when the diff BODY itself says it is not the whole change.
+
+    ``DIFF_TRUNCATED`` is the marker that exists today. Any other ``DIFF_*``
+    string constant gitutil grows later — for instance one marking a chunk it
+    could not render — counts too: they are looked up by that convention rather
+    than imported by name, so a new marker arms the mandatory-ABSTAIN rule the
+    day it lands next door instead of the day someone remembers this module. The
+    manifest-vs-diff comparison above is the primary check and depends on no
+    marker existing at all.
+    """
+    markers = {DIFF_TRUNCATED.strip()}
+    markers.update(value.strip() for name, value in vars(gitutil).items()
+                   if name.startswith("DIFF_") and isinstance(value, str)
+                   and value.strip())
+    return any(marker in diff for marker in markers)
+
+
+def _name_list(paths: list[str], limit: int = 8) -> str:
+    """``a, b, c (+4 more)`` — bounded: a manifest carries up to 400 entries."""
+    if not paths:
+        return ""
+    shown = ", ".join(paths[:limit])
+    return shown if len(paths) <= limit else f"{shown} (+{len(paths) - limit} more)"
 
 
 def _one_answer(ask: Ask | None, ask_structured: AskStructured | None,

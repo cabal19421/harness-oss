@@ -86,9 +86,12 @@ harness [-v|-vv|-q] [--log-file PATH] [--version]
 │   │          [--no-verify] [--verify-samples] [--no-progress-window]
 │   │          [--no-dep-blame-gate] [--require-z3] [--validation-baseline] [--no-pr]
 │   ├── status                                      #   show plan / task state
-│   ├── tmux   [--max] [--no-attach]                #   one visible window per feature + dashboard
+│   ├── tmux   [--backend] [--pr] [--max] [--no-attach]
+│   │                                               #   one visible window per feature + dashboard
 │   ├── complete <task-id> [--pr] [--no-pr] [--mutation-min]
 │   │                                               #   finish an IDE-implemented task → PR
+│   ├── requeue <task-id>… [--reset-attempts] [--force]
+│   │                                               #   return awaiting-human/blocked/failed tasks to pending
 │   ├── supervise [--recover]                       #   liveness report + crash recovery
 │   ├── prune  [--allow-unlanded] [--allow-dirty] [--force]
 │   │                                               #   refuse-and-report teardown of landed worktrees
@@ -125,8 +128,9 @@ A layer built *on top of* the grounding engine that turns markdown **design
 documents** into **pull requests** — one per independent task. It fuses the
 shell-script loop in `loopeng/` — a plan → implement → review workflow
 (`ralph.sh`, `orchestrate.sh`, `review.sh`) — with the harness's grounding gate,
-and exposes the whole thing through `harness pipeline …` and editor tasks (no
-tmux).
+and exposes the whole thing through `harness pipeline …` and editor tasks, with
+the tmux cockpit (`pipeline tmux`, `cockpit.py`) as an optional extra rather than
+the primary interface.
 
 ```mermaid
 flowchart TB
@@ -157,7 +161,7 @@ flowchart TB
 | Component | Responsibility |
 |---|---|
 | `ingest.py` | Parse `designs/*.md` → a `Plan` of independent, risk-tagged `Task`s. **Deterministic, LLM-free** — reads markdown structure (frontmatter, `## Tasks` checklist, sections), not vibes. |
-| `spec.py` | `Task` / `Plan` / `PipelineConfig` data models + lifecycle (`pending → implementing → awaiting-human → review → done`, with `blocked`/`failed` terminal; the enum also defines a `grounding` status that is **defined but never entered** — tasks move straight `pending → implementing`). `PipelineConfig` carries every run knob and is the single place a default lives: unattended safety (`reset_on_failure`, `max_agent_retries`, `backoff_base_seconds`, `max_consecutive_failures`, `no_progress_window`, `max_tokens`, `max_cost_usd`, `quota_wait_cap_seconds`, `max_quota_waits`, `prevent_sleep`), trust/supervision (`untrusted_designs`, `kill_worktree_procs`, `reset_worktree_on_reuse`, `worktree_stale_seconds`, `max_task_attempts`), gates (`verify`, `verify_samples`, `dependency_blame_gate`, `require_z3`, `validation_baseline`, `mutation_min_score`/`mutation_max_mutants`/`mutation_timeout`, `trace`) and agent invocation (`allowed_tools`, `agent_model`, `agent_fallback_model`, `max_agent_turns`, `openai_*`, `gemini_model`, `api_timeout_seconds`). `from_env` fills any gap a CLI flag left from `HARNESS_*`; the field↔env↔flag mapping is tabulated in [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference). |
+| `spec.py` | `Task` / `Plan` / `PipelineConfig` data models + lifecycle (`pending → implementing → awaiting-human → review → done`, with `blocked`/`failed` terminal; the enum also defines a `grounding` status that is **defined but never entered** — tasks move straight `pending → implementing`). `PipelineConfig` carries every run knob and is the single place a default lives: unattended safety (`reset_on_failure`, `max_agent_retries`, `backoff_base_seconds`, `max_consecutive_failures`, `no_progress_window`, `max_tokens`, `max_cost_usd`, `quota_wait_cap_seconds`, `max_quota_waits`, `prevent_sleep`), trust/supervision (`untrusted_designs`, `protected_paths`, `kill_worktree_procs`, `reset_worktree_on_reuse`, `worktree_stale_seconds`, `max_task_attempts`), gates (`verify`, `verify_samples`, `dependency_blame_gate`, `require_z3`, `validation_baseline`, `mutation_min_score`/`mutation_max_mutants`/`mutation_timeout`, `trace`) and agent invocation (`allowed_tools`, `agent_model`, `agent_fallback_model`, `max_agent_turns`, `openai_*`, `gemini_model`, `api_timeout_seconds`). `from_env` fills any gap a CLI flag left from `HARNESS_*`; the field↔env↔flag mapping is tabulated in [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference). |
 | `grounding_gate.py` | Wraps `harness.grounding.Preflight` as (a) a **preflight** over the design's code blocks and (b) a **per-change oracle** that grounds the worktree's changed `.py`/`.go` files. |
 | `worktree.py` / `gitutil.py` | One isolated `git worktree` + `agent/<id>` branch per task (the fan-out from `orchestrate.sh`). Now also: **fail-closed teardown** (dirty trees, in-use trees and unmerged branches are *refused and reported*, each behind its own opt-in — `allow_dirty` / `allow_unlanded` / `in_use`), **merged-aware `prune`** (squash-merge `merge-tree` proof, plus directory reconciliation for worktrees the plan no longer knows about), and **opt-in warm reuse** (`reset_clean`, wired behind `reset_worktree_on_reuse`; **off** by default because harness reuses a worktree to *resume the same task*). `gitutil` adds the landed-work / force-with-lease / no-sign git plumbing. |
 | `backends/` | The pluggable *code-writer*. `ide-handoff` (grounded `TASK.md` packet + loss-free review rounds — pairs with Google Antigravity or any editor), `agent-cli` (unattended non-interactive loop over an agent CLI — `gemini -p` by default; optional flags are passed only when the installed CLI's `--help` advertises them) and `openai`/`gemini` (stdlib-HTTP loop). All share the **hardened ralph loop** and the same oracle. |
@@ -168,11 +172,11 @@ flowchart TB
 | `shutdown.py` | Graceful stop on Ctrl-C / SIGTERM. Every agent invocation is launched **detached** (`start_new_session=True`), so a terminal interrupt reaches only the orchestrator — the agent CLI and its Bash grandchildren would keep editing the worktree and spending tokens. The handler signals the registered process *groups*, sets a flag the loops check (never an exception: a loop that just spent money must still record what it spent), and lets each backend write its own `abort` note + `aborted` beat and return — so the `TaskClaim` is released by the normal `finally`, not by process death. A **second** signal SIGKILLs and exits immediately, so a wedged shutdown stays escapable. |
 | `nosleep.py` | Holds a host sleep inhibitor for the length of a run (`systemd-inhibit --what=sleep:idle` on Linux, `caffeinate -dimsu` on macOS, no-op elsewhere; `prevent_sleep`, on by default). A laptop that suspends mid-iteration loses the night outright. (The heartbeat itself is safe on Linux — age comes from `CLOCK_MONOTONIC`, frozen across a suspend, when the boot_id matches; only the wall-clock fallback path, e.g. macOS, ages a suspended run toward `worktree_stale_seconds`.) Fails **open**: a missing binary logs a line and the run continues. |
 | `sanitize.py` | Treats design text as untrusted: redacts secrets, defangs prompt-injection delimiters, and wraps it in a *data-not-instructions* fence before it reaches any agent prompt or packet. |
-| `trust.py` | The fail-closed allowlist for *executable* config taken from a design: in `untrusted_designs` mode a design's `(validate:)` commands are filtered to known test/build runners; everything else is dropped. |
+| `trust.py` | The fail-closed allowlist for *executable* config taken from a design: in `untrusted_designs` mode a design's `(validate:)` commands are filtered to known test/build runners and everything else is dropped — and what survives is **added to** the operator's own oracle, never substituted for it, since the allowlist bounds *what* may run and not whether it checks anything. |
 | `verifier.py` | The **independent verifier gate** — the anti-hallucination axis grounding cannot cover (*does the diff do what was asked*). Fresh-context model calls that never saw the implementer's reasoning answer factored (Chain-of-Verification) questions about the diff. **At least two vote per implementer**: `samples` is floored at 2 for the calls *and* re-applied to the **counted** votes, so a sample whose answer has no parseable verdict casts none and a lone surviving verdict abstains rather than deciding alone. Majority wins; a split with no strict majority abstains → `high` risk → human review. Fails **open** on infrastructure — but a schema-validated answer that ran and did not conform is a blocking `fail`, because failing open there deletes the gate exactly when output drift broke it. Also hosts `dependency_blame_finding`. |
 | `review.py` | Validate + ground + run the freeze / mutation / dependency-blame / verifier gates + assign a **risk level** (`low`/`medium`/`high`) — **advisory** routing metadata that prioritises human review (`review.sh`); harness **never auto-merges** on it. Freezes **one reviewed SHA** before anything is judged, so the oracle, the risk level and the push all refer to the same commit. Carries the oracle `feedback` back for loss-free IDE review rounds. |
 | `mutation.py` | The optional mutation gate: applies deliberate breakages (comparison/boolean/arithmetic swaps, constant nudges) to the task's changed non-test source and scores how many the validation suite kills. Bounded by `mutation_max_mutants` × `mutation_timeout`; survivors are handed back to the agent as test-writing targets. |
-| `trace.py` | The **span vocabulary** (21 `snake_case` types) and the append-only `.harness/trace.jsonl` writer. One JSON line per consequential decision, each under `PIPE_BUF` so concurrent per-task processes interleave whole lines; every write failure is swallowed — tracing must never break a run. Read back by `pipeline trace`. |
+| `trace.py` | The **span vocabulary** (22 `snake_case` types) and the append-only `.harness/trace.jsonl` writer. One JSON line per consequential decision, each under `PIPE_BUF` so concurrent per-task processes interleave whole lines; every write failure is swallowed — tracing must never break a run. Read back by `pipeline trace`. |
 | `cockpit.py` | The tmux cockpit: one visible window per ready feature (each an independent `pipeline run --task <id>` process) plus a live dashboard window. Optional; `--parallel N` is the headless equivalent. |
 | `pr.py` | Open the PR: `LocalBranchPR` (offline branch) or `GitHubPR` (`gh`). `head_bound_to_review` is the last check before an irreversible remote side effect — a HEAD that is not, and does not descend from, the reviewed SHA withholds the PR. `gh auth` is preflighted *before* the push, the body travels on stdin rather than argv, an existing PR is adopted only when its head ref matches and it is not cross-repository, and a rejected re-push retries with a bare `--force-with-lease` (refusing if the remote carries commits absent locally), never a blind `--force`. |
 | `orchestrator.py` | `PipelineOrchestrator.run()` fans tasks across worktrees; serialises repo-level git mutations behind a lock; persists `implementing` **before** the backend call (crash-visible); recovers stale tasks at the start of each run; exposes `supervise()` / `prune()`. |
@@ -269,7 +273,7 @@ Two complementary channels (see **[LOGGING.md](LOGGING.md)**):
 - **Span traces** (`pipeline/trace.py` → `.harness/trace.jsonl`) — one JSON
   line per consequential decision (gate verdicts, agent cost, status changes).
   Structured and append-only; the *what happened* record for unattended runs.
-  The vocabulary is **21 `snake_case` types**, defined once in `trace.py`'s
+  The vocabulary is **22 `snake_case` types**, defined once in `trace.py`'s
   module docstring and tabulated in
   [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) —
   they are `jq` keys and `--type` filters, so a type spelled any other way, or
@@ -304,8 +308,9 @@ Everything else is contained at each subsystem's boundary:
   `PipelineOrchestrator._run_one()` has a catch-all that marks just that task
   `failed` (with the error recorded as a note) and moves on. `pipeline run`
   exits `1` when any attempted task ends `failed`, `blocked`, `error`,
-  `unavailable`, `waiting-dependency` or `interrupted`, and `0` only when every
-  attempted task succeeded — the contract wrapper loops and cron jobs depend on.
+  `unavailable`, `locked`, `waiting-dependency` or `interrupted`, and `0` only
+  when every attempted task succeeded — the contract wrapper loops and cron jobs
+  depend on.
 - **Gates** — fail **open** on infrastructure (a gate that cannot run never
   blocks a PR), with two stated exceptions: a broken *output contract* in the
   verifier, and an explicitly-requested capability (`--require-z3`).

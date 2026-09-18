@@ -189,12 +189,18 @@ harness/
 │   ├── test_pipeline.py  test_api_backends.py  test_verify_hook.py
 │   ├── test_antihallucination.py  test_trace_and_mutation.py  test_liveness.py
 │   ├── test_extensions.py  test_hardening.py  test_deep_review_fixes.py
-│   └── test_pr_github.py  test_acceptance_version.py  test_batch4.py  test_batch5.py
+│   ├── test_pr_github.py  test_acceptance_version.py  test_batch4.py  test_batch5.py
+│   ├── test_cli_error_surfacing.py  test_commit_and_paths.py
+│   ├── test_detached_children.py  test_publication_guards.py
+│   ├── test_recovery_integrity.py  test_ref_safety.py
+│   ├── test_run_entry_guards.py  test_untrusted_gates.py
+│   └── test_verifier_manifest_guard.py  test_worktree_process_safety.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
 ├── loopeng/                    # Shell-script loop the pipeline grew from
 ├── README.md  INSTALL.md  PIPELINE.md  EXTENSIONS.md
 ├── ARCHITECTURE.md  LOGGING.md  CONTRIBUTING.md
+├── AGENTS.md                   # Agent context file: the gates + constraints above, for coding agents
 ├── pytest.toml  mypy.ini  ruff.toml  # suite + type + lint config (no pyproject.toml, on purpose)
 └── setup.py  requirements.txt  MANIFEST.in
 ```
@@ -470,7 +476,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 783 passing, 1 skipped at the time of writing
+# Run all tests — 1033 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -612,7 +618,7 @@ Harness has two observability channels (full guide in **[LOGGING.md](LOGGING.md)
    | If you change… | Also update |
    |---|---|
    | a `PipelineConfig` field or `HARNESS_*` var | [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference) (+ the README env table if it is one most runs touch) |
-   | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) |
+   | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) — and, when the *number* of types changes, the counts quoted in PIPELINE.md's span-traces intro, ARCHITECTURE.md (the `trace.py` module row **and** § Observability) and LOGGING.md's channel table |
    | a CLI flag | ARCHITECTURE.md's subcommand tree + the run-book snippet that uses it |
    | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md |
    | the test count | the README badge and the counts in this file |

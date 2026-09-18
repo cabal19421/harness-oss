@@ -72,14 +72,57 @@ class WorktreeManager:
         self.root = Path(worktree_root).resolve()
         # base_ref pins a SHA on detached HEAD instead of the literal "HEAD".
         self.base = base_branch or gitutil.base_ref(self.repo)
-        logger.debug("worktree manager: repo=%s root=%s base=%s (base %s)",
-                     self.repo, self.root, self.base,
+        # The SHORT name stays the public one: `integrate` compares it against
+        # `current_branch` and the cockpit echoes it back as `--base`, and both
+        # of those break on a qualified ref. Everything handed to git as a
+        # *revision* uses ``base_rev`` instead, because a bare name lets git's
+        # disambiguation pick refs/tags/<base> over refs/heads/<base> (see
+        # gitutil.qualify_ref).
+        self._base_rev = gitutil.qualify_ref(self.repo, self.base)
+        logger.debug("worktree manager: repo=%s root=%s base=%s (rev %s, %s)",
+                     self.repo, self.root, self.base, self._base_rev,
                      "passed explicitly" if base_branch else "resolved from HEAD")
+
+    @property
+    def base_rev(self) -> str:
+        """:attr:`base` as a git *revision* — qualified as soon as it can be.
+
+        Qualification is memoised only once it SUCCEEDS. A snapshot frozen at
+        construction is wrong in one reachable shape: a repo whose base branch
+        does not exist YET — a fresh ``git init`` with no commits, or a base
+        created after this manager was built — has no ``refs/heads/<base>`` to
+        find, so the snapshot keeps the bare name and the tag-shadowing
+        hardening stays silently off for the rest of the manager's life, first
+        commit or not. Re-resolving while still unqualified closes that;
+        re-resolving after it is qualified would only re-ask a settled question.
+
+        A pinned SHA (what :func:`gitutil.base_ref` returns on detached HEAD) is
+        terminal by SHAPE, so the detached-HEAD path pays no repeat probe
+        either. Two threads may re-resolve concurrently; the write is idempotent.
+        """
+        rev = self._base_rev
+        if rev.startswith("refs/") or gitutil.looks_like_object_name(rev):
+            return rev
+        self._base_rev = rev = gitutil.qualify_ref(self.repo, rev)
+        return rev
 
     # ── naming ────────────────────────────────────────────────────────────────
 
     def branch_for(self, task_id: str) -> str:
         return f"{self.BRANCH_PREFIX}{task_id}"
+
+    @staticmethod
+    def _head_ref(branch: str) -> str:
+        """An agent branch as a fully-qualified ref, for git *revision* arguments.
+
+        Same hazard as the base (gitutil.qualify_ref): a tag named
+        ``agent/<task-id>`` outranks the branch in every bare-name resolution,
+        so ``commits_ahead``/``content_landed`` would measure the tag and read
+        the task as 0-ahead or already-landed. :meth:`branch_for` stays the
+        short name for ``git branch`` / ``worktree add``, which take branch
+        names rather than revisions.
+        """
+        return f"refs/heads/{branch}"
 
     def path_for(self, task_id: str) -> Path:
         return self.root / f"wt-{task_id}"
@@ -112,6 +155,11 @@ class WorktreeManager:
         * its content is classified — if the ``.git`` pointer is missing or its
           backing repo is gone, the content **cannot be verified** and removal
           needs the explicit ``prune_orphans`` opt-in.
+
+        A create whose base does not resolve is refused with a
+        :class:`~harness.pipeline.gitutil.GitError` *before* either recovery
+        path runs, so a typo'd base cannot destroy a directory on its way to
+        being rejected by ``worktree add``.
         """
         if not gitutil.is_repo(self.repo):
             logger.warning("ensure %s refused: %s is not a git repository",
@@ -144,6 +192,18 @@ class WorktreeManager:
                                         action="reset")
                 self.reset_clean(task_id, to_ref="HEAD")
             return Worktree(path=wt, branch=branch, base=self.base)
+
+        # Past the reuse return the CREATE path is live, so settle the fork
+        # point here — before anything destructive. The orphan recovery below
+        # rmtree's whatever squats on the target path, while `worktree add`
+        # rejects a bad base only at the very END, so an unresolvable base
+        # otherwise takes that content with it on the way to failing. Only a
+        # create is gated: a resume checks the existing branch out and never
+        # consults the base, so a base deleted since that branch was made must
+        # not block it.
+        resuming = self._branch_exists(branch)
+        if not resuming:
+            gitutil.require_base(self.repo, self.base_rev, name=self.base)
 
         # Stale registration (dir gone) → prune, then recreate.
         if self._is_registered(wt) and not wt.is_dir():
@@ -201,15 +261,19 @@ class WorktreeManager:
                                        "add` may fail", task_id, wt, self.root)
 
         args = ["worktree", "add", "-q"]
-        resuming = self._branch_exists(branch)
         if resuming:
-            # Branch already exists (resuming): check it out without -b.
+            # Branch already exists (resuming): check it out without -b. The
+            # SHORT name is required here — `worktree add <path> refs/heads/<b>`
+            # checks the ref out DETACHED, while the bare name attaches to the
+            # branch even when a same-named tag shadows it. What keeps a tag off
+            # this path is `_branch_exists` proving a branch is really there.
             args += [str(wt), branch]
         else:
-            args += [str(wt), "-b", branch, self.base]
+            args += [str(wt), "-b", branch, self.base_rev]
         logger.info("task %s: creating worktree %s on %s branch %s (base %s)",
                     task_id, wt,
-                    "existing (resume)" if resuming else "new", branch, self.base)
+                    "existing (resume)" if resuming else "new", branch,
+                    self.base_rev)
         gitutil.git(args, cwd=self.repo, check=True)
         return Worktree(path=wt, branch=branch, base=self.base)
 
@@ -280,12 +344,21 @@ class WorktreeManager:
         # then decline to perform.
         if not allow_dirty and wt.is_dir() and gitutil.is_repo(wt) \
                 and gitutil.working_tree_dirty(wt):
+            # "Commit them" is impossible advice when the dirt is unstageable
+            # (a dirty submodule, most often) — `git add -A` stages nothing and
+            # `git commit` refuses, so an operator following it gets nowhere.
+            # Name what is actually there instead. The refusal itself is
+            # unchanged: fail-closed either way, allow_dirty is still the override.
+            unstageable = gitutil.unstageable_dirt_reason(wt)
             logger.warning("task %s: refusing to remove worktree %s — it has "
-                           "uncommitted changes (allow_dirty=True overrides)",
-                           task_id, wt)
+                           "uncommitted changes%s (allow_dirty=True overrides)",
+                           task_id, wt, f" ({unstageable})" if unstageable else "")
             raise WorktreeInUse(
                 f"refusing to remove worktree '{wt}': it has uncommitted changes. "
-                f"Commit them, or pass allow_dirty=True to discard them.",
+                + (f"They CANNOT be committed — {unstageable}. Pass "
+                   f"allow_dirty=True to discard them."
+                   if unstageable else
+                   "Commit them, or pass allow_dirty=True to discard them."),
                 reason="dirty", path=wt,
             )
 
@@ -462,17 +535,19 @@ class WorktreeManager:
             logger.debug("task %s: branch %s does not exist — trivially landed "
                          "(nothing to lose)", task_id, branch)
             return True
-        landed = gitutil.content_landed(self.repo, self.base, branch)
-        logger.debug("task %s: branch %s landed in %s → %s",
-                     task_id, branch, self.base, landed)
+        base_rev = self.base_rev
+        landed = gitutil.content_landed(self.repo, base_rev,
+                                        self._head_ref(branch))
+        logger.debug("task %s: branch %s landed in %s (rev %s) → %s",
+                     task_id, branch, self.base, base_rev, landed)
         return landed
 
     def reset_clean(self, task_id: str, *, to_ref: str | None = None,
                     keep_ignored: bool = True) -> None:
         """Recycle a reused worktree to a clean state for warm reuse.
 
-        Hard-resets to *to_ref* (default ``self.base``) and clears untracked
-        files, but ``keep_ignored`` (default) preserves git-ignored build caches
+        Hard-resets to *to_ref* and clears untracked files, but ``keep_ignored``
+        (default) preserves git-ignored build caches
         (``node_modules``/``.venv``) so the next task on this worktree doesn't pay
         a cold dependency reinstall — pool-style reset-on-reuse, scoped to the
         harness's per-task model.
@@ -483,12 +558,20 @@ class WorktreeManager:
         point; a recycler handing the worktree to an unrelated task would have
         to reset. Crash recovery resets independently (see
         ``Supervisor._clean_worktree``).
+
+        The default matters only to a DIRECT caller: :meth:`ensure` always passes
+        ``to_ref="HEAD"`` on purpose (resume keeps the commits the task already
+        landed and drops only the debris), so nothing in the pipeline resets a
+        worktree to the base. The default is :attr:`base_rev` rather than
+        :attr:`base` all the same — a hard reset is the last place to let a
+        same-named tag answer for the branch.
         """
         wt = self.path_for(task_id)
+        ref = to_ref or self.base_rev
         logger.info("task %s: recycling worktree %s — hard reset to %s, clean "
                     "untracked (keep_ignored=%s preserves build caches)",
-                    task_id, wt, to_ref or self.base, keep_ignored)
-        gitutil.discard_changes(wt, to_ref or self.base, keep_ignored=keep_ignored)
+                    task_id, wt, ref, keep_ignored)
+        gitutil.discard_changes(wt, ref, keep_ignored=keep_ignored)
 
     def prune_merged(self, *, allow_unlanded: bool = False,
                      force: bool | None = None) -> dict[str, list[str]]:
@@ -509,6 +592,7 @@ class WorktreeManager:
         pinned = self._checked_out_branches()
         out: dict[str, list[str]] = {"deleted": [], "kept_unlanded": [], "kept_active": []}
         branches = self.list_agent_branches()
+        base_rev = self.base_rev      # resolved once, not per branch
         logger.debug("prune_merged: %d agent branch(es), %d pinned by worktrees, "
                      "base=%s allow_unlanded=%s", len(branches), len(pinned),
                      self.base, allow_unlanded)
@@ -518,7 +602,8 @@ class WorktreeManager:
                              branch)
                 out["kept_active"].append(branch)
                 continue
-            landed = gitutil.content_landed(self.repo, self.base, branch)
+            landed = gitutil.content_landed(self.repo, base_rev,
+                                            self._head_ref(branch))
             if landed or allow_unlanded:
                 if not landed:
                     logger.warning("prune: deleting UNLANDED branch %s — commits "
@@ -558,17 +643,26 @@ class WorktreeManager:
 
     def is_green(self, task_id: str) -> bool:
         """True iff the task's branch has a commit ahead of base (== passed)."""
-        ahead = gitutil.commits_ahead(self.repo, self.base, self.branch_for(task_id))
+        base_rev = self.base_rev
+        ahead = gitutil.commits_ahead(self.repo, base_rev,
+                                      self._head_ref(self.branch_for(task_id)))
         logger.debug("task %s: %d commit(s) ahead of %s → green=%s",
-                     task_id, ahead, self.base, ahead > 0)
+                     task_id, ahead, base_rev, ahead > 0)
         return ahead > 0
 
     def list_agent_branches(self) -> list[str]:
+        # ``%(refname)`` + strip, not ``%(refname:short)``: the short form is
+        # ambiguity-aware and renders `agent/x` as `heads/agent/x` when a tag
+        # shadows the branch — a name that then matches nothing in
+        # ``_checked_out_branches`` (so a live worktree's branch reads as
+        # unpinned) and is not the name ``git branch -D`` takes.
         res = gitutil.git(
-            ["branch", "--list", f"{self.BRANCH_PREFIX}*", "--format", "%(refname:short)"],
+            ["branch", "--list", f"{self.BRANCH_PREFIX}*", "--format", "%(refname)"],
             cwd=self.repo,
         )
-        return [b for b in res.out.splitlines() if b.strip()]
+        prefix = "refs/heads/"
+        return [b.strip()[len(prefix):] for b in res.out.splitlines()
+                if b.strip().startswith(prefix)]
 
     def integrate(self, branch: str, *, no_ff: bool = True) -> gitutil.GitResult:
         """Merge a green branch into ``self.base`` (which must be the active checkout).
@@ -590,10 +684,20 @@ class WorktreeManager:
                 f"cannot integrate into '{self.base}': main checkout is on '{cur}' "
                 f"— switch back to '{self.base}' first"
             )
+        # Merge the QUALIFIED revision, name the short branch everywhere a human
+        # reads it. Bare-name resolution ranks refs/tags/<n> above refs/heads/<n>
+        # (gitutil.qualify_ref), so a tag named like the agent branch would get
+        # its tree merged into the base under the branch's name. qualify_ref
+        # rather than _head_ref because this is a library surface with no
+        # in-repo caller: it inverts ONLY the tag/branch precedence and passes
+        # anything else — a pinned SHA, an already-qualified ref, a tag named on
+        # purpose — through with today's meaning intact.
+        rev = gitutil.qualify_ref(self.repo, branch)
         # Sign-safe merge (see gitutil.merge): a --no-ff merge commit must carry
         # the no-gpgsign flags or a commit.gpgsign=true repo blocks unattended.
-        logger.info("integrating %s into %s (no_ff=%s)", branch, self.base, no_ff)
-        res = gitutil.merge(self.repo, branch, message=f"merge {branch}", no_ff=no_ff)
+        logger.info("integrating %s (%s) into %s (no_ff=%s)",
+                    branch, rev, self.base, no_ff)
+        res = gitutil.merge(self.repo, rev, message=f"merge {branch}", no_ff=no_ff)
         if res.ok:
             logger.info("integrated %s into %s", branch, self.base)
         else:
@@ -606,7 +710,12 @@ class WorktreeManager:
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _branch_exists(self, branch: str) -> bool:
-        return gitutil.git(["rev-parse", "--verify", branch], cwd=self.repo).ok
+        # show-ref --verify on the qualified ref, never `rev-parse --verify
+        # <branch>`: rev-parse resolves a TAG named agent/<task-id> just as
+        # happily, and a false "the branch exists" sends `ensure` down the
+        # resume path, where `worktree add <path> <tag>` checks the tag out
+        # detached — the agent's commits then land on no ref at all.
+        return gitutil.exact_ref_exists(self.repo, self._head_ref(branch))
 
     def _is_registered(self, wt: Path) -> bool:
         # Exact per-line match on the porcelain ``worktree <path>`` lines — a

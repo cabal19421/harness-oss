@@ -61,7 +61,7 @@ from ..looptools import (
     wait_out_quota_window,
 )
 from ..notes import RunLog
-from ..sanitize import sanitize_design, wrap_untrusted
+from ..sanitize import sanitize_design, sanitize_publication, wrap_untrusted
 from ..trace import Tracer
 from .base import (
     CodingBackend,
@@ -276,8 +276,11 @@ def _allowed_tools_arg(cfg, commands) -> str:
     Deriving the rule from the command the harness is itself about to run as
     the gate closes that gap without widening scope: the rule only ever mirrors
     a command that is, by construction, already going to execute. (In
-    ``untrusted_designs`` mode ``ctx.validation`` has already been
-    allowlist-filtered, so a contributed design cannot mint a rule either.)
+    ``untrusted_designs`` mode that still holds, though not because every
+    command here was filtered: ``ctx.validation`` is the operator's own
+    ``default_validation()`` — passed in unfiltered, and trusted by definition —
+    unioned with the DESIGN's commands, which are the half the trust allowlist
+    filters. So a contributed design cannot mint a rule either way.)
 
     *cfg*'s own string is passed through byte-for-byte and only appended to, so
     the configured list can never be narrowed or reordered by this function.
@@ -527,8 +530,7 @@ class AgentCliBackend(CodingBackend):
 
                 commit_failures = 0
                 pending_commit_failure = None
-                if gitutil.commits_ahead(ctx.worktree, ctx.diff_base,
-                                         gitutil.current_branch(ctx.worktree)) > 0:
+                if ctx.own_commits_ahead() > 0:
                     logger.info("%s: implementing → done (oracle green after %d "
                                 "iteration(s), %s — %s)",
                                 ctx.task.id, i, budget.summary(),
@@ -543,18 +545,28 @@ class AgentCliBackend(CodingBackend):
                         detail="validation + grounding green",
                         grounding_summary=oracle.grounding.summary,
                     )
+                # When the "work" was unstageable dirt, the generic advice below
+                # ("strengthen the oracle") names the wrong cause and sends the
+                # operator to rewrite an oracle that is doing its job. Say what
+                # actually happened instead, on every surface this exit writes to.
+                unstageable = gitutil.unstageable_dirt_reason(ctx.worktree)
                 logger.warning("failing %s: oracle green but no commit ahead of "
-                               "%r — the task may need no change, or its "
-                               "validation is too weak (validation=%s)",
+                               "%r — %s (validation=%s)",
                                ctx.task.id, ctx.diff_base,
+                               unstageable or "the task may need no change, or "
+                               "its validation is too weak",
                                ctx.validation or "none")
                 msg = (
+                    f"oracle is green but the branch has no commit ahead of "
+                    f"'{ctx.diff_base}' — {unstageable}."
+                    if unstageable else
                     f"oracle is green but the branch has no commit ahead of "
                     f"'{ctx.diff_base}' — the task may require no change, or its "
                     f"validation is too weak to constrain the work "
                     f"(validation={ctx.validation or 'none'}). Strengthen the oracle."
                 )
-                runlog.append("noop", "green but nothing committed ahead of base", iteration=i)
+                runlog.append("noop", "green but nothing committed ahead of base",
+                              detail=unstageable, iteration=i)
                 ctx.log(f"  ⚠️  {msg}")
                 return ImplementOutcome(
                     status="failed", iterations=i, oracle_passed=True,
@@ -823,9 +835,26 @@ class AgentCliBackend(CodingBackend):
             # stderr that held only a warning used to shadow it entirely, so a
             # permanent failure read as transient and burned every retry.
             cli_error = _error_text(out or "")
+            # A second, clearly-labelled source: the agent's OWN account of the
+            # failure. _error_text abstains unless the envelope SAYS it is an
+            # error — that contract is why the classifier is trustworthy and it
+            # must not be widened — but it leaves a failed invocation whose
+            # envelope is an ordinary result with no diagnosis at all, only the
+            # raw stdout tail below. That tail is a fragile place to look for
+            # one: the envelope's `result` sits near its END (after usage,
+            # modelUsage and permission_denials), so a 400-char tail keeps the
+            # LAST 400 chars of the prose and cuts its head — which is exactly
+            # where a machine-readable marker leads. Extracting the field is
+            # bound to the shape rather than to a byte offset. Read only when
+            # there is no CLI error report, so a real one always wins and is
+            # never duplicated.
+            agent_text = "" if cli_error else _result_text(out or "")
             parts: list[str] = []
             if cli_error:
                 parts.append(trunc(redact(cli_error), _DETAIL_TAIL_CHARS))
+            if agent_text:
+                parts.append("agent report: "
+                             + trunc(redact(agent_text), _DETAIL_TAIL_CHARS))
             if err_text:
                 parts.append("stderr: "
                              + _tail_elided(redact(err_text), _DETAIL_TAIL_CHARS))
@@ -865,9 +894,29 @@ class AgentCliBackend(CodingBackend):
             # stdout error, and vice versa. Unredacted on purpose: the marker
             # phrases the classifier keys on are the CLI's own error text, and
             # nothing here is logged raw.
+            #
+            # ``agent_text`` is a term in its own right so classification stops
+            # depending on a tail landing on the envelope's `result` field. It
+            # matters most one level up: _run_with_retries re-classifies from
+            # `detail`, whose stdout term is bounded at _DETAIL_TAIL_CHARS, so
+            # "usage limit reached|<epoch>" leading an unmarked result was lost
+            # there and the run burned max_agent_retries × backoff on a window
+            # that had not reopened. It is model-written text, so prose merely
+            # QUOTING an error phrase could flip a classification — the exposure
+            # is bounded the same way the raw stdout term already is (a
+            # _CLASSIFY_TAIL_CHARS slice) and the precedence _PERMANENT before
+            # _QUOTA_WINDOW before transient is unchanged.
+            #
+            # HEAD slice for the agent's prose, TAIL for the raw streams: the
+            # bound is the same, the end it keeps is not. A raw stream's
+            # diagnosis trails its noise, but ``agent_text`` is already the
+            # extracted `result` field, and a machine-readable marker LEADS that
+            # prose ("usage limit reached|<epoch>" followed by the explanation)
+            # — the reason this term exists at all.
             classify_text = "\n".join(t for t in (
                 err_text[-_CLASSIFY_TAIL_CHARS:],
                 cli_error,
+                agent_text[:_CLASSIFY_TAIL_CHARS],
                 out_text[-_CLASSIFY_TAIL_CHARS:],
             ) if t)
             permanent = classify_invocation_failure(classify_text) == "permanent"
@@ -1036,12 +1085,47 @@ class AgentCliBackend(CodingBackend):
         Returns ``None`` when there was nothing to commit (the agent already
         committed), or the :class:`~harness.pipeline.gitutil.GitResult` of the
         commit attempt — whose ``ok`` flag drives the commit-failure repair path.
+
+        The handoff from staging to committing is decided by the INDEX, not by
+        ``git status``: status reports dirt that ``git add -A`` cannot put in
+        the superproject's index (an initialised submodule holding untracked
+        build output shows as ``" M sub"`` forever), and ``git commit`` then
+        exits 1 with "no changes added to commit" without moving HEAD. Reading
+        that as a commit FAILURE sends the loop into ``commit_repair_prompt``
+        telling a fresh agent to commit work that does not exist, burning up to
+        ``max_consecutive_failures`` invocations on a green task. An empty index
+        is a successful no-op — ``None``, the same answer as a clean worktree,
+        so nothing downstream claims an advance HEAD never made.
+
+        The skip is deliberately NOT recorded on ``self``: one backend instance
+        is shared by every worker thread, so a mutable slot here would be
+        clobbered across concurrent tasks. The loop re-derives the reason from
+        the worktree at the one place it renders it
+        (:func:`~harness.pipeline.gitutil.unstageable_dirt_reason`), where the
+        index it describes is still exactly as this left it.
         """
         if gitutil.working_tree_dirty(ctx.worktree):
             logger.debug("worktree %s dirty — the agent left uncommitted work; "
                          "committing it on its behalf", ctx.worktree)
-            gitutil.add_all(ctx.worktree)
-            return gitutil.commit(ctx.worktree, f"{ctx.task.title}\n\nTask: {ctx.task.id}")
+            try:
+                gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
+            except gitutil.ProtectedPathError as exc:
+                # Reported as a failed commit on purpose: the caller already has
+                # the repair path for "oracle green but the commit did not
+                # happen", which re-prompts with this detail and never resets the
+                # worktree. Nothing was staged, so index and worktree are intact.
+                logger.error("%s: refusing the automatic commit for %s — %s",
+                             self.name, ctx.task.id, exc)
+                return gitutil.GitResult(1, "", str(exc))
+            # Checked only AFTER a successful stage, so the refusal above keeps
+            # its failed GitResult. The predicate is shared with the API loop,
+            # the review sweep and both PR creators so the four cannot drift.
+            if gitutil.nothing_to_commit(ctx.worktree):
+                return None
+            # Scrubbed for the same reason the PR title and body are: this
+            # message rides out on the same `git push` that publishes them.
+            return gitutil.commit(ctx.worktree, sanitize_publication(
+                f"{ctx.task.title}\n\nTask: {ctx.task.id}"))
         logger.debug("worktree %s clean — the agent committed its own work "
                      "(or made no change)", ctx.worktree)
         return None
@@ -1214,8 +1298,16 @@ def _result_text(stdout: str) -> str:
 
     Defensive like :func:`parse_agent_usage`: the JSON shape varies by CLI and
     version, so we look for the known ``result`` key and tolerate anything else
-    (returns ``""`` rather than raising). Used only to spot an ABSTAIN sentinel;
-    a miss just means the abstention path isn't taken for this invocation.
+    (returns ``""`` rather than raising).
+
+    Two roles, and a miss degrades in both. On the SUCCESS path it carries the
+    agent's answer, which is where the ABSTAIN sentinel is spotted — a miss just
+    means the abstention path isn't taken for this invocation. On the FAILURE
+    path it is the agent's own account of what went wrong, reported as a
+    labelled ``agent report:`` part and fed to the classifier, for the case
+    :func:`_error_text` deliberately abstains on (an envelope the CLI never
+    marked as an error); a miss there falls back to the raw stdout tail, i.e.
+    to the behaviour that existed before.
     """
     if not stdout:
         return ""

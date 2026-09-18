@@ -52,6 +52,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -60,6 +61,7 @@ __all__ = [
     "get_logger",
     "log_context",
     "redact",
+    "redact_home_paths",
     "redact_url_userinfo",
     "sanitize_control",
     "setup_logging",
@@ -335,18 +337,39 @@ _URL_USERINFO_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)[^/]*@")
 # Token shapes mirror sanitize.py's design-doc scrubber, kept local so log.py
 # stays a leaf module (grounding imports it; pipeline imports grounding).
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # First, and masked whole: the only multi-line shape here (hence DOTALL),
+    # and the only one whose interior the greedy `\S+` pattern below would
+    # shred — leaving the surviving base64 in the log under a header naming
+    # exactly what it is. Any key TYPE, including the bare
+    # ``-----BEGIN PRIVATE KEY-----``.
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+               r"-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
     re.compile(r"(?i)(api[-_ ]?key|token|secret|password|authorization|bearer)"
                r"\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?\S+"),
     # Header/CLI echoes without a colon: "Bearer sk_live_…", "Basic dXNlcjpw…".
     re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    # The hyphen inside the class is load-bearing: the key shapes that actually
+    # reach a harness log are segmented (`sk-proj-…`, `sk-svcacct-…`), and a
+    # class without it stops at the first `-` — a few characters in, far short
+    # of the 20 the quantifier needs, so the whole key went to the log verbatim.
+    re.compile(r"sk-[A-Za-z0-9-]{20,}"),
     # GitHub: classic PAT/OAuth (ghp_/gho_) *and* the underscore-format
     # server-to-server / user-to-server / refresh shapes (ghs_/ghu_/ghr_).
     # ghs_ is not exotic here — `git push` failures echo the CI remote
     # `https://x-access-token:ghs_…@github.com/o/r.git` verbatim (pr.py).
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),   # fine-grained PAT
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),      # GitLab PAT
+    # npm automation/publish token: a fixed 36-character base62 body, so the
+    # exact length is the cheapest match AND the one with no false positives.
+    re.compile(r"npm_[A-Za-z0-9]{36}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),         # Google API key (AIzaSy…)
     re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+    # Slack webhook: the URL *is* the credential and carries no token-shaped
+    # segment any pattern above would catch (`redact_url_userinfo` sees no
+    # userinfo to rewrite either), so only a URL-aware shape finds it.
+    re.compile(r"https://hooks\.slack\.com/(?:services|workflows|triggers)/"
+               r"[A-Za-z0-9/_+-]{16,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),  # JWT
 )
@@ -393,6 +416,94 @@ def redact_url_userinfo(text: str) -> str:
     ``redacted@host`` is still parsed as userinfo and rewrites to itself.
     """
     return _URL_RE.sub(_redact_url_userinfo, text)
+
+
+# ── home-directory paths ──────────────────────────────────────────────────────
+# Not part of :func:`redact` (a local log line naming a local path is useful);
+# this is for the surfaces harness PUBLISHES, where the operator's directory
+# layout — and the account name inside it — is nobody else's business.
+
+# A "home" that is only a filesystem root would rewrite every absolute path in
+# the document to "~". Such a candidate is DROPPED rather than applied: the
+# anti-over-redaction guard that lets the own-homes pass run unconditionally.
+_ROOT_ONLY_RE = re.compile(r"\A(?:[A-Za-z]:)?[/\\]*\Z")
+
+# The byte a match must NOT be glued to, shared by both passes below so they
+# cannot drift apart. Two anti-over-redaction guards in one lookbehind:
+#
+#   * a word character in front means the home spelling is part of a longer
+#     token, not a path of its own — `https://api.github.com/users/octocat`
+#     survives intact, and so does `https://git.example.com/home/dev` when
+#     the operator's own home really is `/home/dev`;
+#   * `//` is NOT a path separator: `file://home/x` and `https://users/x` name a
+#     HOST, not somebody's home directory (hence `/` in the class). `file://`
+#     as a genuine path prefix is matched explicitly instead.
+_LEADING_BOUNDARY = r"(?<![A-Za-z0-9_.~%+/-])"
+
+# Generic `/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, optionally
+# `file://`-prefixed and tolerating the doubled backslash of a JSON-escaped
+# Windows path. The user segment stops at the next separator, so only
+# `<root>/<user>` is replaced and the remainder survives as context (`~/x`,
+# not `~`).
+_HOME_PATH_RE = re.compile(
+    _LEADING_BOUNDARY
+    + r"(?:file://)?(?:[A-Za-z]:)?"
+    r"(?:/|\\{1,2})(?:[Hh][Oo][Mm][Ee]|[Uu][Ss][Ee][Rr][Ss])(?:/|\\{1,2})"
+    r"[^/\\\s\"'`<>()\[\]{},;:&|*?]+"
+)
+
+
+def _own_home_paths() -> list[str]:
+    """This process's plausible home spellings, longest first.
+
+    Recomputed per call — ``$HOME`` is per-process state, not a constant. Each
+    candidate is kept both verbatim and ``realpath``-resolved, because a
+    symlinked home (``/home/x`` → ``/data/home/x``, macOS's ``/Users/x`` →
+    ``/System/Volumes/…``) reaches the text in whichever spelling the tool that
+    printed it happened to resolve.
+    """
+    raw: list[str] = []
+    with suppress(Exception):          # Path.home() raises when it cannot resolve one
+        raw.append(str(Path.home()))
+    for var in ("HOME", "USERPROFILE"):
+        value = os.environ.get(var)
+        if value:
+            raw.append(value)
+    homes: set[str] = set()
+    for value in raw:
+        homes.add(value)
+        with suppress(OSError, ValueError):
+            homes.add(os.path.realpath(value))
+    keep = {h.rstrip("/\\") for h in homes}
+    keep = {h for h in keep if len(h) >= 4 and not _ROOT_ONLY_RE.match(h)}
+    # Longest first: with both "/home/dev" and "/home/dev/agent" in the set, the
+    # shorter one would otherwise consume the deeper one's prefix and leave
+    # "~/agent" where the whole path was meant to collapse to "~".
+    return sorted(keep, key=len, reverse=True)
+
+
+def redact_home_paths(text: str) -> str:
+    """Rewrite home-directory paths in *text* to ``~``.
+
+    Two passes, because neither is sufficient alone. The **own-homes** pass
+    catches the spellings no regex can know (``/root``, a ``$HOME`` under
+    ``/data``, a resolved symlink); the **generic** pass catches every OTHER
+    account's path — a design doc written on someone else's machine, an agent
+    quoting a traceback from a CI image.
+
+    Both are path-boundary aligned on BOTH ends, and for different reasons:
+    the trailing guard keeps ``/home/dev`` from clipping ``/home/developer``,
+    the leading one (:data:`_LEADING_BOUNDARY`) keeps a URL that merely
+    *contains* the home spelling — ``https://git.example.com/home/dev`` — from
+    losing its host. The replacement is never longer than what it replaces, so
+    a downstream length clamp stays valid.
+    """
+    for home in _own_home_paths():
+        # `file://` is consumed with the path, as in the generic pass: it is a
+        # prefix on the same path, not context that should be left dangling.
+        text = re.sub(_LEADING_BOUNDARY + r"(?:file://)?" + re.escape(home)
+                      + r"(?![A-Za-z0-9_.-])", "~", text)
+    return _HOME_PATH_RE.sub("~", text)
 
 
 def redact(text: str) -> str:

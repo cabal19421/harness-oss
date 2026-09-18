@@ -2,8 +2,10 @@
 
 > Drop markdown **design documents** into `designs/`. Get back **pull requests**,
 > one per independent task — each grounded against your real codebase so
-> hallucinated APIs never make it in. Driven entirely from **VSCodium / Copilot**
-> (or any editor), not tmux.
+> hallucinated APIs never make it in. Editor-first: everything is driven from
+> **VSCodium / Copilot** (or any editor) without a terminal multiplexer, and the
+> optional `pipeline tmux` cockpit is there when you want several features on
+> screen at once.
 
 This is what the harness's neuro-symbolic **grounding engine** and the
 **plan → implement → review** loop (from `loopeng/`) become when you fuse them:
@@ -61,7 +63,7 @@ the gate. Those primitives are detailed in
    save it under `designs/`.
 3. **Command Palette → Tasks: Run Task → `Harness: Plan from designs`.**
    See the tasks it found with `Harness: Pipeline status`.
-4. **`Harness: Run — IDE handoff`.** For each task it creates an isolated git
+4. **`Harness: Run — IDE handoff (prepare task packets)`.** For each task it creates an isolated git
    worktree and drops a grounded `TASK.md` packet in it.
 5. Open a worktree folder, implement the task with Copilot (or open the worktree
    in Google Antigravity). As you write,
@@ -93,6 +95,8 @@ it reads structure, not vibes — so what you write is what you get.
   - `(risk: low|medium|high)` — override the inferred risk.
   - `(validate: cmd; cmd)` — per-task oracle. An annotation can't contain a `)`,
     so a command with parentheses belongs in the `## Validation` block instead.
+    Under `--untrusted` this oracle is **added to** the operator's rather than
+    substituted for it — see [Trust & safety](#trust--safety-gating-work-you-didnt-write).
   - `(paths: a.py, b/c.py)` — files the task is expected to touch.
   - `(depends: other-id)` — only run after `other-id` is `done`.
   - `(accept: tests/acceptance_x.py)` — **freeze** these files: they encode the
@@ -210,8 +214,8 @@ What each primitive buys you, and why it matters for hands-off development:
 | **Failed-iteration rollback** | `looptools` + `gitutil.discard_changes` | A red pass's half-written edits are reset to the seed, so the next fresh agent starts clean instead of inheriting broken code it didn't write. |
 | **Failure classifier + backoff** | `looptools.classify_invocation_failure` / `backoff_seconds` | Three regimes, not two. A *transient* provider overload backs off and retries (`60s·2ⁿ`, jittered downward so parallel workers sharing one backend instance stop retrying in lockstep, and raised to the server's own `Retry-After` when it sends one); a *permanent* error (depleted credit, revoked key, spend limit, retired model id) aborts immediately instead of burning every remaining iteration; a *quota window* waits (see below). |
 | **Quota-window wait** | `looptools.quota_wait_seconds` | Subscription-metered agent CLIs enforce rolling quota windows (commonly 5-hour, sometimes weekly); an exhausted window is neither permanent nor an ordinary rate limit — it reopens at a known wall-clock time. Aborting throws away an overnight run that would have resumed on its own; the transient ladder, capped at 30 minutes, burns `max_consecutive_failures` long before the window reopens. So the loop parses the reset time out of the error text and **sleeps until it reopens**, heart-beating throughout so the wait isn't mistaken for a crash. Bounded by `quota_wait_cap_seconds` and `max_quota_waits`. |
-| **Commit-failure repair** | `looptools.commit_repair_prompt` | When a change is green but a pre-commit hook rejects the commit, the work is **preserved** and the next iteration is told to fix what blocked the commit — a passing solution is never thrown away. |
-| **Token / cost budget** | `looptools.LoopBudget` | `--max-tokens` and `--max-cost` bound **every** backend's run. The agent-cli backend reads real USD from the JSON envelope the CLI emits in non-interactive JSON mode (`--output-format json`); the API backends get tokens only from their providers, so spend is **estimated** per model by `looptools.estimate_cost_usd` (`HARNESS_MODEL_PRICES` supplies or overrides a rate). A model with no known rate is reported loudly at startup — a cost cap that cannot see a price is a cap that cannot fire, and silently pretending otherwise is the defect this table exists to prevent. The loop stops cleanly when a cap is reached. |
+| **Commit-failure repair** | `looptools.commit_repair_prompt` | When a change is green but a pre-commit hook rejects the commit, the work is **preserved** and the next iteration is told to fix what blocked the commit — a passing solution is never thrown away. A green oracle with **nothing staged** is a different case and is not counted as a commit failure at all: when `git add -A` leaves the index empty — most reproducibly an initialised submodule with untracked build output, which `git status` reports as dirty forever while the superproject's index stays empty — the commit is skipped as a successful no-op instead of failing and burning fresh agent invocations on a repair that was never possible. The skip is announced at **WARNING** (and since no `git commit` runs, no pre-commit hook fires for it), and the task note plus the `RunLog` `noop` entry name the unstageable paths — so the morning-after surface points at the dirty submodule rather than at the generic "strengthen the oracle". That decision is one predicate (`gitutil.nothing_to_commit`: the staged index is provably empty **and** no merge, cherry-pick, revert or rebase is waiting to be recorded) shared by both backends' mid-loop commit, the review's leftover sweep and both PR creators, so the five cannot drift. (An in-progress operation still commits, because that commit records the operation; an index git cannot read still attempts the commit — unknown is not proof.) |
+| **Token / cost budget** | `looptools.LoopBudget` | `--max-tokens` and `--max-cost` bound **every** backend's run. The agent-cli backend parses USD **best-effort** from the JSON envelope the CLI emits in non-interactive JSON mode (`--output-format json`) — an agent CLI may omit a cost field entirely, in which case the parse yields zero and only the token cap is live; the API backends get tokens only from their providers, so spend is **estimated** per model by `looptools.estimate_cost_usd` (`HARNESS_MODEL_PRICES` supplies or overrides a rate). A model with no known rate is reported loudly at startup — a cost cap that cannot see a price is a cap that cannot fire, and silently pretending otherwise is the defect this table exists to prevent. The loop stops cleanly when a cap is reached. |
 | **Append-only run notes** | `notes.RunLog` | Every iteration's outcome is logged to `.harness/runs/<task-id>/notes.{jsonl,md}` and a bounded digest is fed *forward* into the next prompt, so the agent learns from dead ends across passes — not just the last oracle line. |
 | **Liveness heartbeat** | `notes.RunLog.beat` | Each iteration stamps `heartbeat.json` (pid + time), which is what makes a crashed or hung run detectable and recoverable (see below). |
 | **Graceful shutdown** | `shutdown.guard` | Ctrl-C (or SIGTERM) **terminates the agent's process group** — every invocation is launched detached, so an unguarded interrupt kills only the orchestrator while the agent CLI and its Bash grandchildren keep editing the worktree and spending tokens. The loop then writes an `abort` note + an `aborted` heartbeat, leaves the task at the resumable `failed` status (preserving green-but-uncommittable work), and returns so the `TaskClaim` is released normally. A **second** signal SIGKILLs and exits at once, so a wedged shutdown is still escapable. |
@@ -238,7 +242,7 @@ HARNESS_MAX_TOKENS=5000000  HARNESS_MAX_COST_USD=20  harness pipeline run ...
 | `max_consecutive_failures` | `3` | Abort after this many consecutive red / commit-failed iterations. |
 | `no_progress_window` / `HARNESS_NO_PROGRESS_WINDOW` | `3` | Abstain to a human once the last N iterations reach the *same* failing state, or the failures strictly alternate A,B,A,B. `0` disables. Catches the loop the consecutive-failure counter misses — it resets on any green and never asks whether the reds are the same red. |
 | `max_tokens` / `HARNESS_MAX_TOKENS` | `None` | Token budget (unbounded if unset). |
-| `max_cost_usd` / `HARNESS_MAX_COST_USD` | `None` | USD budget for **any** backend; unbounded if unset. On `agent-cli` the cost is real (parsed from the CLI's `--output-format json` envelope) and the remaining balance is *also* handed to the CLI as `--max-budget-usd` when the installed CLI advertises that flag, so the cap survives the one failure it cannot otherwise see: `parse_agent_usage` returning silent zeros when the CLI's JSON shape drifts. On `openai`/`gemini` the providers report tokens only, so the cost is **estimated** from a per-model rate table. |
+| `max_cost_usd` / `HARNESS_MAX_COST_USD` | `None` | USD budget for **any** backend; unbounded if unset. On `agent-cli` the cost is parsed **best-effort** from the CLI's `--output-format json` envelope (an agent CLI may not report a USD field at all) and the remaining balance is *also* handed to the CLI as `--max-budget-usd` when the installed CLI advertises that flag, so the cap survives the one failure it cannot otherwise see: `parse_agent_usage` returning silent zeros when the CLI's JSON shape drifts. On `openai`/`gemini` the providers report tokens only, so the cost is **estimated** from a per-model rate table. |
 | `HARNESS_MODEL_PRICES` | *(unset)* | Supply or override API-backend rates: `model=in/cached/out` (USD per 1M tokens), comma-separated; a two-value form `model=in/out` prices cached input at the input rate. Needed for any model the built-in table doesn't know — otherwise `max_cost_usd` warns at startup and cannot trip on that backend (the token cap still works). **This includes the shipped defaults:** the built-in table covers only `gpt-4.1*`/`gpt-4o*`/`gemini-2.x`, so `openai_model` (`gpt-5.6-terra`) and `gemini_model` (`gemini-3.6-flash`) are unpriced out of the box and a USD cap on them is inert until you set this. |
 | `openai_max_output_tokens` / `HARNESS_OPENAI_MAX_OUTPUT_TOKENS` | `None` | Sent as `max_completion_tokens` (never the deprecated `max_tokens`, which the reasoning models reject outright). Safe to set: a response that hits the cap is detected via `finish_reason` and re-prompted, not written to disk. |
 | `openai_service_tier` / `HARNESS_OPENAI_SERVICE_TIER` | `None` | Set `flex` to price at Batch rates — the textbook fit for an unattended, budget-capped overnight loop where latency is irrelevant. Its "resource unavailable" 429 is uncharged and already lands on the transient path. |
@@ -267,11 +271,34 @@ it is distinguishable from a verdict about the diff. Failing open there would
 delete the verifier at exactly the moment output drift broke it. Backends with no
 schema knob (openai/gemini) keep the prose trailer and its fail-open behaviour.
 
+The same principle governs the *evidence* the verifier is shown. The diff handed
+to it is truncated at a character budget with a `…(diff truncated)…` marker, and
+a file whose hunks cannot be decoded as text is re-rendered **per file**: each
+undecodable file is replaced by an explicit `— its diff is NOT shown: the file's
+bytes are not decodable text` marker, emitted *together with* the truncation
+marker so the verifier's mandatory-abstain rule arms on it, and the prompt stops
+claiming its file manifest is complete over a file it never showed. Dropping the
+file silently is the one outcome that must not happen — an empty diff reads
+downstream as "nothing to verify" and opens the gate.
+
+The verifier holds up the other end of that rule. A diff that renders as
+**nothing at all** is "nothing to verify" only when the file manifest is empty
+too: the manifest is the complete file list of the *same* change, so entries
+beside an empty body mean the change could not be rendered, and the gate
+**abstains** — forcing `high` risk and a human read — instead of skipping, since
+abstain is the verdict for "I could not tell" while `fail` would claim something
+judged the change wrong and `skip` is the bug this closes. A manifest entry with
+no hunks in the body arms the same incompleteness rule even when nothing left a
+marker behind. (A file whose *content* is not UTF-8 renders as an explicit
+marker chunk rather than as nothing, so this abstain is the layer that holds if a
+body ever renders to nothing for some other reason.)
+
 | Knob (`PipelineConfig` / env) | Default | Effect |
 |---|---|---|
-| `verify` / `HARNESS_VERIFY` | `True` (on) | **Independent verifiers.** At review time, *fresh-context* model calls — which never saw the implementer's reasoning — answer Chain-of-Verification-style factored questions about the diff. **At least two** of them vote per implementer (see `verify_samples`). `FAIL` blocks the PR; `ABSTAIN` forces `high` risk. Per-task: `(verify: off)` turns the gate off for that task. Fails open when the backend has no one-shot path (e.g. ide-handoff). |
+| `verify` / `HARNESS_VERIFY` | `True` (on) | **Independent verifiers.** At review time, *fresh-context* model calls — which never saw the implementer's reasoning — answer Chain-of-Verification-style factored questions about the diff. **At least two** of them vote per implementer (see `verify_samples`). `FAIL` blocks the PR; `ABSTAIN` forces `high` risk — including the case where the diff rendered as nothing while the manifest still lists changed files, which abstains rather than skipping as "nothing to verify". Per-task: `(verify: off)` turns the gate off for that task. Fails open when the backend has no one-shot path (e.g. ide-handoff). |
 | `verify_samples` / `HARNESS_VERIFY_SAMPLES` | `2` (minimum 2) | **At least two adversarial verifiers per implementer.** Take N independent verifier votes and use the majority; a split with no strict majority → `abstain` → human review (the black-box stand-in for semantic-entropy uncertainty). N is **floored at 2** whenever the gate is on — configuring `1` (or `0`) still runs 2 votes; only `verify: off` reduces it further (to none). `N > 2` adds more votes. The floor applies to *counted* votes too: a sample whose answer has no parseable `VERDICT:` line casts none, and a run left with a single usable verdict abstains rather than letting one judge decide. Per-task: `(samples: 3)`. |
 | `dependency_blame_gate` / `HARNESS_DEP_BLAME_GATE` | `True` (on) | **Dependency-blame gate.** A "fix" that edits vendored/installed dependency code (`site-packages` / `node_modules` / `vendor` …) is forced to `high` risk — the base-rate-correct prior is that the bug is in recently-changed first-party code, not code millions run daily. |
+| `untrusted_designs` / `HARNESS_UNTRUSTED_DESIGNS` (CLI: `--untrusted`) | `False` (off) | **Untrusted with no operator oracle.** Under `--untrusted` the design's allowlisted commands are *added* to the operator's own, never substituted for them — but when `default_validation()` is empty (nothing configured, nothing autodetectable) there is no operator half to add to and the design under review supplies the **entire** oracle. The task is forced to `high` risk with that reason, and the PR body says so above the result, so "✅ all green" can never stand unqualified over a suite the reviewed design picked for itself. |
 | `require_z3` / `HARNESS_REQUIRE_Z3` (CLI: `--require-z3`) | `False` (off) | **Loud failure instead of a silent grounding downgrade.** The grounding solver decides `arity` on any machine, but `call_binding` (an SMT model per call site) and `guard_exclusivity` (dead `if`/`elif` branches) need z3 — without it they abstain to `unverified`, which never fails a gate, so findings vanish quietly. With this on, a run whose solver is not the z3 backend raises `Z3Unavailable` when a grounding gate is built — which `pipeline run` does *before the first task*, so the run aborts up front (`(grounding) unavailable`) instead of after an implementation pass has already been paid for. Leave it off for laptops; turn it on in CI/release runs that must have the full checks. |
 
 A backend can also **abstain**: told to answer `ABSTAIN: <reason>` when the codebase
@@ -314,9 +341,46 @@ harness pipeline supervise --recover  # roll back any crashed/hung task and re-a
   worktree — **preserving any green commit it already landed**, and pushing the
   killed agent's *uncommitted* edits onto the **stash** (`git stash list`, ref
   recorded in the task note) rather than deleting them — records a note, and
-  leaves the task resumable. A crashed `pipeline run` no longer wedges a task in
-  `implementing` forever.
-- Before the reset, **every** proved-stale task passes two destruction gates —
+  leaves the task resumable. Recovery's read-back and the commit path ask the
+  same question the same way: the supervisor's status reader and
+  `working_tree_dirty` share one pinned invocation
+  (`gitutil.status_porcelain` — `--untracked-files=normal --ignore-submodules=none`),
+  so a global `status.showUntrackedFiles=no` can no longer hide a crash's debris
+  from recovery or an agent's new files from staging and the `protected_paths`
+  guard. A crashed `pipeline run` no longer wedges a task in
+  `implementing` forever. The note, the `recovery` span and the journal record
+  all state what actually happened, **read back from the tree** rather than
+  assumed: a `git reset --hard` that was rejected says so, instead of being
+  recorded as a recovery that succeeded.
+- Recovery **holds** the task's claim (`TaskClaim`, an flock) for the whole
+  destructive sequence instead of probing it once. Between a probe's answer and
+  the reset sit a SIGTERM grace, a bounded worktree walk and a stash, and
+  `supervise --recover` is deliberately exempt from the run lock so a
+  `pipeline run` may legitimately start inside that window and have its tree
+  reset out from under it. Holding proves no owner exists **and** keeps one from
+  starting until the sequence is done — check and act become one instant. A
+  claim held by someone else skips the pass, as before.
+- A claim held by a **live but silent** owner is the one liveness case no gate
+  here can resolve — an flock proves its holder is alive *right now*, so a
+  process wedged in an uninterruptible syscall holds it forever while the task
+  sits in `implementing`. That is escalated, never taken — and only once
+  **three** independent signals line up: the claim is still held, the heartbeat
+  has been *measurably* quiet for twice `worktree_stale_seconds` (an age no
+  clock can measure is not a measured silence), **and** the silent beater is
+  provably the owner — its pid reads as `alive`, and where `claim.lock` carries
+  a readable pid stamp that stamp names that same process. The third signal is
+  what a held claim alone cannot give: recovery passes overlap by design, so a
+  second pass meets the *first's* own hold and would otherwise name an already
+  dead pid for a human to go and kill. The stamp is best-effort, so its absence
+  vetoes nothing; a stamp naming somebody else is proof the holder is not the
+  beater, and nothing is said. Only then does a `stuck-claim` record go into
+  the recovery journal (one per wedge, re-announced under the same bound as any
+  other record), and the operator is told on every pass. Nothing is reset,
+  nothing is signalled, nothing is taken — superseding a live owner is exactly
+  what "positive proof of death" forbids. Every deferral, including this one,
+  leaves a `recovery_skipped` span behind it.
+- Then, still before the reset, **every** proved-stale task passes two further
+  destruction gates —
   a dead heartbeat pid is *not* the all-clear, because agents launch detached
   (`start_new_session`) and can outlive the orchestrator that recorded the pid.
   First the **process gate**: anything still running inside the worktree (or a
@@ -344,6 +408,20 @@ harness pipeline prune --allow-unlanded   # also delete UNLANDED branches (disca
 harness pipeline prune --allow-dirty      # also remove worktrees with UNCOMMITTED work
 ```
 
+That landed proof — and the ahead-count that decides whether a task is green and
+whether its PR opens — is measured on
+**fully-qualified refs**: the agent branch as `refs/heads/agent/<id>`, the base
+as `refs/heads/<base>` (or `refs/remotes/origin/<base>` when only the
+remote-tracking branch exists). git's own disambiguation ranks
+`refs/tags/<name>` *above* `refs/heads/<name>`, so a bare name let a same-named
+tag answer for the branch it shadows: a tag on the base sitting ahead of an
+agent branch made **unlanded work read as landed** one step before
+`git branch -D`, and a tag named `agent/<id>` made finished work read as *0
+commits ahead* — which is how the PR gate withheld a PR for work that was really
+there. A tag you name as the base on purpose still means the tag (qualification
+never reinterprets it), and the short name stays what `gh pr create --base`,
+`integrate` and the cockpit see.
+
 `prune` also **reconciles directories**, not just plan entries: a worktree git
 still has registered under `worktree_root` whose task was dropped from the
 designs, renamed, or lost with a corrupt plan file is reclaimed under the same
@@ -358,6 +436,11 @@ Nothing is bulldozed. Two *unrelated* risks get two *separate* opt-ins
 | The worktree has uncommitted work | `dirty` | `--allow-dirty` / `remove(allow_dirty=True)` |
 | The branch's work never landed in the base | `unlanded` | `--allow-unlanded` / `remove(allow_unlanded=True)` |
 | Processes are still running inside it | `processes` / `survivors` | `kill_worktree_procs` (terminate them first) |
+
+When the uncommitted work is dirt that *cannot* be staged — a dirty submodule,
+most often — the refusal says so ("they **cannot be committed**") instead of
+advising "commit them", which is impossible advice there; `allow_dirty` is still
+the override and the refusal itself is unchanged.
 
 Everything refused comes back in `worktrees_skipped` with its reason and is left
 exactly where it was. With `kill_worktree_procs` on (the default), `procutil`
@@ -386,23 +469,79 @@ boundary:
 
 - **Prompt-injection scrub** (`sanitize`) — before any design text reaches an
   agent prompt or a `TASK.md` packet, likely secrets are redacted (`sk-…`,
-  `ghp_…`, `AKIA…`, JWTs, `api_key=…`) and prompt-control delimiters (ChatML
+  `ghp_…`/`github_pat_…`, `glpat-…`, `npm_…`, `AIza…`, `xox…`, `AKIA…`, JWTs,
+  Slack webhook URLs, whole `-----BEGIN … PRIVATE KEY-----` blocks, credentials
+  in URL userinfo, `api_key=…`) and prompt-control delimiters (ChatML
   `<|…|>`, `[INST]`, `<system>`) are defanged, then the text is wrapped in an
   explicit *"this is data, not instructions"* fence. Applied to every backend's
   prompt and the IDE packet.
+- **Publication scrub** (`sanitize.sanitize_publication`) — that same text
+  crosses a second boundary on the way *out*, and a PR body carries it to a
+  public remote. Every PR title and body, the reviewed commit's message, the
+  ide-handoff packet and each review round appended back into that packet pass
+  one scrub before they leave the machine: home-directory paths collapse to `~`
+  (the operator's own spellings, including resolved symlinks, plus any *other*
+  account's path a design doc or a quoted traceback names), the secret patterns
+  above are redacted again, and harness's own `<!-- harness:` attestation
+  marker is defanged inside the untrusted text — in every spelling an HTML
+  comment allows (`<!--harness:`, a newline before the prefix, any case), since
+  the round counter parses that marker back out of the packet. On the PR the
+  scrub runs **once over the assembled body**, not per field — a per-field pass
+  only covers the fields somebody remembered — and the genuine marker is
+  appended *after* it, so the only one in the body is the one harness itself
+  wrote. The packet differs only in WHERE that same scrub runs, never in what
+  it does: every design-derived fragment (title, description, preflight summary
+  and findings, and each `(validate: …)` command) is scrubbed individually,
+  because a blanket pass over the assembled packet would rewrite the worktree
+  and `--repo` lines it exists to hand the operator. Nothing in it is exempt
+  from a pass — a fragment-by-fragment choice of which passes to run is how the
+  packet once published a key the PR body beside it redacted — and a review
+  round appended to it later is a target repo's raw validation output, so it
+  takes the same scrub.
+- **Protected paths** (`protected_paths`, opt-in) — the pipeline's catch-all
+  `git add -A` is what turns "the agent dropped a file in the worktree" into
+  "the file is on a remote": a `.env` it wrote to make the suite pass, a
+  credentials file it copied in to reproduce a bug. Name paths here (exact,
+  glob, directory prefix, or a bare basename at any depth) and a match
+  **refuses** the automatic commit and fails the review with the path and the
+  rule — index and worktree untouched, so you find the tree exactly as the agent
+  left it. Empty by default; see
+  [§ Complete configuration reference](#complete-configuration-reference).
 - **Trusted-config validation allowlist** (`trust`) — with `--untrusted`, the
   `(validate: …)` commands a *design* declares are filtered against an allowlist
   of known test/build runners (pytest, go, npm, mypy, …) and anything with shell
   metacharacters or an unknown executable is **dropped** (fail-closed), so a
   contributed design can't smuggle `(validate: rm -rf ~)` past the gate.
+  What survives the filter is **appended to** the operator's oracle rather than
+  replacing it, because the allowlist bounds *what* may run, not whether anything
+  checks anything: `pytest tests/smoke_test.py` is allowlisted and trivially
+  green, so a design allowed to *replace* your suite could be published as
+  "oracle all green" without the allowlist ever firing. A contributed design can
+  therefore only ever **lengthen** what a pass means.
   The allowlist reaches *below* the executable, because two things under it also
   decide what runs: a multiplexer's first argument (only `go build` / `go test` /
   `go vet` are allowed — `go run`, `go generate`, `go get`, `go tool` and the
   source-rewriting `go fix` are not), and flags that redirect execution or output
   (`pytest --pastebin=all` would ship the whole session to a public paste
   service; `-p`, `-c`, `--rootdir` and `--basetemp` are denied for the same
-  reason). Operator-set commands (`--test-cmd` etc.) are always trusted — they
-  come from you, not the design.
+  reason). Operator-set commands (`--test-cmd` etc.) are always trusted **and
+  always run**: they come from you, not the design, so they go in *unfiltered*,
+  *first*, and survive even when every design command is rejected — including
+  when they are what the task's validation list holds, since a design that
+  declares no validation is seeded with your commands at plan time and filtering
+  *those* would drop a `.venv/bin/python -m pytest -q` oracle to nothing. They
+  must also **produce a verdict**: an operator leg that could not run reds the
+  suite, so a design's green leg can never rescue an operator command that never
+  launched.
+  The union is a gate only while an operator half **exists**. With no
+  `--test-cmd` / `--type-cmd` / `--lint-cmd` and nothing autodetectable, that half
+  is empty and the design under review chooses every command — allowlisted, which
+  bounds what may run and not whether it checks anything. Nothing refuses the run
+  over it (an unconfigured oracle is an infrastructure gap, and those fail
+  **open** here), but it is surfaced three ways: a **WARNING** when the task
+  starts, `high` **advisory risk** from the review gate, and a line in the PR
+  body's oracle section — so the humans who read those three places all learn the
+  same thing.
 
   ```bash
   harness pipeline run --untrusted ...     # env: HARNESS_UNTRUSTED_DESIGNS=1
@@ -459,7 +598,14 @@ Choose per run with `--pr` (the VSCodium tasks prompt you for it):
   with `git diff <base>..agent/<id>` and merge/PR however you like. No network.
 - **`github`** — pushes the branch and opens a real PR with `gh` (needs `gh`
   authed + an `origin` remote). The PR body carries the task, the risk level, the
-  oracle result, and the grounding summary.
+  oracle result and the grounding summary. The oracle it lists is the one that
+  actually **ran** — under `--untrusted` the effective list, not the design's
+  declared one — and commands the allowlist refused are reported by **count**
+  only: a reviewer needs to know the gate refused something, but a refused
+  command line is never republished to the remote. They are attributed as
+  "declared by the design, or seeded before a `--test-cmd` change", because the
+  same list can carry an operator command seeded into the plan before the oracle
+  changed — and publishing that as a contributor's is a public accusation.
 
 Both modes are **bound to the reviewed commit**. Leftover work is committed
 *before* the oracle runs, so one SHA is what the validation, the risk level and
@@ -558,6 +704,22 @@ non-Python.
 > red — but those newly-gated repos are exactly where *pre-existing* failures
 > surface as agent-blamed reds. See `--validation-baseline` below.
 
+A **fourth** route to the same vacuous pass is closed on the trust side rather
+than the detection side: a design that declares no validation is seeded with the
+operator's own commands at plan time, and under `--untrusted` that seeded copy
+was itself allowlist-filtered — which drops the ordinary `.venv/bin/python -m
+pytest -q` spelling of a project-local interpreter and could leave the task with
+no oracle at all. The operator's half now goes in unfiltered and survives even
+when every design command is rejected; see
+[Trust & safety](#trust--safety-gating-work-you-didnt-write).
+
+Which is also why an autodetection miss matters more under `--untrusted` than
+anywhere else: there, a repo we fail to classify does not merely end up with *no*
+oracle, it ends up with **the contributed design's** oracle — and that is worse
+than nothing, because it reads green. Harness cannot refuse over it (an
+unconfigured oracle is an infrastructure gap), so it warns at task start, forces
+the task to `high` risk, and says so in the PR body.
+
 ### "The tool found defects" vs "the tool could not run"
 
 An oracle that collapses every non-zero exit into one boolean will blame an
@@ -584,13 +746,23 @@ for `go` and `npm` — plus any command that fails to launch at all. A timeout
 stays `failed`: an infinite loop the agent just introduced looks exactly like
 one, and excusing it would let a hang buy a green.
 
-Three rules govern the verdict, and the last two are what keep this honest:
+Four rules govern the verdict, and the last three are what keep this honest:
 
 * An excused leg does **not** fail the gate — the same fail-open rule every other
   infrastructure error in the pipeline follows.
 * But a suite that had commands to run and ended up with **no leg that ran** is
   **red**, reported as infrastructure rather than as the agent's fault. Fail-open
   per leg must never add up to a vacuous green.
+* The same rule applied to a **subset**: under `--untrusted` the operator's own
+  legs are *required* (`ImplementContext.operator_validation`, carried as
+  `ValidationReport.required`), so an operator leg that could not run leaves the
+  suite **red** — `stalled`, i.e. infrastructure, never the agent's fault — even
+  when a design leg passed. Otherwise "some leg ran" is satisfiable by a command
+  the *design* chose, and the operator's `.venv/bin/python -m pytest -q` is
+  exactly the leg most likely never to launch in a worktree with no `.venv` of
+  its own. The diff-base re-run below cannot adjudicate it either: a command that
+  never launched has no exit code to compare against the base. This subset is
+  empty in every other mode, which is what keeps their verdicts byte-identical.
 * And an excuse the **agent's own diff manufactured is revoked**. Before an
   excuse is granted to a tool that ran and refused (a `pytest` exiting 4 on a
   typo the diff added to `addopts`, a `go build` in a tree whose `go.mod` it
@@ -607,6 +779,11 @@ Every excused leg gets its own `validation_infra` trace span, a `WARNING` in the
 log, and a contribution to `OracleResult.signature()` — so the progress ledger
 recognises the dead end and abstains to a human instead of grinding. The agent's
 feedback says explicitly that these are not its diff and not to try to fix them.
+When the red came from a *required* leg that never ran rather than from nothing
+running at all, the feedback names the command(s) — `` `cmd` (detail) `` — and
+says the checks that did run are not a substitute for them, because telling an
+agent "NONE of the commands could run" while one of them passed is a lie it will
+act on.
 
 The resolved version of every tool the oracle runs (`{"pytest": "9.0.3",
 "mypy": "2.0.1"}`) is recorded in `.harness/pipeline.json`. Without it, a verdict
@@ -640,7 +817,8 @@ an after-edit hook), grounds the edited `.py`/`.go` file, and on a
 hallucinated/wrong-arity symbol puts the finding **in front of the agent**
 (exit 2 → stderr) as the reason to fix it — instead of finding out at test time.
 For agent CLIs that support after-edit hooks, wire it once in the CLI's project
-settings:
+settings. **Gemini CLI currently has no such hooks**, so if that is what you
+drive, skip the snippet and use the side-car/manual invocation below instead:
 
 ```json
 { "hooks": { "PostToolUse": [ {
@@ -663,8 +841,8 @@ hook's default timeout is 600 seconds.
 [extensions/automations/edit-gate/](extensions/automations/edit-gate/).) The same
 `--hook` primitive drops into a git `pre-commit` hook, an editor on-save task, or
 CI — making the symbolic gate a verification side-car for *any* runtime, not just
-the harness's own loop. Gemini CLI exposes no after-edit hook, so its users run
-the side-car that way — the edit-gate README describes the manual invocation.
+the harness's own loop. That is also the path for a hook-less agent CLI such as
+Gemini CLI; the edit-gate README spells out the manual invocation.
 
 ## Command reference (the CLI behind the tasks)
 
@@ -682,7 +860,7 @@ harness pipeline run        --task remove-all --no-pr      # implement+review on
 
 # Bound an unattended run by tokens/cost; gate untrusted design commands
 harness pipeline run        --backend agent-cli --max-tokens 5000000 --max-cost 20
-harness pipeline run        --backend agent-cli --untrusted    # allowlist design (validate:) cmds
+harness pipeline run        --backend agent-cli --untrusted    # allowlist design (validate:) cmds and add them to yours
 
 # Finish an IDE-implemented task: re-ground, review, open the PR
 harness pipeline complete <task-id> --pr local
@@ -708,11 +886,40 @@ harness pipeline verify-diff --repo . --base main --intent "what the change shou
 harness pipeline backends
 ```
 
+`pipeline status`'s `oracle:` line prints the commands the **plan** holds — what
+the design declared (or what was seeded at plan time). Under `--untrusted` that
+is not what runs: the effective oracle is the operator's own commands plus the
+allowlisted survivors, composed at run time (see
+[Trust & safety](#trust--safety-gating-work-you-didnt-write)). The plan carries no untrusted flag, so
+the renderer has nothing to show the union from.
+
 `verify-diff` is read-only and needs no plan, worktree or PR: it grounds the
 changed files, runs the dependency-blame check, and puts the diff in front of the
 same **≥ 2 fresh-context verifiers** the review gate uses (`--verify-samples` to
 add more). A backend with no one-shot path — `ide-handoff` — makes it skip
 (fail-open) rather than block.
+
+**`--base`** is validated on the subcommands that fork a worktree from it or
+measure against it (`plan`, `run`, `complete`, `requeue`). It must name
+something that resolves as a **ref**: a local branch, taken as
+`refs/heads/<name>`, or an origin remote-tracking branch,
+`refs/remotes/origin/<name>` — with a tag or a raw commit SHA named on purpose
+passing through as themselves. A **revision expression** (`main~3`, `main@{0}`)
+or a **pseudo-ref** (`HEAD`, `@`, `FETCH_HEAD`) is refused: it pins a commit
+where a ref was required, or names a different commit in every worktree.
+Untested, a bad base is silent — `rev-list --count <base>..<branch>` exits 128,
+the count degrades to `0`, and *no task is ever green* again, permanently, from
+one typo. So it is refused up front, before a worktree exists or a pool slot is
+burned, as a clean CLI error rather than a traceback (`pipeline run: base ref
+'mian' does not resolve in …`, exit code **2**). The read-only and recovery
+subcommands — `status`, `trace`, `prune`, `supervise --recover` — are *not*
+gated and stay reachable when the base does not resolve: `status` and `trace`
+only read, `prune`'s landed proof already fails closed (an unmeasurable base
+keeps branches, it never deletes them), and recovery resets a worktree to its
+own `HEAD` — it has to work in exactly the broken repo you reach for it in.
+`verify-diff` is ungated for its own reason: it only reads a diff, so its
+`--base HEAD` is a legitimate way to ask about the uncommitted work and passes
+through untouched (it is still qualified when it names a branch).
 
 The most-used env overrides are `HARNESS_TEST_CMD` / `HARNESS_TYPE_CMD` /
 `HARNESS_LINT_CMD` (the oracle), `HARNESS_MAX_ITERS` (ralph loop cap),
@@ -752,7 +959,7 @@ is in [§ Complete configuration reference](#complete-configuration-reference).
   recursion this closes. The flock dies with its holder, so a stale
   `run.lock` file refuses nothing, and there is deliberately no bypass flag.
 - **Safety:** the `agent-cli` backend's tool whitelist is scoped on purpose
-  (`--allowed-tools`). Widen it deliberately, and run unattended loops on
+  (`--allowedTools`). Widen it deliberately, and run unattended loops on
   disposable branches/worktrees — an agent with broad shell access plus a
   poisoned dependency executes with whatever it can reach.
 - **Grounding environment:** the gate grounds changed **`.py` and `.go`** files.
@@ -786,7 +993,7 @@ and `task_id`. Append-only across runs, one line per span, each well under
 corrupting each other. Tracing never breaks the run: every write failure is
 swallowed.
 
-The vocabulary is **21 span types**, all `snake_case` without exception — they
+The vocabulary is **22 span types**, all `snake_case` without exception — they
 are `jq` keys and `--type` filters, and a hyphenated outlier is a span nobody's
 saved query ever finds. The authoritative list lives in
 `harness/pipeline/trace.py`'s module docstring; it is reproduced here:
@@ -804,14 +1011,15 @@ saved query ever finds. The authoritative list lives in
 | `verify` | the independent-verifier gate: `verdict`, `confidence`, `votes`, `agreement`, and `error` when the gate's own output contract broke |
 | `dep_blame` | the dependency-blame gate fired (the diff patches vendored third-party code) |
 | `freeze` | a frozen acceptance test was modified — review fails outright |
+| `protected_path` | a dirty path matched a `protected_paths` rule, so the pipeline's catch-all `git add -A` was **refused** and review failed before the oracle ran (`path`, `rule`) — nothing staged, committed or reset |
 | `mutation` | the mutation gate scored the change (`total`, `killed`, `score`, `survivors`) |
 | `abstain` | the backend emitted the `ABSTAIN` sentinel and handed the task to a human |
 | `review` | the review gate's verdict (`passed`, `risk`, `files`) |
 | `git` | a repo-level git operation worth auditing (today: seeding a dependency's work into a worktree) |
 | `push_guard` | HEAD no longer is — or descends from — the reviewed commit, so the PR was **withheld** |
 | `pr` | a PR was opened (or refused), with the mode and URL |
-| `recovery` | a provably-crashed task was rolled back and re-armed |
-| `recovery_skipped` | a stale-*looking* task was left alone: liveness could not be established, and a rollback needs positive proof of death |
+| `recovery` | a provably-crashed task was rolled back and re-armed — with `reset_outcome` (`reset` / `no-op` / `failed` / `unknown`), `reset_ok` and `reset_reason` **read back from the tree**, so a reset that was rejected is recorded as one. `reset_outcome` is the field the run summary counts on: only the two `VERIFIED_OUTCOMES` (`reset`, `no-op`) leave a tree whose state was actually proved |
+| `recovery_skipped` | a stale-*looking* task was left alone — because liveness could not be established (`unknown-liveness`: a rollback needs positive proof of death), because the claim could not be **held** (`unclaimable` — `acquire` fail-opened on an unopenable `claim.lock`, and the destructive sequence must not run on an unproved hold), because the task was positively **alive** — its claim is still held (`claim-held`), or its pid is alive with `kill_worktree_procs` off (`pid-alive-kill-off`) — or because one of the destruction gates could not prove the worktree safe to reset (`worktree-busy`, `survivors`, `recent-writes`, `unverified-scan`) |
 | `prune` | a worktree was reclaimed, refused-and-reported, or errored during teardown |
 
 ```bash
@@ -903,7 +1111,7 @@ and a field with no env var is library-only — set it by constructing
 | `max_consecutive_failures` | — | — | `3` | Abort the loop after this many consecutive red / commit-failed iterations. |
 | `no_progress_window` | `HARNESS_NO_PROGRESS_WINDOW` | `--no-progress-window` | `3` | Abstain to a human once the last N iterations reach the *same* failing state, or strictly alternate A,B,A,B. `0` disables. Must not exceed `max_consecutive_failures`. |
 | `max_tokens` | `HARNESS_MAX_TOKENS` | `--max-tokens` | `None` | Token budget for the run (unbounded if unset). |
-| `max_cost_usd` | `HARNESS_MAX_COST_USD` | `--max-cost` | `None` | USD budget: **real** on `agent-cli` (and handed to the CLI as `--max-budget-usd` when it advertises the flag), **estimated** per model on `openai`/`gemini`. |
+| `max_cost_usd` | `HARNESS_MAX_COST_USD` | `--max-cost` | `None` | USD budget: parsed **best-effort** from the JSON envelope on `agent-cli` (and handed to the CLI as `--max-budget-usd` when it advertises the flag), **estimated** per model on `openai`/`gemini`. |
 | — | `HARNESS_MODEL_PRICES` | — | unset | `model=in/cached/out` (USD per 1M tokens), comma-separated; a two-value `model=in/out` prices cached input at the input rate. Without a rate, `max_cost_usd` warns at startup and cannot fire on that backend — which is the **default** state on `openai`/`gemini`, whose default models are absent from the built-in table. |
 | `quota_wait_cap_seconds` | `HARNESS_QUOTA_WAIT_CAP` | — | `18000.0` (5h) | Longest single wait for a subscription quota window to reopen. `0` disables the regime (quota windows fall back to the transient ladder). |
 | `max_quota_waits` | `HARNESS_MAX_QUOTA_WAITS` | — | `4` | How many quota windows one task waits out before giving up, so a misclassification cannot park a run forever. |
@@ -913,7 +1121,8 @@ and a field with no env var is library-only — set it by constructing
 
 | Field | Env | CLI | Default | Effect |
 |---|---|---|---|---|
-| `untrusted_designs` | `HARNESS_UNTRUSTED_DESIGNS` | `--untrusted` | `False` | Allowlist-filter a design's `(validate:)` commands (fail-closed) **and** drop the branch's own agent settings/MCP config. Fails **closed** when the backend cannot do the latter. |
+| `untrusted_designs` | `HARNESS_UNTRUSTED_DESIGNS` | `--untrusted` | `False` | Allowlist-filter a design's `(validate:)` commands (fail-closed), **union** what survives with the operator's own oracle instead of letting it replace them (operator commands first, unfiltered), **and** drop the branch's own agent settings/MCP config. Fails **closed** when the backend cannot do the latter. When `default_validation()` is empty there is no operator half to union into and the design supplies the whole oracle: warned at task start, forced to `high` risk, and stated in the PR body. |
+| `protected_paths` | `HARNESS_PROTECTED_PATHS` | — | `()` (empty) | Paths the pipeline's own catch-all `git add -A` must never sweep into a commit — the sweep is what turns "the agent dropped a file in the worktree" into "the file is on a remote". A match **refuses** the automatic commit and fails the review with the path and the offending rule in its `reasons` (which land in the task's notes): nothing is staged, nothing is committed and deliberately nothing is reset, so the tree survives exactly as the agent left it. An unreadable `git status` refuses too — with rules configured, unchecked is never cleared. Rules match repo-relative paths in four forms: an exact path, an `fnmatch` glob over the whole path, a directory prefix (everything under it), and — for a rule naming no directory at all — the same match against the **basename at any depth**, so `.env` protects `services/api/.env` and `*.pem` protects a key wherever it lands. Case-sensitive, so a rule means the same thing on macOS as in CI. Comma- or newline-separated in the env var; a bare string is one rule, never a sequence of one-character rules. Empty by default — an unconfigured run behaves exactly as before, since the per-task worktree already bounds the blast radius. |
 | `kill_worktree_procs` | — | — | `True` | Terminate processes still running inside a worktree before removing it. When off, such a worktree is **refused and reported**, never bulldozed. |
 | `reset_worktree_on_reuse` | — | — | `False` | Recycle a reused worktree (hard reset to its branch HEAD + clean untracked, keeping git-ignored build caches) instead of resuming it as-is. Off because harness reuses a worktree to *resume the same task*. |
 | `worktree_stale_seconds` | `HARNESS_STALE_SECONDS` | — | `7200.0` | Heartbeat age past which a task whose process is gone is treated as crashed. Must exceed the longest legal quiet period — a 3600s agent call, the validation suite, or `mutation_max_mutants × mutation_timeout` (4800s at defaults). Raise it if you raise those. |
@@ -944,7 +1153,7 @@ and a field with no env var is library-only — set it by constructing
 
 | Field | Env | CLI | Default | Effect |
 |---|---|---|---|---|
-| `test_cmd` / `type_cmd` / `lint_cmd` | `HARNESS_TEST_CMD` / `HARNESS_TYPE_CMD` / `HARNESS_LINT_CMD` | `--test-cmd` / `--type-cmd` / `--lint-cmd` | auto-detected | Override the oracle commands. Operator-set commands are always trusted, even under `--untrusted`. |
+| `test_cmd` / `type_cmd` / `lint_cmd` | `HARNESS_TEST_CMD` / `HARNESS_TYPE_CMD` / `HARNESS_LINT_CMD` | `--test-cmd` / `--type-cmd` / `--lint-cmd` | auto-detected | Override the oracle commands. Operator-set commands are always trusted **and always run**, even under `--untrusted` — they are the escape hatch for a design that legitimately needs a *narrower* oracle, which a design can no longer choose for you. A whitespace-only value is **dropped with a warning** and the oracle falls back to autodetection — an empty command line exits 0 as a leg that judged nothing, so there is no "run no checks" setting here. |
 | `allowed_tools` | — | — | `Read,Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(npm:*),Bash(go:*),Bash(make:*),Bash(cargo:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(cat:*),Bash(ls:*),Bash(wc:*),Bash(find:*),Bash(diff:*),Bash(sort:*),Bash(uniq:*),Bash(sed:*),Bash(awk:*),Bash(echo:*),Bash(env:*)` | The tool allowlist handed to the agent CLI (`--allowedTools`). It must cover every runner the **oracle** can emit — under an accept-edits approval mode a command with no allow rule aborts the invocation. Prefix rules are word-boundary aware (`Bash(python:*)` does *not* cover `python3`) and a piped command is denied unless every segment has a rule, hence the read-only utilities. At invocation the executable of each oracle command in scope (the task's `(validate:)` commands plus `test_cmd`/`type_cmd`/`lint_cmd`) is appended as `Bash(<argv0>:*)`, so a venv-path oracle like `/repo/.venv/bin/python -m pytest -q` no longer needs a hand-widened config. Widen deliberately. |
 | `agent_model` | `HARNESS_AGENT_MODEL` | — | `None` (CLI default, with a startup **WARNING**) | Pin the agent CLI's model. Unpinned, the CLI's (or an org policy's) default decides cost, context size and behaviour — and a default change silently invalidates a calibrated `max_cost_usd`. |
 | `agent_fallback_model` | `HARNESS_AGENT_FALLBACK_MODEL` | — | `None` | `--fallback-model` for overload (passed only when the installed CLI advertises it), so the run leans less on the hand-rolled retry ladder. |
@@ -971,8 +1180,8 @@ and a field with no env var is library-only — set it by constructing
 `loopeng/` documents the plan → implement → review workflow as three bash
 scripts (`ralph.sh`, `orchestrate.sh`, `review.sh`) driving headless agents. This
 pipeline is those patterns rebuilt as a structured, resumable Python package and
-**fused with the harness's grounding gate** — plus an editor-first front end so
-you never touch tmux.
+**fused with the harness's grounding gate** — plus an editor-first front end, so
+a terminal multiplexer is an option (`pipeline tmux`) rather than the interface.
 
 The unattended-safety, fleet-supervision and trust layers above — the loop
 recovery primitives, the worktree lifecycle, the crash supervision, and the
@@ -989,6 +1198,21 @@ each has a condition under which the decision should be revisited.
 
 | Idea | Why not | Revisit when |
 | --- | --- | --- |
-| A `git commit --no-verify` fallback when a hook rejects a commit | Bypasses the target repo's own pre-commit gates to force a commit through — the harness must never weaken the gates of the repo it is editing, at any scope, including for its own pipeline-authored correction commits. Preserve-the-workspace-and-repair is strictly better, and is what harness does: `looptools.commit_repair_prompt` plus the `pending_commit_failure` guards that suppress the rollback and hand the failure to the next iteration. | Never. |
+| A `git commit --no-verify` fallback when a hook rejects a commit | Bypasses the target repo's own pre-commit gates to force a commit through — the harness must never weaken the gates of the repo it is editing, at any scope, including for its own pipeline-authored correction commits. Preserve-the-workspace-and-repair is strictly better, and is what harness does: `looptools.commit_repair_prompt` plus the `pending_commit_failure` guards that suppress the rollback and hand the failure to the next iteration. Do not read the opt-in `protected_paths` guard as a scoped version of this bypass and reject the useful part with it: that guard *refuses* a commit which would sweep a protected path onto a remote, and harness's own correction commits still run the target repo's hooks, unmodified and at every scope. | Never. |
 | A natural-language `--stop-when <cond>` stop condition ("end when the agent reports this condition") | The stop signal is the agent's own report of its own success. Harness already has a strictly stronger, non-self-reported stop condition — the oracle (validation + grounding + review), which the agent cannot assert its way past. Adopting a self-reported stop would be a regression in rigor. | The condition is machine-checkable outside the agent (at which point it is an oracle, not a `--stop-when`) |
 | z3's `Solver.solutions(t)` (new in 5.0.0, [z3#8633](https://github.com/Z3Prover/z3/pull/8633)) | Broken in 5.0.0.0 — the blocking clause uses `And` where it needs `Or`, so it returns a strict subset of the models (2 of 6 on a two-variable repro). Reading "no more models" off that would manufacture a contradiction and report a live branch dead, which the solver's abstention contract forbids. **Revisited 2026-08-21** when the original lift condition was met: z3-solver 5.1.0.0 ships the fix ([z3#10195](https://github.com/Z3Prover/z3/pull/10195)) and the recorded repro yields all 6 models on it. Rejection re-affirmed on new grounds: the `[z3]` extra's floor stays `>=4.12` uncapped, so the broken 5.0.0.0 remains installable and any use would need a version gate with the loops kept as fallback; the iterator ends silently on an `unknown` `check()`, so exhaustion would still need a final unsat confirmation under the abstention contract; and n (guards per `if`/`elif` chain) is too small for the O(n²) loops to be a measured cost. See the comment on `Z3Solver._proved_unsat` in `harness/grounding/solver.py`. | The extra's floor rises to `z3-solver>=5.1` **and** guard-chain enumeration shows up in a profile (then wrap `solutions()` with a final unsat confirmation) |
+| An **overage wait** — pause when the included subscription window is spent and further requests start billing as paid extra usage | **Not rejected on the merits — blocked on transport, and the gap is real.** harness's whole quota-window regime is reachable only from a *failed* invocation (`classify_invocation_failure` runs on the failure detail, which is populated only on a non-zero exit), so an iteration that *succeeds* while billed to extra usage is invisible to it; `max_cost_usd` is the only backstop and it expresses a spend ceiling, not "stop when the included window ends". The signal also cannot be read from where harness stands: the `agent-cli` backend consumes the one JSON result envelope a non-interactive run prints, so a window/overage state a CLI surfaces only as an incremental event on its streaming channel is dropped long before harness sees it. | Either the backend grows a streaming read path — a materially larger change (incremental line parsing, a second usage/denial/result extraction contract, and shutdown/timeout plumbing around a streamed pipe) that must be weighed on its own, not smuggled in with this — **or** the result envelope harness already parses grows a window-state field. Those two shapes are the cheap thing to re-check |
+| **Auto-downgrading to the fallback model** on the first quota-limited result (roll the iteration back, clear the error, retry immediately on a weaker model) | Two standing harness rules conflict with substituting a model for the wait. (1) The **pinned-model rule** — `agent_model`'s own note: leaving the model unpinned lets the CLI's (or an org policy's) default decide cost, context size and behaviour, and a default change silently invalidates any calibrated `max_cost_usd`. An orchestrator that swaps the model on a quota rejection invalidates that calibration from the inside, which is the very thing the pin exists to prevent. (2) The quota-window wait **is** harness's designed overnight recovery, not a last resort: this backend runs on subscription-metered credentials by design, which makes a rolling window the single most likely way an overnight run dies. Trading the wait for a (typically weaker) model changes what implements the task, and harness's oracle is external but not free — a weaker model mostly buys more iterations against the same gate. It is a defensible choice for an interactive tool; harness optimizes for the unattended run, and keeps `agent_fallback_model` as a CLI-level *overload* fallback without letting it pre-empt the quota wait. | An operator wants an explicit **opt-in** downgrade policy — then it is its own `PipelineConfig` field, with `max_cost_usd` re-calibration and a trace span naming the substituted model, never automatic behaviour of the existing `agent_fallback_model` knob |
+| A durable, out-of-band **worktree reservation** (`lease <name>`) stamped onto an already-registered slot, plus its bulk `return --all` release | A reservation verb of that shape exists to hand pooled slots to *unrelated* consumers, so it must outlive the process that took it. harness's ownership primitive is per-task and durable in the stronger sense — an flock-held `TaskClaim` the OS releases on process death, plus a state-dir-wide `RunLock` — and a reservation that outlives its holder is exactly the evidence class recovery refuses to act on. The bulk-release half inherits the same premise: there is no harness state a "release everything someone reserved" sweep could act on. The sub-parts that are sound on their own are independently already here — a per-item failure never stops a sweep, and a slot whose ownership changed since it was observed is skipped. | harness hands worktrees to consumers outside its own plan (a pool shared with another tool), so ownership can no longer be derived from a live process |
+| **HMAC-authenticated** state kept outside the mutable worktree, with unauthenticated/corrupt/unknown/legacy state quarantined and the heal path failing closed | Two harness design rules. (1) The state file is documented as human-readable and **hand-editable** — `spec.py`'s module docstring ("persisted to (and resumed from) `<repo>/.harness/pipeline.json` and inspected in any editor"), which is what justifies `store.load_plan` catching `TypeError`/`KeyError` at all. An HMAC over that file makes every legitimate hand-edit read as tampering and breaks the documented recovery workflow. (2) The threat model for the state dir is **corruption and concurrent writers, not forgery**: the dir is local and `0600`, and the anti-forgery primitives harness does need are already flock-based (`RunLock`, `TaskClaim`), where the question is liveness, not authenticity. (The *quarantine* half of the same idea is separately already here.) The authentication layer also carries a cost this rejection avoids: a cleanup that fails partway can leave a path permanently unusable until someone deletes a file by hand. | The state dir becomes writable by something outside the operator's own trust boundary — a shared host, a network path — at which point authenticity, not corruption, is the question being asked |
+| A distinct **exit code 3** for "a worktree was not returned" — a non-zero status when teardown deliberately leaves a held or dirty worktree in place, with 1 kept for genuine failure | The signal harness would have to key on is the wrong one. `worktrees_skipped` is a heterogeneous bucket built from three unrelated sources: deliberate `WorktreeInUse` refusals (dirty, processes, survivors, unverified-scan) plus the unlanded skip; **genuine teardown errors** from the `except Exception` arm; and "not a pipeline worktree" — a foreign worktree registered under `worktree_root` that is by design never harness's to reclaim, and has its own passing test. Exiting 3 on that bucket reports a real teardown failure as "deliberately left behind", inverting the exact failed-versus-did-not-act distinction that is the whole reason for a distinct code, and latches 3 permanently in any repo where the operator keeps a scratch worktree under the worktree root — no flag clears it and the documented remedy (`--allow-dirty` / `--allow-unlanded`, or move it aside) is a no-op for it. Doing it correctly means separating refusals from errors and from foreign no-ops inside `prune`'s return value, which is a different change. It is also an amendment to a closed contract rather than an application of it: ARCHITECTURE.md's Exit Codes table is a three-code, CI-facing vocabulary (0 success, 1 failure, 2 usage error) with exactly one documented exception, and prune's refusals are the *designed* outcome — "teardown is refuse-and-report, never bulldoze", re-attempted and re-reported on every later run — which a non-zero status turns into failure for every `set -e` wrapper, cron job and task runner. Nothing consumes prune's exit status today: no `.vscode/tasks.json` task, no script, no test, and `orch.prune` has exactly one caller (`run` never calls it in-process). Meanwhile the did-not-act fact already ships on a machine-readable channel that draws precisely the distinction an exit code would blur — the `prune` span's `action=remove` / `skip` / `error` with the reason. | `prune`'s return shape separates deliberate refusals from teardown errors and from foreign-worktree no-ops **and** a real consumer wraps its exit status — and then the new code lands in ARCHITECTURE.md's Exit Codes table, not only in this file |
+| A general condition-to-action **rules engine** for supervision reactions (events → configured responses, a persistent daemon, a durable wake queue) | harness's supervision is **reconcile-on-next-run**, and deliberately does not try to keep agents running or inject keystrokes, which is what fits the file-as-state model — the standing rejection `supervisor.py`'s own docstring records as "deliberately minimal — no long-running event engine". Everything such an engine would react to is already reported on a channel the next pass reads: the heartbeat classification, the `recovery` / `recovery_skipped` spans, and the recovery journal. What the engine additionally buys — an away-mode daemon posture, per-actor wake routing, presentation locks and per-row acknowledgement — all exists to act while nothing else is running, which is precisely the posture harness declined. | harness needs a reaction *between* runs that reconcile-on-next-run cannot express — an event that must be acted on while no `pipeline` command is running |
+| Claim **supersession** — taking a claim from a live-but-wedged owner once the claim record and the liveness beacon are both older than a grace window | Rejected on scope, not merit. Where a claim is cheap, superseding it costs the loser a banner. In harness the claim is the **last gate before `Supervisor._clean_worktree` stashes and hard-resets a worktree**, so taking it from a live-but-slow owner is precisely the "misclassified live agent's work gets destroyed" outcome the module's two safety rules forbid — and "live but not beating" is exactly what a long agent call plus a 4800s mutation gate looks like. The *reporting* half is what harness does instead: a wedged owner is escalated as a `stuck-claim` record and left strictly alone. Report, never take. | Never, for a held flock — a held flock proves the owner is alive *right now*. Only if the claim stops being the last gate before destruction, i.e. some independent positive proof of death gates the reset instead |
+| A **declared-wait token** — a `paused: … until <ISO ts>` a waiting worker writes for itself, rechecked at that time or at the cadence bound, whichever comes first | A token of this shape is safe in a reminder queue — a list of items re-surfaced to a human at a fixed cadence until each is cleared. There `until` can only ever make an item surface **sooner** (a declaration beyond the recheck cadence surfaces anyway) and the worst failure is extra noise. Wired into harness's liveness the polarity inverts: the horizon would defer the *destruction* threshold (the natural producer, `quota_wait_cap_seconds` = 18000s, is 2.5× `worktree_stale_seconds`), and the worst failure becomes a wedged run reading green and unrecoverable for hours. It also deletes half the `stale` rule — a *measured* heartbeat age is one of two independent bases, and a self-declared future horizon is not measurable — and reintroduces wall-clock dependence into the one place `Heartbeat.age_seconds` deliberately removed it (CLOCK_MONOTONIC + `boot_id`, after a backward clock step made a long-dead task read perfectly fresh forever). Both producers are covered already: `wait_out_quota_window` beats every 300s through a 5h wait, and the mutation gate is covered by the documented `worktree_stale_seconds` floor. A note the corpse left saying "don't check on me until 5pm" is the killed-writer attribution problem in another form — the one `_recently_written` already records a rejection of. | harness grows a human-facing re-surface cadence for declared waits — and then an `until` token may only *shorten* that cadence, and must never be consulted by `Heartbeat.freshness` or by any teardown gate |
+| **State-root identity binding** — a claim records its state root's device/inode/owner/mode and the holder re-verifies it | The acquire-time check is empirically ineffective against the case it is sold on. Reproduced locally: after the state root is deleted and recreated, a second probe's `os.fstat(fh)` and `os.stat(path)` return the *same* new inode (the first owner's lock lives on the unlinked one), so the guard passes and `held_elsewhere` still answers a confident `False`. `TaskClaim.held_elsewhere` / `RunLock.held_elsewhere` are static probes with no prior `(st_dev, st_ino)` to compare against, and both short-circuit on `not path.exists()` before any file is opened. Failing *closed* on file identity also contradicts the documented contract that these locks' authority comes solely from a live flock holder — "a stale `run.lock` file whose holder died locks nothing, so it never refuses anyone" — trading a deliberate fail-open for a refusal that buys nothing. The topology that motivates it is a *detached* runner reparented to an init process, outliving its owning session; harness's claim is held by the orchestrator process and released by the kernel the instant it exits. The only reachable trigger is a hand-run `rm -rf .harness`: `prune` touches branches and worktrees, never the state dir, and worktrees live outside the repo. | harness grows a lock-holding process that outlives the command that started it. The narrow residual gap — nothing checks that the path opened is the file locked — should then be closed **owner-side** (the owner re-stats its own recorded `(dev, ino)` and stands down), never as an acquire-time `fstat`/`stat` compare |
+| **Write-probe bounds** — `-xdev` plus a hard wall-clock timeout on the recent-write scan | Both halves fail here: the consequence direction is inverted, and the mechanism does not do in harness what it is sold on. Where this shape works, the bound is a *process* kill — SIGTERM/SIGKILL the whole `find` process group, return 124 — and hitting it reads as **no evidence**, leaving the escalation schedule untouched; the cost of degrading is one spurious nag. In harness the same probe is the *last gate before destruction* and absence of evidence **authorizes** the reset, so a wall-clock expiry is exactly the "scan that could not be completed" case the sibling process gate fails **closed** on. An in-process deadline checked between `stat()` calls cannot preempt a `stat()` wedged in D-state, so the hazard it names ("one hung stat hangs the whole recovery pass") survives the bound entirely — and the `-xdev` check performs the hanging syscall itself. `-xdev` is worse than merely bounded: it makes a nested mount (the tmpfs/overlay/container-volume build dir where a busy agent's writes concentrate) a *permanent* blind spot for the only evidence class this gate collects, and a wall-clock cap shrinks precisely when the box is busy — which correlates with a heavy writer actually running. For readable filesystems the walk is already hard-bounded (depth 6, 2000 entries). | A hung-mount stall is actually observed in a real recovery pass — and then only as a correctly mechanized variant (a bounded subprocess, or a daemon thread with a join timeout) whose expiry **fails closed**: timeout ⇒ skip this pass, exactly like `_worktree_quiet` |
+| **Teardown ownership verification** — no other task record may name the same live path, with allocation, publication, verification and return serialized under a lock shared across clones | Applicable in shape — `Supervisor.recover` is harness's one record-trusting destructive path — but the check as specified cannot see the collision that justifies it. The reachable case is two repos sharing one `worktree_root` with colliding task ids, and there every intra-plan check passes: `path_for` and `branch_for` are computed from the task id alone, so both repos produce the same directory *and* the same `agent/<id>` branch, while the other owner lives in the other repo's plan under a different `state_dir` — all three checks read this repo's own state, which is the exact blindness the change is meant to fix. The version that actually closes it enumerates other registered homes and writes an owner claim at *allocation* time under a lock shared across clones; harness allocates with `git worktree add` from its own clone and has neither a cross-repo registry nor a shared lock location, so building the version that works here is a new design, not an application of this one. The premise was re-verified rather than assumed: `worktree_root` still has no CLI flag and no `HARNESS_*` env var (the CLI's override builder never forwards it; the env merge takes it only from the programmatic overrides dict). (The signal-grace half is already here — `procutil.terminate_in_dir(grace=…)`.) | `worktree_root` becomes a user-facing knob, **or** harness gains a cross-repo registry — then adopt the cross-home scan *and* the shared-root lock, never the intra-plan check alone |
+| A durable **once-per-generation report** for a deferral no unattended caller can clear, aimed at the `survivors` branch of recovery | The premise — that the task then sits in `implementing` forever, structurally identical to the wedged-owner case the stuck-claim record exists for — is false in the default configuration. The survivors branch is reachable only with `kill_worktree_procs` on **and** the `TaskClaim` free, which means the heartbeat pid is dead (a live pid still holding the claim takes the earlier branch and is already escalated); and a task whose heartbeat pid is dead goes straight back into the *same* `pipeline run`, because inflight tasks are unconditionally resumable and the only skip is a recorded pid that is alive. `ensure` then reuses the tree (`reset_worktree_on_reuse` is False by default — harness deliberately does not reset a reused worktree), a fresh claim, generation and heartbeat are minted, and the task stops being stale. So an unattended caller *does* clear it, one wave later; the wedged-owner case is special precisely because its owner is alive, so selection skips it on every future run. The asymmetry is smaller at the other end too: no in-tree caller wires `on_escalate`, so the existing stuck-claim record is itself an unread `0600` file, while the survivors deferral already writes a durable per-task `recovery_skipped` span with `reason='survivors'` (trace is on by default) behind a first-class `trace --type recovery_skipped --task <id>` surface, plus a red `stale` row in `supervise` on every pass — the change buys a second unread file, not a page. The obvious dedup key is unsound as well: the post-kill rescan reports whatever is cwd'd in the tree at that instant, not only what survived a signal, so a respawning writer presents a new pid set every pass and would mint a fresh journal record each time — the journal-burying failure a wedge id exists to prevent, under a bounded journal. | BOTH a harness caller actually wires `on_escalate` (so a record is a notification rather than a second unread file) **and** a survivors deferral is observed to persist across runs while the resume is *also* blocked — and then key the record on the wedge identity, never on a raw pid set |
+| **Record the close before the destructive sequence** — publish the intent to destroy before destroying, so a crash mid-sequence still leaves a record | harness already honours the invariant where it applies — `prune` reclaims only worktrees the plan already records as `done`, and the `implementing` transition is persisted before the long backend call — so the recommendation has only crash recovery left to aim at, where the residual loss is one `stash` field inside one escalation record. That field is not the only pointer: `stash_push` writes `refs/stash` in the repo's common dir with the task id in its message, listed from the worktree and the main repo alike and surviving `git gc`. Nor does the window go silent: a crash before `clear_heartbeat` re-classifies `stale` on the next pass, and a crash after it leaves an active task with no heartbeat, which is `unknown` and is reported on *every* later pass. Meanwhile the proposed fix inverts the module's governing rule — a recovery record asserts a *completed* destructive act backed by positive proof of death, and publishing one before the act (which a later pass may find should never happen, via a held claim, a refreshed heartbeat or the write probe) is a report not backed by fact — and its "never age out a pending record" clause defeats the bounded journal under exactly the repeated-crash pattern it targets. | Someone proposes the much smaller, non-publishing variant: fold the pre-reset intent into the existing `Tracer` span before `_clean_worktree` — a breadcrumb, never an escalation, still prune-eligible |
+| An **isolated-execution prompt contract** — "you are in an isolated worktree at `<abs path>`; prefer relative paths and never invent, abbreviate or re-resolve them; do not read or modify any other clone" | The non-conflicting half already ships: every `agent-cli` prompt opens with "You are implementing ONE task in an isolated git worktree on branch `<branch>`", and the CLI injects its own working-directory block into the agent's context. The novel half encodes a **bare gate repo** topology harness does not have — harness's worktrees come from `git worktree add` run in the main clone, so every git command inside one (including the `git commit` the same prompt mandates two sections later) reads and writes the main repo's `.git`; "do not read or modify any other clone" is literally false there. It also contradicts a mechanically-supported invariant: harness expects the agent to run a **venv-path oracle whose absolute prefix is the main repo** — `_allowed_tools_arg` exists precisely to mint `Bash(<argv0>:*)` for that interpreter — so "never re-resolve an absolute path" and "operate only within this directory" would instruct the agent to rewrite or refuse the one absolute path it is required to execute. And the `openai`/`gemini` backends get no tools and no cwd (harness writes the file), so the section would be false context injected into a toolless completion. | A much narrower variant is wanted: the literal worktree path plus "this checkout is the source of truth for this task; do not go looking for another copy of the repo to edit" — no off-limits clause, no absolute-prefix mandate, and `agent-cli` only. That is a different change, argued on its own |
+| A `:(literal)` **pathspec prefix** on every path handed to `git diff` | The mechanism the change is sold on does not exist. git compares a pathspec literally *before* it tries wildmatch, so a real file whose name equals the pathspec always matches — reproduced with files literally named `app/[id]/page.tsx`, `app/q?x/page.tsx` and `star*.txt`, each of which appears unprefixed in harness's own diff text and diff manifest. The failure direction is therefore **over**-inclusion (a wildcard name matching a sibling too), not the silent dropout the rationale asserts, and over-inclusion is inert here: `diff_manifest` gates every recorded path through exact string membership in the caller's path list and the untracked branch of `diff_text` filters the same way, while both call sites pass the complete `changed_files()` list — so an over-matched sibling was already part of the change. Literalness is needed where a folded sibling corrupts a per-file patch identity; harness has no per-file identity semantics here. The one real dropout in the same code path is not globbing at all and `:(literal)` does not fix it — `core.quotePath` returns a non-ASCII name already quoted and escaped, which matches nothing as a pathspec raw or prefixed — and that one is handled separately, by decoding the name (`gitutil._unquote_path`). Adopting as written would land a false rationale plus a regression test that already passes on unmodified code. | A filename with a **leading colon** needs supporting — the only shape a raw pathspec silently drops, since it parses as pathspec magic and matches nothing with rc=0 and no stderr. The quoted-path half of that pair already landed, so what would remain is escaping the pathspec itself — and then only on its own correct motivation, never as the glob fix this rationale describes |

@@ -60,7 +60,7 @@ that change verdicts, and the next major will too.
 
 ---
 
-## 3. Optional external tools ("skills")
+## 3. Optional external tools
 
 Install these with your OS package manager / vendor — **not** pip. Each unlocks a
 specific feature; the harness degrades gracefully (with a clear message) when one
@@ -114,7 +114,7 @@ lands in that area.
 ```bash
 harness status               # environment doctor: grounding solver, backends, deps, extensions
 harness pipeline backends    # which code-writing backends are usable here
-pytest -q                    # (after `.[dev]`) → 783 passed, 1 skipped
+pytest -q                    # (after `.[dev]`) → 1033 passed, 1 skipped
 harness verify - --lang go <<<'package main
 import "fmtx"
 func main(){}'               # grounding smoke test (should FAIL on the bad import)

@@ -4,7 +4,7 @@ Harness has two observability channels that answer different questions:
 
 | Channel | File | Question it answers |
 |---|---|---|
-| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able — 21 documented span types. |
+| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able — 22 documented span types. |
 | **Verbose logs** (`harness/log.py`) | stderr / `HARNESS_LOG_FILE` | *Right-now:* why did routing pick that agent, what exact git command ran and what did it print, which fallback fired, where did 40 seconds go? |
 
 Spans are the flight recorder; logs are the cockpit voice channel. Every span
@@ -123,7 +123,7 @@ logger = get_logger(__name__)
 9. Correlate pipeline work with `log_context(run_id=…, task_id=…)` — it's a
    `contextvars` scope, so it survives threads only if entered *inside* the
    worker function.
-10. **Span types are `snake_case`, and the vocabulary — 21 types — lives in
+10. **Span types are `snake_case`, and the vocabulary — 22 types — lives in
     `trace.py`'s module docstring** (`validation_infra`, `push_guard`,
     `quota_wait`, `recovery_skipped`, `freeze`, …), reproduced with meanings in
     [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl). Add

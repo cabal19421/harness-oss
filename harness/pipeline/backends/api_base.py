@@ -39,7 +39,7 @@ from ..looptools import (
     wait_out_quota_window,
 )
 from ..notes import RunLog
-from ..sanitize import sanitize_design, wrap_untrusted
+from ..sanitize import sanitize_design, sanitize_publication, wrap_untrusted
 from ..trace import Tracer
 from .base import (
     CodingBackend,
@@ -469,8 +469,7 @@ class ApiBackend(CodingBackend):
                             grounding_summary=oracle.grounding.summary)
                     continue
                 commit_failures = 0
-                if gitutil.commits_ahead(ctx.worktree, ctx.diff_base,
-                                         gitutil.current_branch(ctx.worktree)) > 0:
+                if ctx.own_commits_ahead() > 0:
                     logger.info("%s: %s implementing → done (oracle green after "
                                 "%d iteration(s), %s — %s)",
                                 self.name, ctx.task.id, i, budget.summary(),
@@ -484,17 +483,25 @@ class ApiBackend(CodingBackend):
                         grounding_ok=oracle.grounding_ok, detail="validation + grounding green",
                         grounding_summary=oracle.grounding.summary,
                     )
-                # green but nothing committed ahead of base → can't make progress
+                # green but nothing committed ahead of base → can't make progress.
+                # When the "work" was dirt `git add -A` cannot stage, the generic
+                # "validation may be too weak" reading names the wrong cause; say
+                # what actually happened (same treatment as the CLI loop).
+                unstageable = gitutil.unstageable_dirt_reason(ctx.worktree)
                 logger.warning("%s failing %s: oracle green but no commit ahead "
-                               "of %r — validation may be too weak to force a "
-                               "change (validation=%s)",
+                               "of %r — %s (validation=%s)",
                                self.name, ctx.task.id, ctx.diff_base,
-                               ctx.validation or "none")
+                               unstageable or "validation may be too weak to "
+                               "force a change", ctx.validation or "none")
+                runlog.append("noop", "green but nothing committed ahead of base",
+                              detail=unstageable, iteration=i)
                 return ImplementOutcome(
                     status="failed", iterations=i, oracle_passed=True,
                     grounding_ok=oracle.grounding_ok,
-                    detail=f"oracle green but no change ahead of '{ctx.diff_base}' "
-                           f"(validation={ctx.validation or 'none'} may be too weak)",
+                    detail=(f"oracle green but no change ahead of "
+                            f"'{ctx.diff_base}' — {unstageable}" if unstageable else
+                            f"oracle green but no change ahead of '{ctx.diff_base}' "
+                            f"(validation={ctx.validation or 'none'} may be too weak)"),
                     grounding_summary=oracle.grounding.summary,
                 )
             consecutive_failures += 1
@@ -642,11 +649,35 @@ class ApiBackend(CodingBackend):
             output_tokens=output_tokens) or 0.0
 
     def _ensure_committed(self, ctx: ImplementContext) -> gitutil.GitResult | None:
+        """Commit the model's file write; ``None`` when there is nothing to commit.
+
+        Mirrors ``AgentCliBackend._ensure_committed`` exactly, including the
+        index-not-status commit decision: ``git status`` can report dirt that
+        ``git add -A`` cannot stage (a dirty submodule), and the resulting
+        ``git commit`` rc=1 with an unmoved HEAD must read as "nothing to
+        commit", not as the commit failure that drives the repair loop.
+        """
         if gitutil.working_tree_dirty(ctx.worktree):
             logger.debug("worktree %s dirty — committing the model's file write",
                          ctx.worktree)
-            gitutil.add_all(ctx.worktree)
-            return gitutil.commit(ctx.worktree, f"{ctx.task.title}\n\nTask: {ctx.task.id}")
+            try:
+                gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
+            except gitutil.ProtectedPathError as exc:
+                # Reported as a failed commit on purpose: the caller already has
+                # the repair path for "oracle green but the commit did not
+                # happen", which re-prompts with this detail and never resets the
+                # worktree. Nothing was staged, so index and worktree are intact.
+                logger.error("%s: refusing the automatic commit for %s — %s",
+                             self.name, ctx.task.id, exc)
+                return gitutil.GitResult(1, "", str(exc))
+            # Checked only AFTER a successful stage, so the refusal above keeps
+            # its failed GitResult. Shared predicate — see the CLI loop.
+            if gitutil.nothing_to_commit(ctx.worktree):
+                return None
+            # Scrubbed for the same reason the PR title and body are: this
+            # message rides out on the same `git push` that publishes them.
+            return gitutil.commit(ctx.worktree, sanitize_publication(
+                f"{ctx.task.title}\n\nTask: {ctx.task.id}"))
         logger.debug("worktree %s clean — nothing to commit", ctx.worktree)
         return None
 

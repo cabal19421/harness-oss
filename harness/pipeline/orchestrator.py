@@ -39,7 +39,7 @@ from .ingest import plan_from_designs
 from .notes import RunLog, TaskClaim
 from .review import ReviewGate, ReviewResult
 from .spec import PipelineConfig, Plan, Task
-from .supervisor import Supervisor
+from .supervisor import VERIFIED_OUTCOMES, Supervisor
 from .trace import Tracer, new_run_id
 from .worktree import WorktreeInUse, WorktreeManager
 
@@ -119,6 +119,36 @@ class PipelineOrchestrator:
                            "validation run per task and can hide a pre-existing failure "
                            "a reviewer would want to see.")
 
+    # ── base validation ───────────────────────────────────────────────────────
+
+    def _require_base(self) -> None:
+        """Refuse a fork/measure path whose base does not resolve.
+
+        Checked here and not in ``__init__``, because cli.py builds an
+        orchestrator for *every* ``pipeline`` subcommand and most of them never
+        consume the base: ``status`` and ``trace`` only read, ``prune``'s
+        landed proof already fails closed, and ``supervise --recover`` resets a
+        worktree to its OWN ``HEAD`` (supervisor.py) — recovery in particular has
+        to stay reachable exactly when the repo is in the broken state you would
+        reach for it, so a base branch renamed or deleted mid-run must not
+        disable the recovery tool.
+
+        On the paths that FORK from the base or MEASURE against it, an
+        unresolvable base is otherwise silent: ``rev-list --count
+        <base>..<branch>`` exits 128 and :func:`gitutil.commits_ahead` degrades
+        that to ``0`` — "no task is ever green", permanently, from one typo.
+        Raising here costs no worktree and no pool slot.
+
+        Skipped while the repo has no commits: there are no refs to resolve yet,
+        and :meth:`WorktreeManager.ensure` owns that refusal with the message
+        about the missing initial commit.
+        """
+        if not (gitutil.is_repo(self.config.repo)
+                and gitutil.has_commits(self.config.repo)):
+            return
+        gitutil.require_base(self.config.repo, self._wt.base_rev,
+                             name=self.config.base_branch)
+
     # ── plan phase ────────────────────────────────────────────────────────────
 
     def plan(self, *, persist: bool = True) -> Plan:
@@ -126,7 +156,19 @@ class PipelineOrchestrator:
 
         Existing tasks keep their status/branch/PR; new tasks from edited designs
         are appended; the decomposition is otherwise deterministic.
+
+        Gated on the base: ``--base`` reaches the pipeline here first, and the
+        plan this writes is what a run then forks from, so a typo is refused now
+        rather than read as "nothing is ever green" one command later. The
+        read-only paths (:meth:`status`, :meth:`supervise`, :meth:`prune`) reach
+        the same work through the ungated :meth:`_plan` when there is no plan
+        file yet, so none of them is gated by proxy.
         """
+        self._require_base()
+        return self._plan(persist=persist)
+
+    def _plan(self, *, persist: bool = True) -> Plan:
+        """:meth:`plan` without the base gate — see there."""
         fresh = plan_from_designs(
             self.config.repo, self.config.designs_dir,
             default_validation=self.config.default_validation(),
@@ -184,7 +226,9 @@ class PipelineOrchestrator:
         return fresh
 
     def load_or_plan(self) -> Plan:
-        return store.load_plan(self.config) or self.plan()
+        # _plan, not plan: this is the fallback the read-only and recovery
+        # subcommands share, and none of them consults the base.
+        return store.load_plan(self.config) or self._plan()
 
     def status(self) -> Plan:
         return self.load_or_plan()
@@ -325,7 +369,13 @@ class PipelineOrchestrator:
         under this one — the concurrent-save clobber class — so it fails fast
         instead. The flock dies with its holder, so a stale lock file refuses
         nobody; there is deliberately no bypass flag.
+
+        Ahead of all of it: :meth:`_require_base`. A run forks every worktree
+        from the base and measures every task against it, so a base that does
+        not resolve is refused before the lock is taken and before a slot is
+        burned.
         """
+        self._require_base()
         run_lock = store.RunLock(self.config.state_dir)
         if not run_lock.acquire(exclusive=not task_ids):
             detail = (f"another `harness pipeline` run is live on "
@@ -354,13 +404,34 @@ class PipelineOrchestrator:
             # Recover any task whose process crashed/hung in a prior run: clean its
             # worktree and re-arm it for resume, so a killed `pipeline run` doesn't
             # leave a task wedged in `implementing` with a half-written worktree.
-            recovered = Supervisor(self.config, log=self.log).recover(plan, persist=False)
+            sup = Supervisor(self.config, log=self.log)
+            recovered = sup.recover(plan, persist=False)
             if recovered:
+                # Every id here was re-armed, but only some of them had a
+                # worktree anyone could prove clean afterwards (an unreadable
+                # tree is never even reset). Counting the two together is this
+                # line stating the intent as the outcome, so they are counted —
+                # and said — apart.
+                outcomes = sup.recovered_outcomes
+                # Absent means unrecorded, which is not proof of a clean tree.
+                verified = [t for t in recovered
+                            if outcomes.get(t, "") in VERIFIED_OUTCOMES]
+                proved = frozenset(verified)
+                withheld = [t for t in recovered if t not in proved]
                 for tid in recovered:
                     logger.warning("run start: recovered stale task %s — its prior "
-                                   "process crashed or hung mid-flight; worktree "
-                                   "cleaned and task re-armed for resume", tid)
-                self.log(f"♻️  recovered {len(recovered)} crashed task(s): {', '.join(recovered)}")
+                                   "process crashed or hung mid-flight; task re-armed "
+                                   "for resume, worktree outcome: %s", tid,
+                                   outcomes.get(tid, "unknown"))
+                if verified:
+                    self.log(f"♻️  recovered {len(verified)} crashed task(s): "
+                             f"{', '.join(verified)}")
+                if withheld:
+                    detail = ", ".join(f"{t} ({outcomes.get(t, 'unknown')})"
+                                       for t in withheld)
+                    self.log(f"⚠️  {len(withheld)} crashed task(s) re-armed WITHOUT a "
+                             f"verified worktree reset: {detail} — the resumed run "
+                             "may see the crashed iteration's edits")
 
             backend = get_backend(self.config.backend)
             ok, reason = backend.available()
@@ -541,7 +612,13 @@ class PipelineOrchestrator:
         a live process holds is refused outright. Never touches a worktree, a
         branch or a claim — only status/attempts, so the requeued task resumes
         through the ordinary ``pending`` → :meth:`Plan.ready` path.
+
+        Base-gated (:meth:`_require_base`) all the same: a requeue exists to put
+        a task back in front of a run that forks from the base, so requeuing
+        against a base that does not resolve only re-parks the task one run
+        later, with the failure looking like the task's fault.
         """
+        self._require_base()
         out: dict[str, str] = {}
         # Same locked read-modify-write shape plan() uses. NOTE: store.plan_lock
         # and store.save_merged take the SAME lock file, so nesting them would
@@ -670,7 +747,13 @@ class PipelineOrchestrator:
         task's full validation suite while holding a ``TaskClaim`` and beating a
         heartbeat, which is exactly the state a mid-flight host suspend
         corrupts, so it holds the sleep inhibitor too.
+
+        Base-gated (:meth:`_require_base`): the review gate measures the task's
+        work against the base (changed files, diff, commits ahead), so an
+        unresolvable base here produces a verdict on an empty diff rather than
+        an error.
         """
+        self._require_base()
         with shutdown.guard(), nosleep.prevent_sleep(self.config.prevent_sleep):
             return self._complete(task_id, open_pr=open_pr)
 
@@ -710,10 +793,17 @@ class PipelineOrchestrator:
                 self._owned.add(task_id)
             try:
                 result = self._review_and_record(plan, task, ctx, open_pr)
+                # Persist INSIDE the hold. Saving after `claim.release()` left a
+                # window where the task was done in memory, its claim free and
+                # nothing on disk yet — long enough for a concurrent recovery
+                # pass to take the claim, reset the worktree and `save_merged`
+                # the stale `implementing` record back over the finished one.
+                # The claim is what makes check-and-act one instant; the write
+                # it protects has to happen under it.
+                self._save(plan)
             finally:
                 claim.release()
                 GroundingGate.invalidate(task.worktree)
-            self._save(plan)
             return self._task_run(task, result)
 
     # ── per-task pipeline ─────────────────────────────────────────────────────
@@ -862,13 +952,45 @@ class PipelineOrchestrator:
                            "result will not prove any work was done", task.id)
             self.log(f"⚠️  task {task.id} has no validation oracle — a green "
                      "result will not prove any work was done.")
+        if ctx.untrusted_without_operator_oracle:
+            # The union that makes --untrusted a gate needs an operator half to
+            # union INTO. With none configured and none autodetectable, the design
+            # under review chose the whole oracle — allowlisted, which bounds what
+            # may run and not whether it checks anything. Not refused (an
+            # unconfigured oracle is an infrastructure gap, and those fail open
+            # here), but never silent: the review gate also forces this task to
+            # HIGH risk and says so in the PR body.
+            logger.warning("task %s: --untrusted with NO operator oracle — "
+                           "default_validation() is empty, so every validation "
+                           "command comes from the design under review (%s). A green "
+                           "result attests only what that design chose to check; "
+                           "review risk is forced to high. Set --test-cmd/--type-cmd/"
+                           "--lint-cmd (or HARNESS_TEST_CMD) to restore an operator "
+                           "half.",
+                           task.id,
+                           trunc(redact(", ".join(ctx.validation)), 160)
+                           or "and it declares none either")
+            self.log(f"⚠️  task {task.id}: --untrusted with no operator oracle — the "
+                     f"design chooses the whole oracle; risk forced to high. Set "
+                     f"--test-cmd to restore an operator half.")
         if ctx.rejected_validation:
-            logger.warning("task %s: dropped %d unsafe design-provided validation "
-                           "command(s) (untrusted mode): %s",
+            # What lands here is whatever ``task.validation`` carried that the
+            # allowlist refused. Usually that IS a design's own `(validate: …)`,
+            # but it can equally be an operator command seeded into the plan
+            # before `--test-cmd` changed (ingest seeds the oracle of the day;
+            # the next `pipeline plan` refreshes it). Calling every entry
+            # "design-provided" would report the operator's own stale command
+            # back to them as somebody else's attack. Either way the operator's
+            # CURRENT oracle runs, unfiltered — that is the point of the union.
+            logger.warning("task %s: dropped %d validation command(s) the untrusted "
+                           "allowlist refuses — declared by the design, or seeded into "
+                           "the plan from an earlier operator oracle; the operator's "
+                           "current oracle runs either way: %s",
                            task.id, len(ctx.rejected_validation),
                            trunc(redact(", ".join(ctx.rejected_validation)), 160))
-            self.log(f"🔒 task {task.id}: dropped {len(ctx.rejected_validation)} unsafe "
-                     f"design-provided validation command(s) (untrusted mode): "
+            self.log(f"🔒 task {task.id}: dropped {len(ctx.rejected_validation)} "
+                     f"validation command(s) not on the untrusted allowlist (from the "
+                     f"design, or seeded before a --test-cmd change): "
                      f"{', '.join(ctx.rejected_validation)[:160]}")
 
         # 2. Implement (agent-cli loop or ide-handoff packet).
@@ -960,8 +1082,16 @@ class PipelineOrchestrator:
                            "— re-seeding from scratch", task.id, prior, wt.path)
             prior = ""
 
-        wanted: list[tuple[str, str]] = []    # (dep_id, branch) — all completed deps
-        missing: list[tuple[str, str]] = []   # …those not yet ancestors of HEAD
+        # (dep_id, short branch name, fully-qualified ref). Every git *revision*
+        # argument below takes the REF; only messages take the short name. Same
+        # hazard as gitutil.qualify_ref, and here it was load-bearing: git ranks
+        # refs/tags/<n> ABOVE refs/heads/<n> in bare-name disambiguation, so a
+        # tag named like a dep branch answered the ancestry proof below — a tag
+        # sitting at the base reads as "already merged", the dep lands in
+        # `wanted` but not in `missing`, and CASE A returns early. The task then
+        # implements WITHOUT its dependency's code, with no warning and no span.
+        wanted: list[tuple[str, str, str]] = []    # all completed deps
+        missing: list[tuple[str, str, str]] = []   # …those not yet ancestors of HEAD
         for dep_id in task.depends_on:
             dep = plan.get(dep_id)
             if dep is None or dep.status != "done":
@@ -974,7 +1104,13 @@ class PipelineOrchestrator:
             # 'agent/gx-operator-register-open'), and deriving `agent/<task-id>`
             # here skipped that done dep — its work never reached this worktree.
             branch = dep.branch or self._wt.branch_for(dep_id)
-            if not gitutil.git(["rev-parse", "--verify", branch], cwd=repo).ok:
+            ref = self._wt._head_ref(branch)
+            # `show-ref --verify` on the qualified ref, never `rev-parse --verify
+            # <branch>` — the same rule `WorktreeManager._branch_exists` runs on.
+            # rev-parse answers for a same-named TAG just as happily, so a dep
+            # whose branch was pruned looked present and got seeded from the
+            # tag's tree.
+            if not gitutil.exact_ref_exists(repo, ref):
                 # A dep branch that was pruned or rewritten away must not crash
                 # and must not look silently satisfied. Always a WARNING, even on
                 # a first seed: the debug-level skip left no trace and the agent
@@ -983,9 +1119,9 @@ class PipelineOrchestrator:
                     "task %s: dependency %s is done but branch %r does not exist "
                     "— cannot seed it", task.id, dep_id, branch)
                 continue
-            wanted.append((dep_id, branch))
-            if not gitutil.is_ancestor(wt.path, branch, "HEAD"):
-                missing.append((dep_id, branch))
+            wanted.append((dep_id, branch, ref))
+            if not gitutil.is_ancestor(wt.path, ref, "HEAD"):
+                missing.append((dep_id, branch, ref))
 
         # CASE A — nothing new to merge. This is the optimisation the old guard
         # existed for, now keyed on real ancestry: byte-identical to today's
@@ -999,8 +1135,8 @@ class PipelineOrchestrator:
                 # warning would scroll past in the attempt that caused it and the
                 # inflated diff would look unexplained for the rest of the task's
                 # life. Re-state it every time it is true. Log-only.
-                stale = [d for d, b in wanted
-                         if not gitutil.is_ancestor(wt.path, b, prior)]
+                stale = [d for d, _, ref in wanted
+                         if not gitutil.is_ancestor(wt.path, ref, prior)]
                 if stale:
                     logger.warning(
                         "task %s: diff base %s PREDATES dependency branch(es) %s "
@@ -1019,7 +1155,7 @@ class PipelineOrchestrator:
         own = gitutil.commits_ahead(wt.path, prior, "HEAD") if prior else 0
         logger.info("task %s: %d dependency branch(es) not yet in this worktree (%s) "
                     "— re-seeding (prior start_ref %s, %d own commit(s) ahead of it)",
-                    task.id, len(missing), ", ".join(d for d, _ in missing),
+                    task.id, len(missing), ", ".join(d for d, _, _ in missing),
                     prior or "(none)", own)
 
         # CASE B — first seed, or a resume with no work of its own on the branch
@@ -1041,7 +1177,7 @@ class PipelineOrchestrator:
         # attempt's work from it. Build a commit that holds base+deps and none of
         # the task's work, with plumbing that never touches the working tree, then
         # merge that single commit in and measure from it.
-        seed = gitutil.seed_commit(repo, prior, [b for _, b in wanted],
+        seed = gitutil.seed_commit(repo, prior, [r for _, _, r in wanted],
                                    message=f"seed dependencies for {task.id}")
         if seed:
             res = gitutil.merge(wt.path, seed,
@@ -1078,23 +1214,26 @@ class PipelineOrchestrator:
                            "the declared dependency code; resolve the conflict on "
                            "the branch, or requeue the task once the dependencies "
                            "settle", task.id,
-                           ", ".join(d for d, _ in missing), prior)
+                           ", ".join(d for d, _, _ in missing), prior)
             self.log(f"  ⚠️  {task.id}: dependencies could NOT be seeded — this "
                      f"attempt runs without them")
         return prior
 
     def _merge_deps_in_place(self, task: Task, wt,
-                             deps: list[tuple[str, str]]) -> list[str]:
-        """Merge each ``(dep_id, branch)`` into *wt*; return the ids that landed.
+                             deps: list[tuple[str, str, str]]) -> list[str]:
+        """Merge each ``(dep_id, branch, ref)`` into *wt*; return the ids that landed.
 
         Best-effort per dependency, as before: a conflict is aborted and skipped
         with a warning rather than failing the whole task.
         """
         merged: list[str] = []
-        for dep_id, branch in deps:
+        for dep_id, branch, ref in deps:
+            # Merge the fully-qualified REF, report the short branch: a tag named
+            # like the branch outranks it in bare-name resolution, so a bare name
+            # merges the TAG's tree and reports success under the branch's name.
             # Sign-safe merge: without _NO_SIGN a commit.gpgsign=true repo fails to
             # sign the seed merge commit and we'd silently skip dependency seeding.
-            res = gitutil.merge(wt.path, branch, message=f"seed dependency {branch}")
+            res = gitutil.merge(wt.path, ref, message=f"seed dependency {branch}")
             if not res.ok:
                 gitutil.git(["merge", "--abort"], cwd=wt.path)
                 logger.warning("task %s: dependency %r (branch %r) did not merge "
@@ -1179,7 +1318,18 @@ class PipelineOrchestrator:
                 # Loss-free feedback for the editor-driven (ide-handoff) flow: write
                 # the exact findings back into the worktree's TASK.md so the human's
                 # next edit pass has the full, accumulating history to act on.
-                if result.feedback and Path(ctx.worktree).is_dir():
+                if result.protected_path_refusal:
+                    # `_protected_path_fail` promised the operator the tree is
+                    # exactly as the agent left it — index, worktree and all —
+                    # so the file they are about to inspect can be judged
+                    # untouched. Appending a feedback round would falsify that
+                    # promise (TASK.md is tracked, so it also re-dirties the
+                    # tree the refusal declined to stage). The findings still
+                    # reach the run notes above and the CLI.
+                    logger.info("task %s: protected-path refusal — NOT appending a "
+                                "feedback round; the worktree is preserved as "
+                                "promised (findings are in the run notes)", task.id)
+                elif result.feedback and Path(ctx.worktree).is_dir():
                     from .backends.ide_handoff import append_feedback_round
                     rnd = append_feedback_round(
                         ctx.worktree, result.feedback,
@@ -1241,13 +1391,23 @@ class PipelineOrchestrator:
             ctx, prompt, schema=schema)
 
     def _context(self, task: Task) -> ImplementContext:
+        # ``base_branch`` stays the SHORT name because its other consumer is the
+        # PR base (`gh pr create --base`), which takes a branch name, not a ref.
+        # But ``ImplementContext.diff_base`` falls back to it as a git
+        # *revision*, and that revision reaches a LIVE `git reset --hard`
+        # (reset_on_failure) as well as every commits_ahead/diff/grounding
+        # scope — where a bare name lets git's disambiguation pick
+        # refs/tags/<base> over refs/heads/<base> and the reset discards the
+        # agent's work against the wrong tree. So a task with no recorded
+        # start_ref is measured from the QUALIFIED base instead: the same commit
+        # whenever no tag shadows the branch, and the right one when one does.
         return ImplementContext(
             task=task,
             worktree=Path(task.worktree) if task.worktree else self._wt.path_for(task.id),
             base_branch=self.config.base_branch,
             config=self.config,
             design_text=self._design_text(task),
-            start_ref=task.start_ref,
+            start_ref=task.start_ref or self._wt.base_rev,
             log=self.log,
             trace=self._tracer.for_task(task.id),
             # The oracle's baseline probe does `git worktree add/remove` against

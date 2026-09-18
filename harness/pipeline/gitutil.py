@@ -9,7 +9,9 @@ callers decide whether a failure is fatal.
 
 from __future__ import annotations
 
+import fnmatch
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -38,8 +40,31 @@ class GitError(RuntimeError):
     """A git command failed when the caller required success."""
 
 
+class ProtectedPathError(RuntimeError):
+    """A catch-all ``git add -A`` was refused: a dirty path is protected.
+
+    Deliberately NOT a :class:`GitError` — no git command failed, and a caller
+    that swallows git failures to degrade gracefully must not swallow this one:
+    the refusal is the point, and it has to reach the gate that reports it.
+    """
+
+    def __init__(self, message: str, *, path: str = "", rule: str = "") -> None:
+        super().__init__(message)
+        self.path = path       # the dirty path that matched ("" when unproven)
+        self.rule = rule       # the protected_paths pattern it matched
+
+
 @dataclass
 class GitResult:
+    """One git invocation's exit code and captured streams.
+
+    Whitespace contract, because callers depend on it in both directions:
+    ``err`` is ALWAYS stripped, and ``out`` is stripped unless the call passed
+    ``strip=False`` to :func:`git`. Stripping is what lets ``rev-parse`` be read
+    as a bare sha; it is also what would silently rename a file called
+    ``" lead.txt"``, which is why every call that lists PATHS opts out.
+    """
+
     code: int
     out: str
     err: str
@@ -67,6 +92,7 @@ def git(
     cwd: Path | str,
     check: bool = False,
     timeout: int = 120,
+    strip: bool = True,
 ) -> GitResult:
     """Run ``git <args>`` in *cwd* and return a :class:`GitResult`.
 
@@ -74,6 +100,14 @@ def git(
     :class:`GitResult` (codes 124/127) rather than raising — so a slow ``git
     push`` or an absent binary degrades to a clear failure instead of crashing
     the whole run. ``check=True`` still raises :class:`GitError` on any non-ok.
+
+    *strip* (the default, and what every caller but the path listers wants)
+    trims surrounding whitespace off ``out`` — ``err`` is always stripped,
+    whatever this says — so ``rev-parse`` answers a bare sha. A command whose
+    output is a list of PATHS must pass ``strip=False``: a file may legally be
+    named ``" lead.txt"`` or ``"trail2 "`` and git does not quote either shape,
+    so the trim eats a real character off the first and last entry — producing
+    a name that matches nothing when it is handed back as a pathspec.
     """
     # Log lines identify the call by its subcommand (skips ``-c k=v`` hardening
     # flags); the full argv is on the preceding ``$ git …`` line.
@@ -105,7 +139,9 @@ def git(
         logger.warning("failed to launch git (%s: %s) — degrading to rc=127; "
                        "is git on PATH?", type(exc).__name__, exc)
     else:
-        res = GitResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+        res = GitResult(proc.returncode,
+                        proc.stdout.strip() if strip else proc.stdout,
+                        proc.stderr.strip())
     if res.ok:
         logger.debug("git %s → rc=0 in %.2fs (stdout=%d chars)",
                      sub, time.monotonic() - t0, len(res.out))
@@ -209,6 +245,145 @@ def ref_exists(cwd: Path | str, ref: str) -> bool:
     return git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).ok
 
 
+def exact_ref_exists(cwd: Path | str, ref: str) -> bool:
+    """Does *ref* name an existing ref EXACTLY? (*ref* must be fully qualified.)
+
+    ``show-ref --verify`` neither disambiguates a bare name across git's ref
+    search path nor evaluates a revision expression, which is what separates it
+    from :func:`ref_exists`: ``main~3``, ``main@{0}`` and a raw SHA all resolve
+    under ``rev-parse --verify`` and none of them is a ref. A caller asking "is
+    there a BRANCH here" — not "does this resolve to something" — needs this one.
+    """
+    return git(["show-ref", "--verify", "--quiet", ref], cwd=cwd).ok
+
+
+# Names git resolves from ``$GIT_DIR`` instead of the ref store. Each denotes a
+# DIFFERENT commit per worktree (``HEAD``) or per last operation (``FETCH_HEAD``,
+# ``ORIG_HEAD``, ``MERGE_HEAD``, …), so none of them is a base — and none may be
+# QUALIFIED either: ``git clone`` always writes ``refs/remotes/origin/HEAD``, so
+# turning ``HEAD`` into a ref would silently re-point a cloned repo's base at the
+# REMOTE's default branch. Listed rather than matched on shape, because a real
+# branch may legitimately be named in caps.
+_PSEUDO_REFS = frozenset({
+    "HEAD", "@", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+    "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD", "AUTO_MERGE",
+})
+
+
+def qualify_ref(repo: Path | str, name: str) -> str:
+    """``refs/heads/<name>`` (or the remote-tracking ref), else *name* unchanged.
+
+    A bare branch name is not a ref: git's disambiguation ranks
+    ``refs/tags/<name>`` ABOVE ``refs/heads/<name>``, so in a repo carrying both
+    a branch and a tag called ``release`` every plumbing call given ``release``
+    reads the TAG. That is not academic on the base ref — :func:`content_landed`
+    merge-trees the base against an agent branch, and a tag sitting *ahead* of
+    the branch makes unlanded work look landed, which is the proof
+    ``prune_merged`` and ``remove`` consult before ``git branch -D``.
+
+    Preferring the branch is the ONLY precedence this inverts. When there is no
+    local branch but a tag by that name exists, the input is returned unchanged:
+    git already resolves the bare name to ``refs/tags/<name>`` ahead of any
+    remote-tracking ref, so qualifying to ``refs/remotes/origin/<name>`` would
+    harden nothing and instead REINTERPRET a base that used to mean the tag.
+    Unchanged keeps that resolution byte-identical to pre-change behaviour.
+
+    A pseudo-ref (:data:`_PSEUDO_REFS`) is never qualified — see there.
+
+    Unqualifiable input is returned unchanged (degrade-not-crash, like
+    :func:`main_repo_root`): that pass-through is what preserves harness's
+    deliberate pinned-SHA base (:func:`base_ref` on detached HEAD), an
+    already-qualified ref, and a tag the caller named on purpose.
+    """
+    if not name or name.startswith("refs/") or name in _PSEUDO_REFS:
+        return name
+    head = f"refs/heads/{name}"
+    if exact_ref_exists(repo, head):
+        logger.debug("qualify_ref: %r → %s in %s", name, head, repo)
+        return head
+    if exact_ref_exists(repo, f"refs/tags/{name}"):
+        logger.debug("qualify_ref: %r has no local branch but names a tag in %s "
+                     "— passing it through unchanged, so git keeps resolving the "
+                     "tag exactly as it did before", name, repo)
+        return name
+    remote = f"refs/remotes/origin/{name}"
+    if exact_ref_exists(repo, remote):
+        logger.debug("qualify_ref: %r → %s in %s", name, remote, repo)
+        return remote
+    logger.debug("qualify_ref: %r is neither a local branch nor an origin "
+                 "remote-tracking branch in %s — passing it through unchanged "
+                 "(pinned SHA / already-qualified ref / unknown)", name, repo)
+    return name
+
+
+# A raw object name, the one non-ref base harness produces itself: ``base_ref``
+# pins a SHA when HEAD is detached. Matched by SHAPE so that accepting it cannot
+# also let a revision expression in through the same door.
+_OBJECT_NAME = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+
+
+def looks_like_object_name(name: str) -> bool:
+    """Is *name* SHAPED like a raw object name (harness's pinned-SHA base)?
+
+    Shape only — it says nothing about whether such an object exists. Callers
+    use it to skip ref lookups that can never succeed for a pinned SHA.
+    """
+    return bool(_OBJECT_NAME.match(name))
+
+
+def base_resolves(cwd: Path | str, rev: str) -> bool:
+    """Is *rev* usable as a fork/diff base — an existing ref, or a pinned commit?
+
+    The check every fork/measure path runs before anything destructive: an
+    unresolvable base makes ``rev-list --count <base>..<branch>`` exit 128, and
+    :func:`commits_ahead` degrades that to ``0`` — "no green commit" for every
+    task, silently and permanently, from a single typo.
+
+    Deliberately not ``rev-parse --verify`` alone: it also accepts revision
+    expressions (``main~3``, ``main@{0}``), which pin a commit where a ref was
+    required, and the pseudo-refs (``HEAD``, ``FETCH_HEAD``, …), which name a
+    *different* commit per worktree or per last operation — the drift
+    :func:`base_ref` refuses to produce. So a bare name must satisfy both halves
+    (it names a ref, and that ref resolves), and a raw object name is admitted
+    only on its own explicit branch.
+
+    The pseudo-ref rejection is checked FIRST and on the caller's spelling,
+    because ``show-ref --verify HEAD`` succeeds: only refusing the name itself
+    keeps that door shut.
+    """
+    if rev in _PSEUDO_REFS:
+        return False
+    if exact_ref_exists(cwd, rev):
+        return True
+    if _OBJECT_NAME.match(rev) and git(
+            ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=cwd).ok:
+        return True
+    return git(["show-ref", "--quiet", "--", rev], cwd=cwd).ok and ref_exists(cwd, rev)
+
+
+def require_base(cwd: Path | str, rev: str, *, name: str = "") -> None:
+    """Raise :class:`GitError` unless *rev* is usable as a fork/diff base.
+
+    One refusal for both gates that consume a base — the orchestrator's
+    fork/measure entry points and :meth:`WorktreeManager.ensure`'s create path —
+    so the operator reads the same sentence wherever the typo is caught. *name*
+    is the spelling they typed (the short branch name); *rev* is the qualified
+    revision actually probed.
+    """
+    if base_resolves(cwd, rev):
+        return
+    shown = name or rev
+    logger.warning("base ref %r does not resolve in %s (probed as %r) — refusing "
+                   "to start: no worktree is created, no pool slot is burned",
+                   shown, cwd, rev)
+    raise GitError(
+        f"base ref {shown!r} does not resolve in {cwd} — pass an existing "
+        f"branch, tag or commit as --base. A revision expression ('main~3', "
+        f"'main@{{0}}') or a pseudo-ref ('HEAD', '@', 'FETCH_HEAD') is not a "
+        f"base: it pins a commit, or a different one per worktree."
+    )
+
+
 def has_commits(repo: Path | str) -> bool:
     return git(["rev-parse", "--verify", "HEAD"], cwd=repo).ok
 
@@ -236,13 +411,19 @@ def changed_files(
     Returns repo-relative POSIX paths.  When *base* is given, the comparison is
     ``base...HEAD`` plus any uncommitted/untracked changes, so it works mid-loop
     (before the agent has committed) and after.
+
+    Names come back as git has them on disk, not as git PRINTS them: every
+    lister's output is run through :func:`_unquote_path`, because the quoted
+    form (``"caf\\303\\251.txt"``) matches nothing when it is handed straight
+    back as a pathspec — which is what every caller does with this list.
     """
     paths: set[str] = set()
 
     if base:
         if git(["rev-parse", "--verify", base], cwd=cwd).ok:
-            diff = git(["diff", "--name-only", f"{base}...HEAD"], cwd=cwd)
-            paths.update(_lines(diff.out))
+            diff = git(["diff", "--name-only", f"{base}...HEAD"], cwd=cwd,
+                       strip=False)
+            paths.update(_path_lines(diff.out))
         else:
             # A missing base ref silently dropping the committed diff reads
             # downstream as "no changes → grounding skipped → risk low". Keep
@@ -256,9 +437,12 @@ def changed_files(
                   "committed changes are NOT included in this diff", file=sys.stderr)
 
     # Uncommitted (staged + unstaged) changes.
-    paths.update(_lines(git(["diff", "--name-only", "HEAD"], cwd=cwd).out))
+    paths.update(_path_lines(
+        git(["diff", "--name-only", "HEAD"], cwd=cwd, strip=False).out))
     # Untracked, non-ignored files.
-    paths.update(_lines(git(["ls-files", "--others", "--exclude-standard"], cwd=cwd).out))
+    paths.update(_path_lines(
+        git(["ls-files", "--others", "--exclude-standard"], cwd=cwd,
+            strip=False).out))
 
     files = sorted(p for p in paths if p)
     if only_suffix:
@@ -281,6 +465,59 @@ DIFF_TRUNCATED = "\n…(diff truncated)…"
 # this marker and stop claiming completeness when it is present.
 MANIFEST_CLIPPED = "— this file LIST IS INCOMPLETE"
 
+# The marker that stands in for ONE file whose diff could not be rendered as
+# text. Exported for the same reason as the two above, and deliberately emitted
+# together with :data:`DIFF_TRUNCATED`: a consumer that arms its "the evidence
+# is incomplete" rule on the truncation marker must arm it here too. Dropping a
+# file silently is the one outcome that must never happen — an empty diff reads
+# downstream as "nothing to verify" and opens the gate.
+DIFF_UNDECODABLE = "— its diff is NOT shown: the file's bytes are not decodable text"
+
+# ``_diff_body``'s own exit code for "git ran fine, the bytes are not text".
+# Distinct from git's own codes and from the wrapper's 124/127.
+_UNDECODABLE_RC = 125
+
+
+def _undecodable_chunk(rel: str) -> str:
+    """The stand-in emitted in place of one file's unrenderable diff."""
+    return f"[harness] {rel} {DIFF_UNDECODABLE}{DIFF_TRUNCATED}"
+
+
+def _render_diff(spec: Sequence[str], *, cwd: Path | str,
+                 limit: Sequence[str]) -> list[str]:
+    """Diff chunks for ``git <spec> -- <limit>``, per-file on a decode failure.
+
+    One undecodable byte anywhere in a changeset makes the WHOLE combined diff
+    undecodable, and returning nothing for it would hand the verifier an empty
+    diff — which it reads as "nothing to verify" and passes. So the combined
+    render is only the fast path: when it cannot be decoded, each file is
+    rendered on its own, so every file that IS text still reaches the reader,
+    and each one that is not is replaced by :func:`_undecodable_chunk` rather
+    than by silence.
+
+    The per-file file list comes from ``--name-only``, which git C-quotes to
+    pure ASCII and which therefore always decodes.
+    """
+    whole = _diff_body([*spec, "--", *limit], cwd=cwd)
+    if whole.code != _UNDECODABLE_RC:
+        return [whole.out] if whole.out else []
+    files = _path_lines(git([*spec, "--name-only", "--", *limit], cwd=cwd,
+                            strip=False).out)
+    logger.warning("the combined diff for %s in %s is not decodable text — "
+                   "re-rendering its %d file(s) one at a time so the decodable "
+                   "ones still reach the reader", " ".join(spec), cwd, len(files))
+    chunks: list[str] = []
+    for rel in files:
+        one = _diff_body([*spec, "--", rel], cwd=cwd)
+        if one.code == _UNDECODABLE_RC:
+            logger.warning("%s: diff omitted — the file's bytes are not "
+                           "decodable text; emitting an explicit marker so the "
+                           "evidence is never presented as complete", rel)
+            chunks.append(_undecodable_chunk(rel))
+        elif one.out:
+            chunks.append(one.out)
+    return chunks
+
 
 def diff_text(
     cwd: Path | str,
@@ -295,26 +532,34 @@ def diff_text(
     change under review. Combines the committed ``base...HEAD`` diff with any
     uncommitted edits so it works mid-loop and after. Truncated to *max_chars*
     (a verifier judges the shape of a change, not every line of a huge one).
+
+    A file whose bytes are not decodable text never simply disappears: it is
+    replaced by a :data:`DIFF_UNDECODABLE` marker carrying :data:`DIFF_TRUNCATED`,
+    so the reader is told the evidence is incomplete instead of being handed a
+    diff that silently omits a file (or, worse, an empty one — which reads
+    downstream as "no change to verify").
     """
     limit = list(paths) if paths else []
     chunks: list[str] = []
     if base and git(["rev-parse", "--verify", base], cwd=cwd).ok:
-        committed = git(["diff", f"{base}...HEAD", "--", *limit], cwd=cwd)
-        if committed.out:
-            chunks.append(committed.out)
-    uncommitted = git(["diff", "HEAD", "--", *limit], cwd=cwd)
-    if uncommitted.out:
-        chunks.append(uncommitted.out)
+        chunks += _render_diff(["diff", f"{base}...HEAD"], cwd=cwd, limit=limit)
+    chunks += _render_diff(["diff", "HEAD"], cwd=cwd, limit=limit)
     # `git diff` never shows UNTRACKED files — a change made of new files would
     # produce an empty diff here (and a verifier judging it would see nothing).
-    untracked = _lines(git(["ls-files", "--others", "--exclude-standard"], cwd=cwd).out)
+    untracked = _path_lines(
+        git(["ls-files", "--others", "--exclude-standard"], cwd=cwd,
+            strip=False).out)
     if limit:
         untracked = [u for u in untracked if u in set(limit)]
     for rel in untracked:
         # --no-index vs /dev/null renders a plain add-diff; exit 1 is "differs",
         # not an error.
-        add = git(["diff", "--no-index", "--", "/dev/null", rel], cwd=cwd)
-        if add.out:
+        add = _diff_body(["diff", "--no-index", "--", "/dev/null", rel], cwd=cwd)
+        if add.code == _UNDECODABLE_RC:
+            logger.warning("%s: add-diff omitted — the new file's bytes are not "
+                           "decodable text; emitting an explicit marker", rel)
+            chunks.append(_undecodable_chunk(rel))
+        elif add.out:
             chunks.append(add.out)
     text = "\n".join(chunks)
     if len(text) > max_chars:
@@ -349,19 +594,33 @@ def diff_manifest(
             seen.setdefault(rel, status)
 
     def _scan(res: GitResult) -> None:
-        for line in _lines(res.out):
+        # `_raw_lines`, not `_lines`: only the STATUS field may be stripped, and
+        # it is stripped below. A path field trimmed here would rename
+        # ``"trail2 "`` into a file that does not exist.
+        for line in _raw_lines(res.out):
             parts = line.split("\t")
             if len(parts) >= 2:
                 # Rename/copy carry two paths (R100 old new): report the new one.
                 # Only the leading LETTER is kept — `[:2]` rendered a rename as
                 # "R1" and a copy as "C0", which reads like a truncated status in
                 # a listing whose whole job is to be unambiguous.
-                _record(parts[0].strip()[:1] or "M", parts[-1].strip())
+                #
+                # The path is un-quoted (`_unquote_path`) for the same reason
+                # `changed_files` does it: a manifest entry that reads
+                # `M "caf\303\251.txt"` names no file the reader can find, and
+                # it would never match the `limit_paths` membership test below,
+                # so the file would drop out of a listing this module promises
+                # is complete.
+                _record(parts[0].strip()[:1] or "M", _unquote_path(parts[-1]))
 
     if base and git(["rev-parse", "--verify", base], cwd=cwd).ok:
-        _scan(git(["diff", "--name-status", f"{base}...HEAD", "--", *limit_paths], cwd=cwd))
-    _scan(git(["diff", "--name-status", "HEAD", "--", *limit_paths], cwd=cwd))
-    for rel in _lines(git(["ls-files", "--others", "--exclude-standard"], cwd=cwd).out):
+        _scan(git(["diff", "--name-status", f"{base}...HEAD", "--", *limit_paths],
+                  cwd=cwd, strip=False))
+    _scan(git(["diff", "--name-status", "HEAD", "--", *limit_paths], cwd=cwd,
+              strip=False))
+    for rel in _path_lines(
+            git(["ls-files", "--others", "--exclude-standard"], cwd=cwd,
+                strip=False).out):
         _record("A", rel)
 
     out = [f"{seen[rel]} {rel}" for rel in sorted(seen)]
@@ -379,6 +638,375 @@ def diff_manifest(
 
 def add_all(cwd: Path | str) -> GitResult:
     return git(["add", "-A"], cwd=cwd)
+
+
+def status_porcelain_z(cwd: Path | str) -> list[str] | None:
+    """Every dirty or untracked path in *cwd* — or ``None`` when git could not say.
+
+    ``None`` is not "clean": a caller that must PROVE nothing protected is dirty
+    cannot read a failed probe as permission to proceed.
+
+    Each flag is load-bearing:
+
+    * ``--porcelain=v1`` pins the format to the one parsed here (``git status``
+      is documented to be free to change ``v2``/human output);
+    * ``-z`` makes the entries NUL-separated and the paths raw, so a name with a
+      space, a newline or a non-UTF-8 byte survives instead of arriving quoted;
+    * ``--untracked-files=all`` lists files individually instead of collapsing
+      them into their new parent directory — a protected file must not be able
+      to hide behind ``newdir/``;
+    * ``--no-renames`` reports a rename as its delete + its add, so BOTH the
+      source and the destination are checked (a rename INTO a protected path is
+      the interesting direction) — and, incidentally, keeps every entry a
+      SINGLE field, since a rename is the one entry that would carry a second
+      NUL-separated path;
+    * ``--ignore-submodules=none`` keeps a dirty submodule visible.
+
+    ``-z`` is also what makes the decode a real failure mode, and it is handled
+    here rather than in :func:`git`: raw paths mean a file named with non-UTF-8
+    bytes reaches ``subprocess.run(text=True)`` undecodable, and that
+    ``UnicodeDecodeError`` would escape as a crash past every caller — all of
+    which catch :class:`ProtectedPathError` only — instead of the diagnosed
+    refusal. Only calls that ask for RAW paths are exposed: this one and
+    :func:`staged_changes_present`, which pays the same guard. Everywhere else
+    git C-quotes such a name to pure ASCII (:func:`_unquote_path` decodes it
+    back in Python), so no other caller of :func:`git` is exposed and none of
+    them pays for the guard.
+    """
+    try:
+        res = git(["status", "--porcelain=v1", "-z", "--untracked-files=all",
+                   "--no-renames", "--ignore-submodules=none"], cwd=cwd,
+                  strip=False)
+    except UnicodeDecodeError as exc:
+        logger.warning("status_porcelain_z: `git status -z` output in %s is not "
+                       "decodable text (%s at byte %d) — a path here is not "
+                       "UTF-8; reporting 'cannot tell', which callers must treat "
+                       "as unproven rather than clean", cwd, exc.reason, exc.start)
+        return None
+    if not res.ok:
+        logger.warning("status_porcelain_z: git status failed in %s (rc=%s): %s "
+                       "— reporting 'cannot tell', which callers must treat as "
+                       "unproven rather than clean",
+                       cwd, res.code, trunc(redact(res.err or res.out), 200))
+        return None
+    out: list[str] = []
+    for entry in res.out.split("\0"):
+        if not entry:
+            continue
+        # Every entry is ``XY<space><path>`` — a FIXED three-byte prefix, so the
+        # path is sliced positionally. Locating the first space instead cuts
+        # inside the status code the moment X is blank (" M svc/.env" would
+        # yield "M svc/.env"), and a status letter glued to the path silently
+        # defeats every rule naming a directory — i.e. the guard reports clean
+        # and the protected file is staged, committed and pushed.
+        #
+        # ``strip=False`` above is what makes that slice unconditional. It used
+        # to need a heuristic for the FIRST entry alone, because :func:`git`
+        # stripped the output and took the leading blank status byte with it —
+        # and that heuristic could not tell " M a.py" (unstaged) from "M  a.py"
+        # (staged, Y blank), so it resolved the tie one way and lost a leading
+        # space off a file literally named " lead.txt". Asking git not to strip
+        # removes the ambiguity rather than picking a side of it.
+        #
+        # A prefix that is not the documented shape keeps the entry WHOLE rather
+        # than guessing: over-reporting a path costs a false refusal, dropping
+        # one costs the leak this function exists to prevent.
+        out.append(entry[3:] if len(entry) > 3 and entry[2] == " " else entry)
+    return out
+
+
+def _repo_relative(text: str) -> str:
+    """A path or rule in the repo-relative dialect ``git status`` reports in.
+
+    Separators normalised, and every leading ``./`` or ``/`` stripped. The
+    leading slash is the load-bearing half: ``git status`` paths are always
+    repo-relative, so an absolute-LOOKING rule (``/.env``, meaning "at the repo
+    root") would otherwise match no path at all — a configured protection that
+    silently protects nothing, which is the one outcome this guard must not
+    have. Anchoring it to the repo root instead can only widen what it covers,
+    and over-refusing costs a false refusal where under-matching costs the leak.
+    """
+    out = text.strip().replace("\\", "/")
+    while out.startswith(("./", "/")):
+        out = out[2:] if out.startswith("./") else out[1:]
+    return out
+
+
+def _matches_protected(path: str, pattern: str) -> bool:
+    """Does *path* fall under one ``protected_paths`` rule?
+
+    Four accepted forms, mirroring ``review._declared`` so operators only learn
+    one path-matching dialect: an exact repo-relative path, an ``fnmatch`` glob
+    over the whole path, a directory prefix (everything under it), and — for a
+    rule naming no directory at all — the same match against the BASENAME, so
+    ``.env`` protects ``services/api/.env`` and ``*.pem`` protects a key
+    wherever an agent drops it. Case-sensitive (``fnmatchcase``): the rule must
+    mean the same thing on macOS as it does in CI.
+
+    Both sides are put in the repo-relative dialect first (:func:`_repo_relative`).
+    """
+    p = _repo_relative(path)
+    rule = _repo_relative(pattern)
+    if not p or not rule:
+        return False
+    if p == rule or fnmatch.fnmatchcase(p, rule):
+        return True
+    if p.startswith(rule.rstrip("/") + "/"):
+        return True
+    if "/" not in rule:
+        base = p.rsplit("/", 1)[-1]
+        return base == rule or fnmatch.fnmatchcase(base, rule)
+    return False
+
+
+def add_all_guarded(cwd: Path | str,
+                    patterns: Sequence[str] = ()) -> GitResult:
+    """``git add -A``, refused when a dirty path matches a protected rule.
+
+    The pipeline's catch-all stage is what turns "the agent dropped a file in
+    the worktree" into "the file is in a commit, and then on a remote". This is
+    the opt-in veto: with no *patterns* it is :func:`add_all` exactly, cost and
+    behaviour identical.
+
+    On refusal NOTHING is written — no ``git add``, no commit, and deliberately
+    no reset either: the operator's index and worktree survive exactly as the
+    agent left them, so the offending file can be inspected before anyone
+    decides what to do with it. Raises :class:`ProtectedPathError`.
+    """
+    # A bare string is one rule, not a sequence of single-character rules — the
+    # same footgun ``spec._as_patterns`` closes at the config boundary, closed
+    # again here because this is the function a caller reaches for directly.
+    if isinstance(patterns, str):
+        patterns = (patterns,)
+    rules = [r for r in (p.strip() for p in patterns) if r]
+    # A rule that is nothing but separators names no path and can never match.
+    # It is dropped LOUDLY rather than silently: an operator who configured a
+    # protection and got none must be told, and a dropped rule must not inflate
+    # the "N rule(s) cleared" count the refusal messages quote.
+    hollow = [r for r in rules if not _repo_relative(r)]
+    if hollow:
+        logger.error("protected_paths: rule(s) %s name no path at all (only "
+                     "separators) and can never match — they protect NOTHING; "
+                     "fix or remove them", hollow)
+        rules = [r for r in rules if _repo_relative(r)]
+    if not rules:
+        return add_all(cwd)
+    dirty = status_porcelain_z(cwd)
+    if dirty is None:
+        # Unknown is never a proof: with rules configured, an unreadable status
+        # means the guard cannot clear the tree, so the stage does not happen.
+        raise ProtectedPathError(
+            f"cannot read `git status` in {cwd} to check the {len(rules)} "
+            "protected path rule(s) — refusing the automatic `git add -A` "
+            "rather than staging paths that were never checked")
+    for path in dirty:
+        for rule in rules:
+            if _matches_protected(path, rule):
+                logger.error("REFUSING `git add -A` in %s: dirty path %r matches "
+                             "protected rule %r — index and worktree left "
+                             "untouched; remove the file, .gitignore it, or drop "
+                             "the rule", cwd, path, rule)
+                raise ProtectedPathError(
+                    f"protected path refusal: {path!r} matches protected_paths "
+                    f"rule {rule!r} — the automatic commit was refused and the "
+                    "worktree was left untouched",
+                    path=path, rule=rule)
+    logger.debug("protected-path guard: %d dirty path(s) cleared against %d "
+                 "rule(s) in %s", len(dirty), len(rules), cwd)
+    return add_all(cwd)
+
+
+def staged_changes_present(cwd: Path | str) -> bool | None:
+    """Does the INDEX hold anything to commit — ``None`` when git could not say.
+
+    The commit half of the pipeline's catch-all stage is decided here rather
+    than from :func:`working_tree_dirty`, because ``git status`` and ``git add
+    -A`` do not answer the same question. Status reports dirt that ``git add
+    -A`` cannot put in the SUPERPROJECT's index — most reproducibly an
+    initialised submodule with untracked build output, which shows as ``" M
+    sub"`` forever while the index stays empty. Staging then succeeds, ``git
+    commit`` exits 1 with "no changes added to commit", HEAD does not move, and
+    a caller reading that rc as a commit FAILURE burns fresh agent invocations
+    repairing a commit that was never possible — on a task the oracle called
+    green.
+
+    An empty index is therefore a successful no-op, not a commit and not a
+    failure. ``None`` is neither: unknown is not proof (the same doctrine as
+    :func:`status_porcelain_z`), and a caller that cannot read the index must
+    fall back to attempting the commit, not to assuming there is nothing there.
+
+    ``-z`` keeps the path list raw, which is also why the decode failure is
+    caught: a filename that is not UTF-8 is undecodable under
+    ``subprocess.run(text=True)``, and that must read as "cannot tell" — such a
+    name is itself evidence that something IS staged.
+
+    ``strip=False`` for the same reason every other raw-path caller sets it, and
+    here it decides a COMMIT. A file named ``" "`` (one space) is a legal staged
+    path and the whole of this output; stripping leaves nothing but the NUL
+    separator, so the index reads EMPTY, ``nothing_to_commit`` says yes, and the
+    agent's staged work is silently never committed — under a warning blaming a
+    submodule that does not exist. Emptiness is therefore tested by removing the
+    separators only, never by stripping whitespace that is part of a name.
+    """
+    try:
+        res = git(["diff", "--cached", "--name-only", "-z"], cwd=cwd,
+                  strip=False)
+    except UnicodeDecodeError as exc:
+        logger.warning("staged_changes_present: the staged path list in %s is "
+                       "not decodable text (%s at byte %d) — reporting 'cannot "
+                       "tell', which callers must treat as unproven rather than "
+                       "as an empty index", cwd, exc.reason, exc.start)
+        return None
+    if not res.ok:
+        logger.warning("staged_changes_present: `git diff --cached` failed in %s "
+                       "(rc=%s): %s — reporting 'cannot tell', which callers "
+                       "must treat as unproven rather than as an empty index",
+                       cwd, res.code, trunc(redact(res.err or res.out), 200))
+        return None
+    # An unborn HEAD answers here too (rc=0, empty output when nothing is
+    # staged), so this needs no `rev-parse HEAD` pre-check.
+    return res.out.replace("\0", "") != ""
+
+
+NOTHING_STAGED_REASON = (
+    "`git add -A` staged nothing: `git status` reports dirt this repo cannot "
+    "put in the index (a dirty submodule, most likely), so there was nothing "
+    "to commit")
+
+
+def unstageable_dirt_reason(cwd: Path | str, *, limit: int = 5) -> str:
+    """Why *cwd* looks dirty and yet has nothing to commit — ``""`` if it doesn't.
+
+    The morning-after diagnostic. When an agent's only remaining "work" is dirt
+    ``git add -A`` cannot stage, the loop reaches its "oracle green but no
+    commit ahead of base" exit and reports the generic cause — "the task may
+    require no change, or its validation is too weak; strengthen the oracle" —
+    which sends the operator to rewrite a perfectly good oracle. Naming the
+    actual paths turns that into a five-second diagnosis.
+
+    Derived from the worktree rather than carried in backend state on purpose:
+    one backend instance serves every worker thread, and a mutable slot there
+    would be clobbered across concurrent tasks. It only runs on a path that is
+    already ending the task, so the two extra git calls cost nothing that matters.
+
+    Unstageability is PROVEN, not inferred, and it takes both halves:
+
+    * ``git add -A --dry-run`` reports what a real stage WOULD pick up and
+      writes nothing at all — empty means nothing is left to stage;
+    * :func:`staged_changes_present` must also be ``False``, because "nothing
+      left to stage" is equally true of work that is already staged and simply
+      has not been committed yet.
+
+    Either half alone mislabels ordinary work as unstageable. Anything unproven
+    — a probe git could not answer — returns ``""``: this is a diagnostic, and
+    one that guesses is worse than silence.
+    """
+    dirty = status_porcelain_z(cwd)
+    if not dirty:
+        return ""
+    probe = git(["add", "-A", "--dry-run"], cwd=cwd)
+    if not probe.ok or probe.out.strip():
+        return ""                      # cannot tell, or the dirt IS stageable
+    if staged_changes_present(cwd) is not False:
+        return ""                      # cannot tell, or it is staged already
+    more = f" (+{len(dirty) - limit} more)" if len(dirty) > limit else ""
+    return f"{NOTHING_STAGED_REASON}: {', '.join(dirty[:limit])}{more}"
+
+
+# The sequencer markers whose presence means a commit is FINISHING an operation
+# rather than recording a change. Each is per-worktree, hence ``--git-path``.
+# The last three are the rebase/``am`` states: ``REBASE_HEAD`` is the commit
+# being replayed, and ``rebase-merge`` / ``rebase-apply`` are DIRECTORIES (the
+# sequencer's todo state), which is why the probe tests existence rather than
+# reading a file. They are listed for the conservative direction: mid-rebase,
+# an empty index falls through to the commit attempt, i.e. exactly what harness
+# did before any of this.
+_IN_PROGRESS_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                        "REBASE_HEAD", "rebase-merge", "rebase-apply")
+
+
+def in_progress_operation(cwd: Path | str) -> str | None:
+    """Name the merge/cherry-pick/revert/rebase under way in *cwd*, else ``None``.
+
+    The one case where an EMPTY index still makes a legitimate commit: a merge
+    whose resolved tree already equals HEAD (``git merge -s ours``, or a
+    conflict resolved back to the original) still has to record its merge
+    commit, and ``git commit`` does exactly that, rc=0. So
+    :func:`staged_changes_present` returning ``False`` is only a no-op when no
+    operation is in progress.
+
+    ``git rev-parse --git-path`` is what makes this correct inside a linked
+    worktree: these markers live in ``.git/worktrees/<name>/``, never in the
+    shared common dir, so probing ``<cwd>/.git/MERGE_HEAD`` would miss every
+    worktree the pipeline actually runs in. The answer can be relative
+    (``.git/MERGE_HEAD`` in a plain clone) or absolute, which ``Path.__truediv__``
+    resolves either way.
+
+    A probe that cannot be answered reports ``"unknown"`` rather than ``None``:
+    callers only test truthiness, and an unreadable marker must read as "an
+    operation may be in progress" — the conservative direction, whose whole cost
+    is one ordinary commit attempt.
+    """
+    for marker in _IN_PROGRESS_MARKERS:
+        res = git(["rev-parse", "--git-path", marker], cwd=cwd)
+        if not res.ok or not res.out.strip():
+            logger.warning("in_progress_operation: cannot locate %s in %s "
+                           "(rc=%s) — reporting 'unknown', which callers must "
+                           "treat as an operation possibly in progress",
+                           marker, cwd, res.code)
+            return "unknown"
+        try:
+            if (Path(cwd) / res.out.strip()).exists():
+                logger.debug("in_progress_operation: %s present in %s", marker, cwd)
+                return marker
+        except OSError as exc:                    # pragma: no cover - defensive
+            logger.warning("in_progress_operation: cannot stat %s in %s (%s) — "
+                           "reporting 'unknown'", marker, cwd, exc)
+            return "unknown"
+    return None
+
+
+def nothing_to_commit(cwd: Path | str) -> bool:
+    """Would :func:`commit` fail here for no reason worth reporting?
+
+    Call it AFTER a successful ``git add -A`` and BEFORE :func:`commit`. It is
+    the whole "decide the commit from the INDEX, not from ``git status``" rule
+    in one place, because five call sites now need it and they must not drift:
+    both agent loops' ``_ensure_committed``,
+    :meth:`~harness.pipeline.review.ReviewGate._freeze_reviewed_commit` and
+    both :mod:`~harness.pipeline.pr` creators.
+
+    ``git status`` reports dirt that ``git add -A`` cannot put in this repo's
+    index — most reproducibly an initialised submodule holding untracked build
+    output, which shows as ``" M sub"`` forever. ``git commit`` then exits 1
+    with "no changes added to commit" and HEAD does not move. A caller reading
+    that rc as a commit FAILURE re-prompts an agent to fix a commit that was
+    never possible, or reports a push that had nothing to push.
+
+    ``True`` only when the index is provably empty AND no merge/cherry-pick/
+    revert/rebase is waiting to be recorded. Anything unproven returns ``False``
+    — the caller attempts the commit exactly as it always did.
+
+    One narrow, deliberate consequence of skipping: ``git commit`` never runs,
+    so a pre-commit hook that would have ADDED content to the index (a formatter
+    staging its own fixes) does not fire. Git refuses an empty index before
+    hooks run, so nothing git would have kept is lost — but the hook does not
+    get its chance.
+    """
+    if staged_changes_present(cwd) is not False:
+        return False                   # staged content, or cannot tell
+    in_progress = in_progress_operation(cwd)
+    if in_progress is not None:
+        logger.debug("index is empty in %s but %s is in progress — committing "
+                     "anyway, since that commit records the operation rather "
+                     "than a change", cwd, in_progress)
+        return False
+    logger.warning("nothing staged after `git add -A` in %s — the dirt `git "
+                   "status` reports is not stageable in this repo (a dirty "
+                   "submodule, most likely); treating as already committed "
+                   "instead of as a commit failure. No `git commit` is run, so "
+                   "no pre-commit hook fires for it", cwd)
+    return True
 
 
 def commit(cwd: Path | str, message: str) -> GitResult:
@@ -401,8 +1029,45 @@ def merge(cwd: Path | str, branch: str, *, message: str, no_ff: bool = True) -> 
     return git(args, cwd=cwd)
 
 
+def status_porcelain(cwd: Path | str) -> GitResult:
+    """``git status --porcelain`` with the config-independence flags pinned.
+
+    The single place those flags live. Every reader that asks "is this tree
+    dirty?" — :func:`working_tree_dirty` here, ``supervisor._status_dirty``
+    there — must ask it the same way, or one of them clears a tree the other
+    still considers dirty. Returns the raw :class:`GitResult` so a caller that
+    needs to tell "clean" from "could not read" (rc≠0) still can.
+
+    See :func:`working_tree_dirty` for what each flag is overriding and why.
+    """
+    return git(["status", "--porcelain", "--untracked-files=normal",
+                "--ignore-submodules=none"], cwd=cwd)
+
+
 def working_tree_dirty(cwd: Path | str) -> bool:
-    return bool(git(["status", "--porcelain"], cwd=cwd).out)
+    """Is there anything in *cwd* the pipeline's catch-all commit should stage?
+
+    The two flags are pinned for the same reason :func:`status_porcelain_z`
+    pins them: a bare ``git status --porcelain`` honours whatever the operator's
+    global or repo config says, and this function is the gate in front of the
+    whole commit path — ``_ensure_committed`` returns before ``add_all_guarded``
+    ever runs, so a tree that reads clean is never staged, never committed, and
+    never inspected by the ``protected_paths`` guard.
+
+    * ``status.showUntrackedFiles=no`` (a common setting on a big checkout, and
+      one an agent can write itself) makes an agent that created ONLY new files
+      read as CLEAN. ``--untracked-files`` overrides it.
+    * submodule dirt is hidden by ``submodule.<name>.ignore`` AND by
+      ``diff.ignoreSubmodules`` — ``git status`` honours both, verified on git
+      2.55 — and ``--ignore-submodules=none`` overrides both.
+
+    ``normal``, not ``all``: this answers a BOOL, so enumerating every file
+    under a new directory buys nothing and costs a full walk on every
+    iteration. ``all`` is still right for :func:`status_porcelain_z`, which has
+    to see each path individually so a protected file cannot hide behind
+    ``newdir/``.
+    """
+    return bool(status_porcelain(cwd).out)
 
 
 # ── rollback / clean (hard reset + clean, cache-preserving for warm reuse) ────────
@@ -622,3 +1287,152 @@ def has_remote(repo: Path | str, name: str = "origin") -> bool:
 
 def _lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+# The C-style escapes ``git`` emits inside a quoted path (see ``quote_c_style``
+# in quote.c). Everything else non-printable arrives as a three-digit octal
+# ``\nnn`` byte.
+_C_UNESCAPES = {
+    "a": 0x07, "b": 0x08, "f": 0x0C, "n": 0x0A,
+    "r": 0x0D, "t": 0x09, "v": 0x0B, '"': 0x22, "\\": 0x5C,
+}
+
+
+def _unquote_path(raw: str) -> str:
+    """Decode one path as ``git`` prints it under ``core.quotePath`` (the default).
+
+    A path with any byte outside printable ASCII is emitted wrapped in double
+    quotes with its non-ASCII bytes C-escaped — ``café.txt`` arrives as the
+    literal 12-character string ``"caf\\303\\251.txt"``. That string is not the
+    file's name, and it is not a pathspec that matches it either: feeding it
+    back to ``git diff -- <path>`` matches NOTHING, silently and with rc=0. So
+    an un-decoded name does not merely *look* wrong in a listing — it drops the
+    file out of :func:`diff_text` and out of the :func:`diff_manifest` that the
+    verifier prompt presents as "COMPLETE and AUTHORITATIVE", which is exactly
+    the "unshown vs absent" confusion the manifest exists to remove.
+
+    Decoding here rather than passing ``-c core.quotePath=false`` to each lister
+    is deliberate: the raw form would put un-decodable bytes into
+    ``subprocess.run(text=True)``, and the resulting ``UnicodeDecodeError``
+    would escape :func:`changed_files` as a crash. Keeping git's ASCII-safe
+    output and decoding it in Python cannot fail that way — see
+    :func:`status_porcelain_z`, which pays that guard precisely because it is
+    the one caller that does ask for raw bytes.
+
+    Anything that is not a well-formed quoted path (including a name whose
+    bytes are not UTF-8) is returned UNCHANGED: today's behaviour, loudly
+    logged, rather than a guess about what the operator's filesystem meant.
+    """
+    if len(raw) < 2 or not raw.startswith('"') or not raw.endswith('"'):
+        return raw                     # git only quotes when it has to
+    body = raw[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        i += 1
+        esc = body[i] if i < len(body) else ""
+        if esc in _C_UNESCAPES:
+            out.append(_C_UNESCAPES[esc])
+            i += 1
+        elif esc and esc in "01234567":
+            digits = body[i:i + 3]
+            if len(digits) < 3 or any(d not in "01234567" for d in digits) \
+                    or int(digits, 8) > 0xFF:
+                logger.warning("_unquote_path: %r carries a malformed octal "
+                               "escape — leaving the name as git printed it",
+                               trunc(raw, 120))
+                return raw
+            out.append(int(digits, 8))
+            i += 3
+        else:
+            logger.warning("_unquote_path: %r carries an unknown escape %r — "
+                           "leaving the name as git printed it",
+                           trunc(raw, 120), esc)
+            return raw
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        logger.warning("_unquote_path: %r does not decode as UTF-8 (%s at byte "
+                       "%d) — a filename here is not UTF-8; leaving the name as "
+                       "git printed it, which will not match as a pathspec",
+                       trunc(raw, 120), exc.reason, exc.start)
+        return raw
+
+
+def _raw_lines(text: str) -> list[str]:
+    """Split git output into lines WITHOUT touching what is inside them.
+
+    :func:`_lines` strips each line, which is right for shas and status codes
+    and wrong for paths: ``" lead.txt"`` and ``"trail2 "`` are legal filenames
+    that git does NOT quote, so stripping silently renames them into paths that
+    match nothing. Only the line separator is removed here — including the
+    trailing one, which is why the empty final element is dropped.
+    """
+    return [ln for ln in text.split("\n") if ln]
+
+
+def _path_lines(text: str) -> list[str]:
+    """One real path per line: separators removed, git's quoting decoded.
+
+    Pair with ``git(..., strip=False)``. With the default ``strip=True`` the
+    first and last entries have already lost any leading/trailing space before
+    this sees them, and nothing here can put it back.
+    """
+    return [_unquote_path(ln) for ln in _raw_lines(text)]
+
+
+def _diff_body(args: Sequence[str], *, cwd: Path | str) -> GitResult:
+    """Run a ``git diff`` that RENDERS a patch, with NON-ASCII paths unquoted.
+
+    The file listers decode git's quoting in Python (:func:`_unquote_path`), but
+    a diff BODY is one opaque blob — there is no path field to decode. Without
+    ``core.quotePath=false`` the body would name ``café.txt`` as
+    ``"caf\\303\\251.txt"`` while :func:`diff_manifest` names it properly.
+
+    The flag governs the NON-ASCII case only, which is the one the listers also
+    handle: a path containing ``"``, ``\\`` or a control byte is still quoted
+    and escaped in the body no matter what this asks for, so body and manifest
+    can still spell such a name differently. It closes the common disagreement,
+    not every possible one.
+
+    Two failure modes, both degrading rather than raising, because the callers
+    (the verifier gate, ``harness verify``) are rendering a diff for a reader —
+    and a gate that CRASHES is strictly worse than one shown an uglier diff:
+
+    * a path that is not UTF-8 makes the raw form un-decodable under
+      ``subprocess.run(text=True)`` → retry with git's C-quoted default, which
+      is pure ASCII and always decodes;
+    * file CONTENT that is not UTF-8 (a tracked latin-1 file) makes BOTH forms
+      un-decodable, since the bytes are in the hunk either way → rc
+      ``_UNDECODABLE_RC`` with no output.
+
+    That second answer is a REPORT, not a result: it is the caller's job to act
+    on it, and :func:`_render_diff` does — by re-rendering file by file so the
+    decodable files survive, and by substituting an explicit marker for the one
+    that does not. Swallowing it here (returning an empty diff for the whole
+    changeset) would be a silent review bypass: an empty diff reads downstream
+    as "nothing to verify".
+    """
+    try:
+        return git(["-c", "core.quotePath=false", *args], cwd=cwd)
+    except UnicodeDecodeError as exc:
+        logger.warning("diff output in %s is not decodable as text with raw "
+                       "paths (%s at byte %d) — retrying with git's C-quoted "
+                       "default, so the body may name a file differently from "
+                       "the manifest", cwd, exc.reason, exc.start)
+    try:
+        return git(args, cwd=cwd)
+    except UnicodeDecodeError as exc:
+        logger.warning("diff output in %s is not decodable as text even with "
+                       "git's C-quoted paths (%s at byte %d) — the CONTENT of a "
+                       "file in this diff is not UTF-8; reporting rc=%d so the "
+                       "caller can re-render per file rather than crashing the "
+                       "gate that asked for it",
+                       cwd, exc.reason, exc.start, _UNDECODABLE_RC)
+        return GitResult(_UNDECODABLE_RC, "",
+                         f"diff output is not decodable text: {exc}")

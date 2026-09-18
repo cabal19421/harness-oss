@@ -23,7 +23,7 @@ from pathlib import Path
 from harness.log import get_logger, trunc
 
 from .. import gitutil
-from ..sanitize import sanitize_design
+from ..sanitize import neutralize_markers, sanitize_design, sanitize_publication
 from .base import CodingBackend, ImplementContext, ImplementOutcome
 
 logger = get_logger(__name__)
@@ -68,15 +68,26 @@ class IdeHandoffBackend(CodingBackend):
 
         # Commit the packet so the worktree has a clean starting point and the
         # branch exists for the eventual PR.
-        gitutil.add_all(ctx.worktree)
-        commit = gitutil.commit(ctx.worktree, f"chore: task packet for {task.id}")
-        if not commit.ok:
-            # Fail-open: the packet is still on disk and usable, but the branch
-            # may lack the clean start point `pipeline complete` expects.
-            logger.warning("packet commit failed for %s (rc=%d) — continuing "
-                           "with an uncommitted packet: %s",
-                           task.id, commit.code,
-                           trunc((commit.err or commit.out or "").strip(), 300))
+        refusal = ""
+        try:
+            gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
+        except gitutil.ProtectedPathError as exc:
+            # Degrade the way a failed commit degrades below — the packet is on
+            # disk and the human is the next gate anyway — but say so loudly and
+            # in the outcome, since the reason they will hit later (`pipeline
+            # complete` refusing the same path) starts here.
+            refusal = str(exc)
+            logger.error("packet NOT committed for %s: %s", task.id, refusal)
+            ctx.log(f"  ⚠ packet left uncommitted: {refusal}")
+        else:
+            commit = gitutil.commit(ctx.worktree, f"chore: task packet for {task.id}")
+            if not commit.ok:
+                # Fail-open: the packet is still on disk and usable, but the branch
+                # may lack the clean start point `pipeline complete` expects.
+                logger.warning("packet commit failed for %s (rc=%d) — continuing "
+                               "with an uncommitted packet: %s",
+                               task.id, commit.code,
+                               trunc((commit.err or commit.out or "").strip(), 300))
 
         ctx.log(f"  ✎ wrote {PACKET_NAME} → {packet_path}")
         ctx.log(f"    open this worktree in your agentic IDE (e.g. Google "
@@ -88,7 +99,8 @@ class IdeHandoffBackend(CodingBackend):
             status="awaiting-human",
             oracle_passed=False,
             grounding_ok=preflight.ok,
-            detail=f"task packet ready for IDE implementation ({preflight.summary})",
+            detail=(f"task packet ready for IDE implementation ({preflight.summary})"
+                    + (f" — packet left UNCOMMITTED: {refusal}" if refusal else "")),
             packet_path=str(packet_path),
             grounding_summary=preflight.summary,
         )
@@ -98,12 +110,49 @@ class IdeHandoffBackend(CodingBackend):
     def _render_packet(self, ctx: ImplementContext, *, preflight_summary: str,
                         preflight_findings: str) -> str:
         task = ctx.task
-        validation = "\n".join(f"- [ ] `{c}` exits 0" for c in ctx.validation) \
-            or "- [ ] (no validation commands configured — add some!)"
         # Both arms of the old conditional carried this same literal, so the
         # hint never actually depended on ctx.validation.
         verify_hint = "harness verify <file>.py --project ."
-        return f"""# Task packet — {task.title}
+        # `implement` COMMITS this packet to the task branch and `pipeline
+        # complete` pushes that branch, so every design-derived fragment in it
+        # crosses the same publication boundary as the PR body. The scrub is
+        # therefore the SAME one (:func:`sanitize_publication`) and it is
+        # applied UNIFORMLY: a fragment-by-fragment choice of which passes to
+        # run is how the packet ended up publishing a pasted key that the PR
+        # body next to it redacted. What differs from the PR body is only WHERE
+        # the scrub runs — per fragment, never over the assembled packet,
+        # because harness's own interpolations (the worktree path, the `--repo`
+        # line) must survive verbatim; see the note at the end of this method.
+        #
+        # So: every fragment below is somebody else's bytes.
+        #   * ``title`` / ``description`` — the design doc's own words.
+        #   * ``preflight_findings`` / ``preflight_summary`` — the grounding
+        #     gate's render of the design's code blocks and the paths it
+        #     resolved them against.
+        #   * ``ctx.validation`` — the oracle this task is judged by. A design
+        #     names its own via `(validate: …)` (ingest.py), so the command line
+        #     can be that author's — and under ``--untrusted`` the list ALSO
+        #     carries the operator's own `--test-cmd`/autodetected commands,
+        #     since there a design's commands are ADDED to the operator's oracle
+        #     rather than replacing it. Both origins are committed and pushed
+        #     with the packet, so both take the scrub: somebody else's pasted
+        #     credential and the operator's own `/home/<user>/…` interpreter path
+        #     are the same leak at this boundary.
+        title = sanitize_publication(task.title)
+        # The description is the one fragment that ALSO crosses the *prompt*
+        # boundary — an editor agent reads this packet — so it keeps
+        # :func:`sanitize_design`'s control-token defang on top of the
+        # publication scrub. The two share ``redact_secrets``; running it twice
+        # is a no-op, and the composition says which boundary each pass is for.
+        description = sanitize_publication(sanitize_design(task.description))
+        findings = sanitize_publication(preflight_findings)
+        summary = sanitize_publication(preflight_summary)
+        # Scrubbed inside the join, per command: the checklist around them is
+        # harness's own text and must not be rewritten.
+        validation = "\n".join(f"- [ ] `{sanitize_publication(c)}` exits 0"
+                               for c in ctx.validation) \
+            or "- [ ] (no validation commands configured — add some!)"
+        body = f"""# Task packet — {title}
 
 > Generated by the harness design-docs → PRs pipeline. Implement this task in
 > **this worktree** using your agentic IDE (Google Antigravity, or VSCodium +
@@ -120,7 +169,7 @@ class IdeHandoffBackend(CodingBackend):
 
 ## What to build
 
-{sanitize_design(task.description)}
+{description}
 
 ## Definition of done (the oracle)
 
@@ -134,8 +183,8 @@ Your change is complete only when every box is checked:
 The pipeline grounded the code already present in the design against this repo +
 the installed environment:
 
-> {preflight_summary}
-{preflight_findings}
+> {summary}
+{findings}
 As you write, ground individual files yourself:
 
 ```bash
@@ -157,8 +206,18 @@ your changes, runs the validation oracle, assigns a risk level, and opens the
 PR (`--pr local` branch or `--pr github`).
 
 ---
-<!-- harness:task={task.id} -->
 """
+        # Same boundary rule as the PR body: scrub, then sign. At THIS level
+        # only the marker pass may run — a blanket scrub over the assembled
+        # packet would rewrite the worktree and `--repo "…"` lines this packet
+        # exists to hand the operator, and mask them as credentials besides.
+        # That is why the full scrub runs per fragment above and this pass does
+        # not repeat it; the fragments are already defanged, so this is the
+        # marker guard for harness's own assembled text. Not optional either
+        # way: `append_feedback_round` really does parse a
+        # `<!-- harness:review-round N -->` marker back out of this file.
+        return (f"{neutralize_markers(body)}"
+                f"<!-- harness:task={task.id} -->\n")
 
 
 def append_feedback_round(worktree: Path | str, feedback: str, *,
@@ -187,8 +246,22 @@ def append_feedback_round(worktree: Path | str, feedback: str, *,
     round_no = len(re.findall(r"<!-- harness:review-round \d+ -->", existing)) + 1
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     head = f"\n\n## Review round {round_no} — still failing ({ts})\n<!-- harness:review-round {round_no} -->\n"
-    meta = f"\n> risk: `{risk or 'n/a'}`" + (f" — {summary}" if summary else "") + "\n"
-    body = feedback.strip() or "(no detail captured)"
+    # Both of these are somebody else's bytes — a TARGET repo's raw validation
+    # stdout/stderr and the verifier's prose about it — and this file is TRACKED:
+    # `implement` commits it, the next `pipeline complete` sweeps this append
+    # into the reviewed commit, and `GitHubPR.open` pushes that to the remote. So
+    # they cross the publication boundary exactly like a PR body and get the same
+    # single scrub, not just the marker pass:
+    #   * markers, because the round counter above parses a marker back out of
+    #     this very file, so one inside these bytes forges rounds;
+    #   * SECRETS, because a target repo's failing test prints its environment
+    #     (an earlier exemption argued these fragments only describe the
+    #     operator's own worktree — that argument never covered credentials);
+    #   * home paths, for the reason every other published fragment gets them.
+    # ``risk`` is harness's own verdict word and is left alone.
+    meta = (f"\n> risk: `{risk or 'n/a'}`"
+            + (f" — {sanitize_publication(summary)}" if summary else "") + "\n")
+    body = sanitize_publication(feedback.strip()) or "(no detail captured)"
     section = f"{head}{meta}\n```\n{body}\n```\n\nFix the above, then re-run the *Complete* step.\n"
     packet.write_text(existing + section, encoding="utf-8")
     logger.info("feedback round %d appended to %s (%d chars of findings, "

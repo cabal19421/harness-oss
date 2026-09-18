@@ -161,8 +161,8 @@ class Heartbeat:
         boot) and falls back to the wall clock. The old ``max(0.0, …)`` clamp is
         deliberately gone: a backward wall-clock step (a WSL2 btime was
         observed moving 1784094040 → 1784094031) made a long-dead task read
-        as *perfectly fresh* forever. A negative age is surfaced so callers can treat the age
-        as UNKNOWN instead of as fresh.
+        as *perfectly fresh* forever. A negative age is surfaced so callers
+        can treat the age as UNKNOWN instead of as fresh.
         """
         if self.mono is not None and self.boot_id and self.boot_id == _boot_id():
             return time.monotonic() - self.mono
@@ -482,8 +482,8 @@ class TaskClaim:
     acquires it before implementing/reviewing a task, and the supervisor refuses
     to recover a task whose claim is held.
 
-    Fail-open on platforms without ``fcntl``: every acquire succeeds and the
-    pre-existing heartbeat heuristics remain the only guard.
+    :meth:`acquire` fails open TWICE, and a caller whose next step is
+    destructive must tell them apart — see :attr:`held` and :attr:`fail_open`.
     """
 
     def __init__(self, state_dir: Path, task_id: str) -> None:
@@ -491,18 +491,62 @@ class TaskClaim:
         self.state_dir = Path(state_dir)
         self.path = runs_root(self.state_dir) / task_id / "claim.lock"
         self._fh: IO[str] | None = None
+        #: Why the CURRENT acquire returned True with NO lock behind it:
+        #: ``""`` (it is genuinely held, or acquire returned False),
+        #: ``"no-fcntl"`` or ``"unclaimable"`` — see :meth:`acquire`. Reset by
+        #: :meth:`acquire` and cleared by :meth:`release`, so it never outlives
+        #: the acquire it describes.
+        self.fail_open = ""
+
+    @property
+    def held(self) -> bool:
+        """Does THIS process hold the advisory lock *right now*?
+
+        :meth:`acquire` returning True does not imply it — both of its
+        fail-opens return True holding nothing, and :attr:`fail_open` says
+        which one happened. A caller whose next step is DESTRUCTIVE must
+        consult this rather than acquire()'s return value: "nobody stopped me"
+        is not "I own this", and the whole point of the claim is that a held
+        one proves an owner is alive right now.
+        """
+        return self._fh is not None
 
     def acquire(self, *, mint_gen: bool = True) -> bool:
         """Try to take exclusive ownership; True on success (or no-fcntl).
 
         A successful acquire starts a new *incarnation* of the task and mints a
         fresh generation token (see :meth:`RunLog.mint_gen`) so records left by
-        an earlier incarnation are recognisable as such. ``mint_gen=False`` is
-        for read-only probes like :meth:`held_elsewhere`, which must not have
-        that side effect.
+        an earlier incarnation are recognisable as such.
+
+        ``mint_gen=False`` is for holders that are not going to *work* the task:
+        the read-only :meth:`held_elsewhere` probe, and the supervisor holding
+        the claim across a recovery. Minting there would stamp the heartbeats a
+        live owner is still writing as belonging to a stale incarnation —
+        turning a merely-slow agent into one that reads ``unknown`` forever.
+
+        **True does not mean held.** Two fail-opens return True with nothing
+        behind them, and :attr:`fail_open` records which:
+
+        ``"no-fcntl"``
+            This platform has no advisory locking, so NO process can hold a
+            claim: the absence of a hold is *uniform*, and the pre-existing
+            heartbeat heuristics are the documented only guard for everyone.
+        ``"unclaimable"``
+            The claim file could not be opened (read-only state dir, ENOSPC,
+            EMFILE in a long parallel run) while every other process on this
+            platform still takes real claims. This one is *asymmetric*: an
+            owner may hold the claim right now and this process cannot tell.
+            Proceeding is a choice each caller has to make on its own — the
+            orchestrator's implement path keeps proceeding (a second agent in
+            one worktree is bad but recoverable), and :meth:`Supervisor.recover
+            <harness.pipeline.supervisor.Supervisor.recover>` refuses, because
+            it would otherwise reset a live owner's tree believing it holds the
+            claim that exists to prevent exactly that.
         """
+        self.fail_open = ""
         if fcntl is None:
-            if mint_gen:  # type: ignore[unreachable]  # fail-open when fcntl is absent (non-POSIX)
+            self.fail_open = "no-fcntl"  # type: ignore[unreachable]  # non-POSIX
+            if mint_gen:
                 RunLog(self.state_dir, self.task_id).mint_gen()
             return True
         try:
@@ -511,8 +555,11 @@ class TaskClaim:
             # file handle does — release() closes it.
             fh = open(self.path, "a+")  # noqa: SIM115
         except OSError as exc:
+            self.fail_open = "unclaimable"
             logger.warning("cannot open claim file for %s (%s: %s) — proceeding "
-                           "UNCLAIMED (heartbeat heuristics are the only guard)",
+                           "UNCLAIMED (heartbeat heuristics are the only guard; "
+                           "`held` is False and callers about to do something "
+                           "destructive must refuse)",
                            self.task_id, type(exc).__name__, exc)
             return True
         try:
@@ -536,6 +583,11 @@ class TaskClaim:
         return True
 
     def release(self) -> None:
+        # Cleared unconditionally, and OUTSIDE the handle check: an acquire that
+        # fail-opened holds no handle, so a `fail_open` set by it would survive
+        # this call and answer for whatever a later reader asks — "why is this
+        # claim not held" about a claim nobody has tried to take yet.
+        self.fail_open = ""
         if self._fh is not None:
             try:
                 if fcntl is not None:

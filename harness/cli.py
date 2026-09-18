@@ -614,13 +614,20 @@ def _cmd_verify_diff(args: argparse.Namespace) -> None:
 
     config = _pipeline_config(args)
     repo = config.repo
-    base = getattr(args, "base", None) or config.base_branch or "main"
+    base_name = getattr(args, "base", None) or config.base_branch or "main"
+    # Every use below hands `base` to git as a *revision*, where a bare name
+    # lets git's disambiguation pick refs/tags/<base> over refs/heads/<base> —
+    # so a shadowing tag would silently move what this second opinion is a
+    # second opinion ON (gitutil.qualify_ref). The short name stays for display,
+    # and a pseudo-ref (`--base HEAD`, i.e. "the uncommitted work") passes
+    # through untouched.
+    base = gitutil.qualify_ref(repo, base_name)
     intent = getattr(args, "intent", None) or "the change described by this diff"
 
-    print(_header(f"Verify diff — {repo.name} (vs {base})"))
+    print(_header(f"Verify diff — {repo.name} (vs {base_name})"))
     changed = gitutil.changed_files(repo, base=base)
     if not changed:
-        print(_warn(f"no changes vs {base} — nothing to verify"))
+        print(_warn(f"no changes vs {base_name} — nothing to verify"))
         return
     print(_info(f"{len(changed)} changed file(s)"))
 
@@ -790,6 +797,7 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
         return
 
     from harness.pipeline import PipelineOrchestrator
+    from harness.pipeline.gitutil import GitError
 
     config = _pipeline_config(args)
     if sub in _MUTATING_PIPELINE_SUBS:
@@ -801,6 +809,23 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
         _refuse_if_run_live(config, sub, lock_probe=False)
     orch = PipelineOrchestrator(config, log=lambda m: print(_info(m)))
 
+    try:
+        _pipeline_dispatch(sub, args, config, orch)
+    except GitError as exc:
+        # A refusal, not a crash. The base gate (a typo'd --base, a base branch
+        # renamed or deleted mid-run) and every other git refusal reach the
+        # operator in the same _error + exit-2 shape as the rest of this
+        # command, never as a traceback — main() has no top-level handler.
+        # Read-only subcommands and `supervise --recover` never consult the
+        # base, so this is not a gate on them (see PipelineOrchestrator
+        # ._require_base).
+        print(_error(f"pipeline {sub}: {exc}"))
+        sys.exit(2)
+
+
+def _pipeline_dispatch(sub: str, args: argparse.Namespace, config,
+                       orch) -> None:
+    """Run one ``pipeline`` subcommand against an already-built orchestrator."""
     if sub == "plan":
         print(_header(f"Plan — {config.repo.name}"))
         plan = orch.plan()

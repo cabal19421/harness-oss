@@ -107,6 +107,12 @@ class ReviewResult:
     # RunLog.memory_digest, which is the ONLY review context a retry inherits.
     mutation_survivors: list[str] = field(default_factory=list)  # "file:line description"
     verifier_reasons: list[str] = field(default_factory=list)
+    # This FAIL came from :meth:`ReviewGate._protected_path_fail`, whose whole
+    # contract is that the worktree and index are exactly as the agent left
+    # them. A caller that writes into the worktree on a FAIL (the ide-handoff
+    # feedback round appends to the tracked TASK.md) must consult this and skip
+    # — the refusal's promise is only worth what the next step honours.
+    protected_path_refusal: bool = False
 
     def failure_notes_detail(self) -> str:
         """The actionable slice of a FAIL, for the task's run notes.
@@ -175,7 +181,13 @@ class ReviewGate:
         # push time, minutes and several gates later) so there is exactly one
         # reviewed SHA — and _open_pr refuses to push anything that is not it or
         # a descendant of it.
-        reviewed_sha = self._freeze_reviewed_commit(ctx, commit=open_pr)
+        try:
+            reviewed_sha = self._freeze_reviewed_commit(ctx, commit=open_pr)
+        except gitutil.ProtectedPathError as exc:
+            # The sweep is refused, so there is no reviewed commit and nothing
+            # downstream can be bound to one. Stop here rather than judging (and
+            # possibly publishing) a tree the pipeline was told not to touch.
+            return self._protected_path_fail(ctx, exc)
         oracle = oracle or self._oracle(ctx)
         # Review the task's OWN delta (post-seed), not the seeded dependency code —
         # so risk/sensitive-path detection doesn't re-fire on every dependant.
@@ -184,7 +196,9 @@ class ReviewGate:
                      task.id, ctx.diff_base, len(changed),
                      trunc(", ".join(changed)) if changed else "(none)")
 
-        risk, reasons = self._assess_risk(task, oracle, changed)
+        risk, reasons = self._assess_risk(
+            task, oracle, changed,
+            no_operator_oracle=ctx.untrusted_without_operator_oracle)
         passed = oracle.passed
         extra_feedback: list[str] = []
         mutation_survivors: list[str] = []
@@ -342,17 +356,37 @@ class ReviewGate:
         ``git reset --hard`` — but it does mean "branch has a commit" no longer
         implies "the review passed".
         """
+        from .sanitize import sanitize_publication
+
         task = ctx.task
         if commit and gitutil.working_tree_dirty(ctx.worktree):
             logger.debug("[%s] worktree %s dirty at review time — committing it "
                          "now so the oracle, the risk level and the push all "
                          "refer to one commit", task.id, ctx.worktree)
-            gitutil.add_all(ctx.worktree)
-            res = gitutil.commit(ctx.worktree, f"{task.title} [{task.id}]")
-            if not res.ok:
-                logger.warning("[%s] could not commit leftover work (rc=%s): %s — "
-                               "the PR step will retry the commit", task.id,
-                               res.code, trunc(redact(res.err or res.out), 200))
+            # This is the sweep the protected-path guard exists for: whatever the
+            # agent left in the worktree is about to become one reviewed commit
+            # and then a push. Raises ProtectedPathError, which review() turns
+            # into a FAIL — deliberately not caught here, where the only options
+            # would be to stage anyway or to invent a verdict.
+            gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
+            # Decide the commit from the INDEX, not from `git status` — the same
+            # rule as both agent loops' `_ensure_committed`. Status can report
+            # dirt `git add -A` cannot stage (a dirty submodule), and the rc=1
+            # "no changes added to commit" that follows is not a failure to warn
+            # about or for the PR step to "retry": there is nothing to commit.
+            if gitutil.nothing_to_commit(ctx.worktree):
+                logger.debug("[%s] nothing stageable left in %s — no review "
+                             "commit to make", task.id, ctx.worktree)
+            else:
+                # The commit MESSAGE is the third surface `git push` publishes,
+                # alongside the PR title and body — same design-doc text, same
+                # remote, one click apart — so it crosses the same scrub.
+                res = gitutil.commit(
+                    ctx.worktree, sanitize_publication(f"{task.title} [{task.id}]"))
+                if not res.ok:
+                    logger.warning("[%s] could not commit leftover work (rc=%s): %s "
+                                   "— the PR step will retry the commit", task.id,
+                                   res.code, trunc(redact(res.err or res.out), 200))
         sha = gitutil.head_sha(ctx.worktree)
         if not sha:
             logger.warning("[%s] cannot resolve HEAD in %s — the review verdict "
@@ -361,6 +395,42 @@ class ReviewGate:
         else:
             logger.debug("[%s] review is bound to commit %s", task.id, sha[:12])
         return sha
+
+    def _protected_path_fail(self, ctx: ImplementContext,
+                             exc: gitutil.ProtectedPathError) -> ReviewResult:
+        """FAIL the review on a protected-path refusal, worktree untouched.
+
+        Nothing was staged, nothing was committed and nothing was reset: the
+        contract is that the operator finds the tree exactly as the agent left
+        it, so the offending file can be inspected before anyone decides what to
+        do with it. The reason rides in ``reasons`` because that is what
+        ``_summary`` puts into the task's notes — the morning-after surface, and
+        the only place this refusal would otherwise be visible.
+        """
+        task = ctx.task
+        reason = str(exc)
+        logger.error("[%s] review FAILED before the oracle ran: %s", task.id, reason)
+        ctx.trace.span("protected_path", ok=False, task=task.id,
+                       path=exc.path, rule=exc.rule, detail=reason[:200])
+        reasons = [reason]
+        summary = "\n".join([
+            f"[{task.id}] FAIL  risk=high  files=0",
+            "  protected-path refusal — index and worktree preserved, nothing committed",
+            "  reasons: " + "; ".join(reasons),
+        ])
+        return ReviewResult(
+            task_id=task.id, passed=False, risk="high",
+            # Not "grounding failed" — grounding never ran. False is the honest
+            # value for a gate that produced no proof (unknown is never a pass).
+            grounding_ok=False, summary=summary, reasons=reasons,
+            protected_path_refusal=True,
+            feedback=(
+                f"The pipeline refused to commit this worktree: {reason}. "
+                "Nothing was staged or reset — your work is intact. Remove that "
+                "file from the worktree (or add it to .gitignore) and leave the "
+                "task's own changes in place; it is protected by operator "
+                "configuration, not by anything you can override."),
+        )
 
     def _verifier_gate(self, ctx: ImplementContext, task: Task,
                        oracle: OracleResult, changed: list[str]) -> VerifierReport:
@@ -508,11 +578,22 @@ class ReviewGate:
         return OracleResult(
             passed=validation_ok and grounding.ok,
             validation_ok=validation_ok, grounding=grounding, output=output,
-            validation_legs=report.legs,
+            validation_legs=report.legs, required=report.required,
         )
 
     def _assess_risk(self, task: Task, oracle: OracleResult,
-                     changed: list[str]) -> tuple[RiskLevel, list[str]]:
+                     changed: list[str], *,
+                     no_operator_oracle: bool = False) -> tuple[RiskLevel, list[str]]:
+        """The advisory risk level for this task, and why.
+
+        *no_operator_oracle* is
+        :attr:`~harness.pipeline.backends.base.ImplementContext.untrusted_without_operator_oracle`:
+        an ``--untrusted`` run in which the design chose every validation command
+        because the operator configured none. It escalates rather than refuses —
+        risk is the documented "a human must look at this" channel, and an
+        unconfigured oracle is an infrastructure gap, which fails open here like
+        every other one.
+        """
         reasons: list[str] = []
         logger.debug("[%s] risk checks: grounding_ok=%s oracle_passed=%s "
                      "design_risk_tag=%s changed_files=%d",
@@ -536,6 +617,20 @@ class ReviewGate:
             logger.debug("[%s] risk escalator hit: design tags this task high "
                          "→ high", task.id)
             reasons.append("task tagged high risk in the design")
+            return "high", reasons
+        if no_operator_oracle:
+            # Last of the hard escalators, so it never displaces a more specific
+            # reason — but it is a hard one: no amount of green, and no size of
+            # diff, makes an oracle the reviewed design chose for itself into
+            # evidence the operator asked for.
+            logger.warning("[%s] risk escalator hit: --untrusted with NO operator "
+                           "oracle — every validation command came from the design "
+                           "under review, so a green oracle attests only what that "
+                           "design chose to check → high (advisory: a human must "
+                           "look). Set --test-cmd/--type-cmd/--lint-cmd to restore "
+                           "an operator half.", task.id)
+            reasons.append("--untrusted with no operator oracle: the design under "
+                           "review chose every validation command")
             return "high", reasons
 
         if not oracle.passed:
@@ -568,9 +663,17 @@ class ReviewGate:
     def _open_pr(self, ctx: ImplementContext, task: Task, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str], *,
                  reviewed_sha: str = "") -> PrResult:
+        from .sanitize import sanitize_publication
+
         creator = get_pr_creator(self.pr_mode)
-        title = f"{task.title} [{task.id}]"
-        body = self._pr_body(task, risk, oracle, changed)
+        # The title is published by the same command as the body (`gh pr create
+        # --title`) and is built from the same design-doc text, so it crosses
+        # the boundary through the same scrub.
+        title = sanitize_publication(f"{task.title} [{task.id}]")
+        body = self._pr_body(task, risk, oracle, changed,
+                             validation=ctx.validation,
+                             rejected=ctx.rejected_validation,
+                             no_operator_oracle=ctx.untrusted_without_operator_oracle)
         branch = task.branch or gitutil.current_branch(ctx.worktree)
         # The push/commit is the only repo-level git mutation → serialise it.
         with step(logger, "open PR (includes wait on repo git lock)",
@@ -593,13 +696,55 @@ class ReviewGate:
                 repo=ctx.config.repo, worktree=ctx.worktree, branch=branch,
                 base=ctx.base_branch, title=title, body=body,
                 reviewed_sha=reviewed_sha,
+                protected_paths=ctx.config.protected_paths,
             )
 
     def _pr_body(self, task: Task, risk: RiskLevel, oracle: OracleResult,
-                 changed: list[str]) -> str:
+                 changed: list[str], *, validation: list[str] | None = None,
+                 rejected: list[str] | None = None,
+                 no_operator_oracle: bool = False) -> str:
+        """Render the PR body. *validation* is the oracle that actually **ran**.
+
+        It defaults to ``task.validation`` — the list the design declared — but a
+        caller with the context should always pass ``ctx.validation`` instead,
+        because under ``--untrusted`` the two differ in both directions: the
+        declared list omits every operator leg that ran (the design's commands
+        are *added to* the operator's oracle there, not substituted for it) and
+        it still contains any command the allowlist refused. Attesting the
+        declared list would put "✅ all green" under a `rm -rf ~` that never ran
+        — on a public remote, in harness's own voice.
+
+        *rejected* commands are reported by COUNT only. The reviewer of an
+        untrusted contribution needs to know the gate refused something; nobody
+        needs the refused command line republished to the remote, where it would
+        read as part of the attested oracle.
+
+        *no_operator_oracle* says the listed commands are ALL the design's own
+        (``--untrusted`` with nothing configured or autodetected). The PR is the
+        one place a human is guaranteed to look, so it says so there rather than
+        letting "✅ all green" stand over a suite the reviewed design picked.
+        """
+        from .sanitize import sanitize_publication
+
+        commands = task.validation if validation is None else validation
         files = "\n".join(f"- `{p}`" for p in changed) or "- (no tracked changes detected)"
-        validation = "\n".join(f"- `{c}`" for c in task.validation) or "- (none)"
-        return f"""## {task.title}
+        validation_md = "\n".join(f"- `{c}`" for c in commands) or "- (none)"
+        if rejected:
+            # Not "declared by the design": the same list can carry an operator
+            # command seeded into the plan before `--test-cmd` changed, and this
+            # text is published — attributing the operator's stale command to a
+            # contributor is a public accusation. Mirrors the run-log wording.
+            validation_md += (
+                f"\n\n_{len(rejected)} command(s) from this task's validation list "
+                f"were refused by the untrusted-design allowlist and did **not** run "
+                f"(declared by the design, or seeded before a `--test-cmd` change)._")
+        if no_operator_oracle:
+            validation_md += (
+                "\n\n> ⚠️ **Run with `--untrusted` and no operator oracle.** Every "
+                "command above was chosen by the design under review, not by the "
+                "operator, so a green result attests only what that design chose to "
+                "check. Risk is forced to `high` for human review.")
+        body = f"""## {task.title}
 
 Implements task `{task.id}` from design `{task.design_doc}`.
 
@@ -608,7 +753,7 @@ Implements task `{task.id}` from design `{task.design_doc}`.
 ### Risk: **{risk}**
 
 ### Validation (oracle)
-{validation}
+{validation_md}
 
 Result: {'✅ all green' if oracle.passed else '❌ not green'} — {oracle.grounding.summary}
 
@@ -617,8 +762,19 @@ Result: {'✅ all green' if oracle.passed else '❌ not green'} — {oracle.grou
 
 ---
 🤖 Generated by the harness design-docs → PRs pipeline
-<!-- harness:task={task.id} risk={risk} -->
 """
+        # THE publication boundary. Everything above arrived from the design doc
+        # (title, description, the oracle's own commands) and this is the last
+        # place it is still ours — GitHubPR.open pushes it to a real remote next.
+        # One scrub over the assembled body, not per field: a per-field pass only
+        # covers the fields somebody remembered.
+        #
+        # The attestation trailer is appended AFTER the scrub, and that ordering
+        # is what makes it worth anything: a forged `<!-- harness:` in the
+        # description is defanged above it, so the marker below is the only one
+        # in the body harness itself wrote.
+        return (f"{sanitize_publication(body)}"
+                f"<!-- harness:task={task.id} risk={risk} -->\n")
 
     def _summary(self, task: Task, passed: bool, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str],

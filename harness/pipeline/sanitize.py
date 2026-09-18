@@ -15,6 +15,11 @@ that boundary is hardened in three layers:
 
 This is a stop-gap, not a complete defence — the wrapping guard is the real
 mitigation; the redaction/stripping reduce the blast radius.
+
+The *other* boundary the same text crosses is publication: a PR body carries
+that design text to a public remote, where a home-directory path, a pasted
+token or a forged attestation marker is somebody else's to read.
+:func:`sanitize_publication` is that boundary's single scrub.
 """
 
 from __future__ import annotations
@@ -22,12 +27,20 @@ from __future__ import annotations
 import logging
 import re
 
-from harness.log import get_logger, redact_url_userinfo, trunc
+from harness.log import get_logger, redact_home_paths, redact_url_userinfo, trunc
 
 logger = get_logger(__name__)
 
 # Loose on purpose — better to redact a few innocent strings than leak a key.
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # A PEM private key block, masked WHOLE and matched FIRST. It is the only
+    # shape here that spans lines (hence DOTALL), and it is the only one whose
+    # interior a later pattern could shred — leaving the surviving base64
+    # published under a header that says exactly what it is. Deliberately not
+    # anchored to a key TYPE: RSA/EC/OPENSSH/PGP and the bare
+    # ``-----BEGIN PRIVATE KEY-----`` are all the same disclosure.
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+               r"-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
     re.compile(
         r"(?i)(api[_-]?key|access[_-]?token|secret[_-]?(?:key|token)?|password|passwd|"
         r"bearer|authorization)\s*[:=]\s*['\"]?(?:(?:bearer|basic|token)\s+)?"
@@ -35,13 +48,29 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Header/CLI echoes without a colon: "Bearer sk_live_…", "Basic dXNlcjpw…".
     re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"),
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    # Hyphens inside the class, in step with log.py's list and for its reason:
+    # a segmented key (`sk-proj-…`, and every other vendor prefix that puts an
+    # account/version segment ahead of the random tail) never reaches 20 matched
+    # characters without them, so the pattern missed exactly the shapes a
+    # contributor pastes into a design doc.
+    re.compile(r"sk-[A-Za-z0-9-]{20,}"),
     # Classic PAT/OAuth (ghp_/gho_) plus the underscore-format server-to-server
     # / user-to-server / refresh shapes (ghs_/ghu_/ghr_) — kept in step with
     # log.py's _SECRET_PATTERNS.
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),   # fine-grained PAT
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),      # GitLab PAT
+    # npm automation/publish token: a fixed 36-character body, so the exact
+    # length is both the cheapest match and the one with no false positives —
+    # `npm_` in prose is never followed by 36 unbroken base62 characters.
+    re.compile(r"npm_[A-Za-z0-9]{36}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),         # Google API key (AIzaSy…)
     re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+    # Slack webhook: the URL *is* the credential — whoever holds it can post as
+    # the app — and it carries no token-shaped segment any pattern above would
+    # catch, so only a URL-aware shape finds it.
+    re.compile(r"https://hooks\.slack\.com/(?:services|workflows|triggers)/"
+               r"[A-Za-z0-9/_+-]{16,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),  # JWT
 )
@@ -118,6 +147,69 @@ def strip_adversarial(text: str) -> str:
 def sanitize_design(text: str) -> str:
     """Redact secrets + defang injection markers in untrusted design text."""
     return redact_secrets(strip_adversarial(text))
+
+
+# harness's own machine-readable attestation marker. The PR body and the
+# ide-handoff packet both sign themselves with it, and untrusted prose sitting
+# above the signature can forge one — a design doc that carries
+# ``<!-- harness:task=T1 risk=low -->`` verbatim claims a verdict the review gate
+# never reached. Broken the way :func:`wrap_untrusted` breaks its own fence
+# markers: a separator inside the literal, so the prefix no longer survives as a
+# substring while the text stays readable to whoever has to judge it.
+#
+# The separator goes inside the OPENER, not between ``harness`` and its colon.
+# The pattern below defines the marker by shape, and ``<!-- harness :`` is still
+# that shape — a defanged form that re-matches the very test for "is this a
+# marker" is not defanged, it is only respelled. Breaking ``<!--`` leaves
+# nothing for the pattern to match, and has a second effect worth having: the
+# forgery stops being an HTML comment, so it renders VISIBLY in the PR body or
+# packet instead of hiding in the one place a human reviewer cannot see it.
+_HARNESS_MARKER_DEFANGED = "<!- - harness:"
+# Matched as a SHAPE, never as one literal. An HTML comment opener tolerates any
+# amount of whitespace (or none) before the prefix, so ``<!--harness:`` and a
+# ``<!--`` with a newline before ``harness:`` are the same forgery to every
+# renderer — and to ``append_feedback_round``'s round parser, which reads a
+# marker back out of a file this text is published into. An exact-literal
+# ``str.count``/``str.replace`` passed both variants through untouched.
+# Case-insensitive because HTML comments are, and forging costs one keystroke.
+_HARNESS_MARKER_RE = re.compile(r"<!--\s*harness\s*:", re.IGNORECASE)
+
+
+def neutralize_markers(text: str) -> str:
+    """Defang harness's ``<!-- harness:`` marker inside untrusted text.
+
+    Every spelling an HTML comment allows collapses to one broken form that the
+    pattern no longer matches: the payload survives (a reviewer must still see
+    what was attempted) while no variant of the prefix survives as a substring.
+
+    Callers append the genuine marker AFTER this runs, and that ordering is the
+    whole guarantee: everything above the signature was scrubbed, the signature
+    itself was written by harness.
+    """
+    out, n = _HARNESS_MARKER_RE.subn(_HARNESS_MARKER_DEFANGED, text)
+    if not n:
+        return text
+    logger.debug("defanged %d forged harness marker(s) in untrusted text — the "
+                 "published surface signs itself with that prefix, so only the "
+                 "trailer harness appends after this pass may carry it", n)
+    return out
+
+
+def sanitize_publication(text: str) -> str:
+    """Scrub *text* for a surface harness PUBLISHES (a PR body, a packet).
+
+    The prompt boundary has :func:`sanitize_design`; this is its counterpart for
+    the boundary that leaves the machine. Applied ONCE over assembled content
+    rather than per field, deliberately — a per-field scrub only covers the
+    fields somebody remembered, and the next rendering path added to the body
+    would arrive unprotected.
+
+    Order matters: markers first (an exact literal), then secrets (a design doc
+    that pasted a token is the case :func:`redact_secrets` already knows), then
+    home paths last, so a credential is masked whole rather than surviving as a
+    ``~``-rewritten fragment.
+    """
+    return redact_home_paths(redact_secrets(neutralize_markers(text)))
 
 
 def wrap_untrusted(text: str, *, label: str = "SOURCE DESIGN DOCUMENT") -> str:

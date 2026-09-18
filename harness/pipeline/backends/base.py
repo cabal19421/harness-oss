@@ -30,11 +30,16 @@ from pathlib import Path
 
 from harness.log import fmt_cmd, get_logger, trunc
 
-from ..gitutil import pwd_for
+from ..gitutil import commits_ahead, pwd_for
 from ..grounding_gate import GateResult, GroundingGate
 from ..spec import PipelineConfig, Task
 from ..trace import Tracer, noop_tracer
-from ..trust import has_shell_metachars, leading_runner
+from ..trust import (
+    compose_untrusted_validation,
+    dedup_commands,
+    has_shell_metachars,
+    leading_runner,
+)
 
 logger = get_logger(__name__)
 
@@ -63,38 +68,143 @@ class ImplementContext:
     #: ``--parallel > 1``. ``None`` falls back to a module-level lock, which
     #: still serialises baselines against each other.
     git_lock: AbstractContextManager | None = None
+    #: Memo behind :meth:`_operator_oracle` — not a configured field.
+    _operator_oracle_memo: list[str] | None = field(default=None, init=False,
+                                                    repr=False, compare=False)
+    #: Memo behind :meth:`_composed` — likewise.
+    _composed_memo: tuple[list[str], list[str]] | None = field(
+        default=None, init=False, repr=False, compare=False)
+
+    def _operator_oracle(self) -> list[str]:
+        """``config.default_validation()``, resolved once for this context.
+
+        :attr:`validation` is a *property*, and several callers read it
+        repeatedly for one task (the oracle, the mutation gate, the prompt
+        renderer, the packet, the PR body). Re-entering
+        :meth:`~harness.pipeline.spec.PipelineConfig.default_validation` on each
+        read re-probes the filesystem and — the part that matters at
+        ``--parallel > 1`` — *reassigns* ``tool_versions`` on the
+        :class:`PipelineConfig` every task shares, i.e. a write to shared mutable
+        state from a hot read path. Resolving it once per context also means one
+        task's oracle cannot change under it mid-implementation, which is the
+        same promise the plan's pinned tool versions already make.
+        """
+        if self._operator_oracle_memo is None:
+            self._operator_oracle_memo = self.config.default_validation()
+        return self._operator_oracle_memo
+
+    def _composed(self) -> tuple[list[str], list[str]]:
+        """``(effective, rejected)`` for this context's untrusted union, once.
+
+        Not only to save work. :func:`~harness.pipeline.trust.filter_validation`
+        logs a WARNING per refused command — deliberately, a refusal must be
+        loud — and :attr:`validation` is a property that every stage of a task
+        reads (the prompt, the oracle, the mutation gate, the packet, the PR
+        body) on every iteration of the loop. Recomputing per read turned one
+        refusal into dozens of identical warnings per task, which is how a real
+        one stops being read. One composition per context means one warning per
+        refused command per task.
+        """
+        if self._composed_memo is None:
+            effective, rejected = compose_untrusted_validation(
+                self._operator_oracle(), self.task.validation)
+            if rejected:
+                logger.debug(
+                    "untrusted_designs: allowlist dropped %d of %d design validation "
+                    "command(s) for %s; oracle is %d command(s) (rejected ones listed "
+                    "by rejected_validation)",
+                    len(rejected), len(self.task.validation), self.task.id,
+                    len(effective))
+            self._composed_memo = (effective, rejected)
+        return self._composed_memo
 
     @property
     def validation(self) -> list[str]:
         """The oracle commands to run.
 
-        A design doc's own ``(validate: …)`` commands are trusted by default. In
-        ``untrusted_designs`` mode they are allowlist-filtered (fail-closed) so a
-        contributed design can't smuggle ``(validate: rm -rf ~)`` past the gate;
-        operator-set defaults (``--test-cmd`` etc.) are always trusted.
+        A design doc's own ``(validate: …)`` commands are trusted by default, and
+        they *replace* the operator's oracle: the documented per-task oracle
+        (PIPELINE.md, ``(validate: cmd; cmd)``) is the operator's own choice when
+        the operator wrote the design.
+
+        Under ``untrusted_designs`` they are neither trusted nor substitutive.
+        They are allowlist-filtered (fail-closed) so a contributed design can't
+        smuggle ``(validate: rm -rf ~)`` past the gate, and what survives that
+        filter is **added to** the operator's oracle instead of replacing it
+        (:func:`~harness.pipeline.trust.compose_untrusted_validation`) — the
+        allowlist bounds *what* may run, not whether it checks anything, so under
+        replacement a design could swap the operator's suite for an allowlisted,
+        trivially-green ``pytest tests/smoke_test.py`` and still be published as
+        "oracle all green".
+
+        Operator-set commands (``--test-cmd`` etc.) are always trusted: they go in
+        unfiltered, first, and survive even when every design command is rejected.
+        That also covers the case where they are what ``task.validation`` holds — a
+        design declaring no validation is seeded with them at plan time
+        (``ingest.tasks_from_doc``), and filtering *those* dropped a
+        ``.venv/bin/python -m pytest -q`` oracle to nothing, i.e. into
+        :func:`run_validation_report`'s vacuous pass.
         """
-        if self.task.validation:
-            if self.config.untrusted_designs:
-                from ..trust import filter_validation
-                allowed, _ = filter_validation(self.task.validation)
-                if len(allowed) != len(self.task.validation):
-                    logger.debug(
-                        "untrusted_designs: allowlist kept %d of %d design "
-                        "validation commands for %s (rejected ones listed by "
-                        "rejected_validation)",
-                        len(allowed), len(self.task.validation), self.task.id)
-                return allowed
+        if not self.task.validation:
+            return self._operator_oracle()
+        if not self.config.untrusted_designs:
             return self.task.validation
-        return self.config.default_validation()
+        return self._composed()[0]
 
     @property
     def rejected_validation(self) -> list[str]:
-        """Design-proposed validation commands dropped as unsafe (untrusted mode)."""
+        """Design-proposed validation commands dropped as unsafe (untrusted mode).
+
+        Only the genuinely design-proposed ones: a command the operator's own
+        oracle already carries is trusted by contract and never lands here, or the
+        run would report as "dropped" a command :attr:`validation` is about to run.
+        """
         if self.config.untrusted_designs and self.task.validation:
-            from ..trust import filter_validation
-            _, rejected = filter_validation(self.task.validation)
-            return rejected
+            return self._composed()[1]
         return []
+
+    @property
+    def operator_validation(self) -> list[str]:
+        """The commands in :attr:`validation` that came from the OPERATOR.
+
+        Non-empty only under ``untrusted_designs`` — the one mode where
+        :attr:`validation` mixes two trust levels, the operator's own oracle and
+        whatever the design declared that the allowlist let through. In trusted
+        mode the design *is* the operator, so there is nothing to tell apart and
+        this stays empty, which is also what keeps trusted-mode gating
+        byte-identical.
+
+        The oracle passes it to :func:`run_validation_report` as
+        :attr:`ValidationReport.required`: the commands that must actually
+        produce a verdict before the suite may be called green. A leg the
+        *design* chose is no evidence about a leg the operator chose — see
+        :attr:`ValidationReport.ok`.
+        """
+        if not self.config.untrusted_designs:
+            return []
+        return dedup_commands(self._operator_oracle())
+
+    @property
+    def untrusted_without_operator_oracle(self) -> bool:
+        """``--untrusted`` with no operator oracle for the design to be added to.
+
+        The union in :attr:`validation` is only a gate while the operator half
+        exists. With no ``--test-cmd``/``--type-cmd``/``--lint-cmd`` and nothing
+        autodetectable, that half is empty, :attr:`operator_validation` marks
+        nothing required, and the design's own commands — allowlisted, and
+        allowlisted is not the same as *checking anything* — are the entire
+        oracle. That is the arrangement this whole mode exists to prevent,
+        reached not by an attack but by an operator who never configured a
+        check.
+
+        Nothing refuses the run over it: an unconfigured oracle is an
+        infrastructure gap, and those fail **open** here by doctrine. It is made
+        impossible to miss instead — a WARNING when the task starts, HIGH
+        advisory risk from the review gate (harness's documented "a human must
+        look at this" mechanism), and a line in the PR body's oracle section, so
+        the humans who read those three places all learn the same thing.
+        """
+        return bool(self.config.untrusted_designs) and not self.operator_validation
 
     @property
     def diff_base(self) -> str:
@@ -107,6 +217,32 @@ class ImplementContext:
         branch for root tasks that have no dependencies to seed.
         """
         return self.start_ref or self.base_branch
+
+    def own_commits_ahead(self) -> int:
+        """Commits on this worktree's tip that :attr:`diff_base` does not carry.
+
+        The branch side is the literal ``HEAD`` evaluated with the worktree as
+        cwd — inside a worktree that *is* its checked-out tip, with no ref
+        lookup to get wrong. The per-worktree drift that makes ``HEAD``
+        unusable as a *base* (:func:`~harness.pipeline.gitutil.base_ref`) is
+        exactly the property wanted on this side. The base side is
+        :attr:`diff_base`, which the orchestrator already qualifies.
+
+        Both agent loops used to pass ``current_branch(worktree)`` here, and
+        this count is what decides "the oracle is green *and* something was
+        committed → done", so a wrong answer fails a task whose commit is
+        sitting right there. To be exact about which wrong answer that was:
+        ``current_branch`` is ``rev-parse --abbrev-ref HEAD``, which
+        disambiguates itself under a shadowing tag (it renders the branch as
+        ``heads/agent/<id>``, still resolving to the branch), so unlike the ref
+        names harness spells out itself — :func:`~harness.pipeline.gitutil
+        .qualify_ref`, :meth:`~harness.pipeline.worktree.WorktreeManager
+        ._head_ref` — this site was never tag-shadowable. What it does carry is
+        a fallback: an unreadable HEAD yields the literal ``"main"``, i.e.
+        *another branch's* tip measured as if it were this task's. ``HEAD`` has
+        neither failure mode and depends on no git-version rendering.
+        """
+        return commits_ahead(self.worktree, self.diff_base, "HEAD")
 
     def gate(self) -> GroundingGate:
         """Grounding gate rooted at the worktree (grounds *this task's* changes).
@@ -166,6 +302,11 @@ class ValidationReport:
 
     legs: list[ValidationLeg] = field(default_factory=list)
     output: str = ""
+    #: Commands that must actually *judge the code* for this suite to pass —
+    #: :attr:`ImplementContext.operator_validation`, i.e. the operator's own
+    #: oracle under ``untrusted_designs``. Empty everywhere else, which is what
+    #: keeps every other mode's verdict byte-identical.
+    required: frozenset[str] = frozenset()
 
     @property
     def failed(self) -> list[ValidationLeg]:
@@ -185,6 +326,12 @@ class ValidationReport:
         return self.infrastructure + self.preexisting
 
     @property
+    def unproven(self) -> list[ValidationLeg]:
+        """:attr:`required` legs that never judged the code (infrastructure)."""
+        return [lg for lg in self.legs
+                if lg.status == LEG_INFRA and lg.command in self.required]
+
+    @property
     def ok(self) -> bool:
         """Did the suite clear the agent's diff?
 
@@ -200,10 +347,28 @@ class ValidationReport:
           leg that ran** is red — reported as infrastructure, not as the agent's
           fault. (A suite with no commands at all still passes vacuously; the
           orchestrator warns about that separately.)
+        * The same rule applied to a *subset*: a leg named in :attr:`required`
+          that is still excused as **infrastructure** — it never launched, or it
+          launched and refused to judge — leaves the suite red even when other
+          legs passed. Only that excuse counts: a required leg excused as
+          ``preexisting`` *did* run and judge, and ``validation_baseline`` is the
+          operator's own opt-in to not being blamed for what was already red, so
+          it is proven by the operator's own choice.
+          That subset is only ever populated under ``untrusted_designs``, where
+          the suite is a union of two trust levels — and "some leg ran" is then
+          satisfiable by a command the *design* chose. The operator's
+          ``.venv/bin/python -m pytest -q`` is exactly the leg most likely to
+          never launch in a worktree (which has no ``.venv`` of its own), and
+          :func:`_unexcuse_diff_broken_legs` cannot adjudicate it because a
+          command that never launched has no returncode to compare against the
+          diff base. Without this rule a design's allowlisted, trivially-green
+          command rescues an operator suite that never ran at all.
         """
         if not self.legs:
             return True
         if self.failed:
+            return False
+        if self.unproven:
             return False
         return any(lg.status in (LEG_PASSED, LEG_PREEXISTING) for lg in self.legs)
 
@@ -226,6 +391,10 @@ class OracleResult:
     #: boolean (and for hand-built results in tests), which keeps every existing
     #: behaviour identical.
     validation_legs: list[ValidationLeg] = field(default_factory=list)
+    #: :attr:`ValidationReport.required` carried through, so the agent-facing
+    #: feedback can *name* the command that had to run and did not instead of
+    #: saying "a validation command" and leaving it to guess which.
+    required: frozenset[str] = frozenset()
 
     @property
     def grounding_ok(self) -> bool:
@@ -237,6 +406,13 @@ class OracleResult:
         return [lg for lg in self.validation_legs
                 if lg.status in (LEG_INFRA, LEG_PREEXISTING)]
 
+    @property
+    def unproven_legs(self) -> list[ValidationLeg]:
+        """Required legs still excused as infrastructure — see
+        :attr:`ValidationReport.unproven`, of which this is the caller-side view."""
+        return [lg for lg in self.validation_legs
+                if lg.status == LEG_INFRA and lg.command in self.required]
+
     def feedback(self) -> str:
         """Combined, agent-readable explanation of what is still failing."""
         parts: list[str] = []
@@ -244,15 +420,39 @@ class OracleResult:
         excused = self.excused_legs
         if not self.validation_ok:
             if self.validation_legs and not blamed:
-                # Every leg was infrastructure: telling the agent its code is
-                # "still failing" sends it off editing code to fix a config
-                # error it cannot reach.
-                parts.append(
-                    "NONE of the validation commands could run — every configured "
-                    "check failed to start (a tool/environment problem, not your "
-                    "diff). Do not try to fix these by editing code; the oracle "
-                    "proved nothing, so this iteration cannot be green:\n"
-                    + self.output.strip())
+                # No leg blamed the diff, yet the suite is red. Either nothing
+                # ran at all, or something ran and a leg that HAD to run did not
+                # (``ValidationReport.required`` — the operator's own oracle
+                # under --untrusted). Both are environment problems the agent
+                # cannot reach by editing code, but saying "NONE of the commands
+                # could run" when one of them passed is a lie the agent will act
+                # on, so the two are worded apart.
+                ran = [lg for lg in self.validation_legs
+                       if lg.status in (LEG_PASSED, LEG_PREEXISTING)]
+                if ran and self.unproven_legs:
+                    missing = "; ".join(f"`{lg.command}` ({lg.detail or lg.status})"
+                                        for lg in self.unproven_legs)
+                    parts.append(
+                        f"{len(self.unproven_legs)} validation command(s) that MUST "
+                        f"judge this change never ran — {missing}. The "
+                        f"{len(ran)} check(s) that DID run are not a substitute for "
+                        f"them, so the oracle proved nothing and this iteration "
+                        f"cannot be green. Do not try to fix this by editing "
+                        f"code:\n" + self.output.strip())
+                elif ran:
+                    parts.append(
+                        "A validation command that MUST judge this change never "
+                        "ran. The checks that DID run are not a substitute for "
+                        "it, so the oracle proved nothing and this iteration "
+                        "cannot be green. Do not try to fix this by editing "
+                        "code:\n" + self.output.strip())
+                else:
+                    parts.append(
+                        "NONE of the validation commands could run — every configured "
+                        "check failed to start (a tool/environment problem, not your "
+                        "diff). Do not try to fix these by editing code; the oracle "
+                        "proved nothing, so this iteration cannot be green:\n"
+                        + self.output.strip())
             else:
                 parts.append("Validation commands are still failing:\n" + self.output.strip())
         elif excused:
@@ -468,7 +668,7 @@ class CodingBackend(ABC):
                          ctx.task.id, trunc(output[-1200:], 600))
         return OracleResult(passed=passed, validation_ok=validation_ok,
                             grounding=grounding, output=output,
-                            validation_legs=report.legs)
+                            validation_legs=report.legs, required=report.required)
 
 
 # ── validation runner ───────────────────────────────────────────────────────────
@@ -491,7 +691,8 @@ def run_validation(commands: list[str], cwd: Path, *, timeout: int = 1800) -> tu
 
 
 def run_validation_report(commands: list[str], cwd: Path, *, timeout: int = 1800,
-                          baseline_failed: set[str] | None = None) -> ValidationReport:
+                          baseline_failed: set[str] | None = None,
+                          must_run: list[str] | None = None) -> ValidationReport:
     """Run each command in *cwd*, classifying **why** each one ended as it did.
 
     Every leg lands in one of four buckets (see the ``LEG_*`` constants): it
@@ -500,11 +701,17 @@ def run_validation_report(commands: list[str], cwd: Path, *, timeout: int = 1800
     at the diff base before the agent touched anything. Only the second bucket
     is the agent's to answer for; see :attr:`ValidationReport.ok` for how the
     others are handled without opening a path to a vacuous green.
+
+    *must_run* names the commands whose infrastructure excuse must not be enough
+    for the suite to pass — the operator's own oracle under ``untrusted_designs``
+    (:attr:`ImplementContext.operator_validation`). It is recorded on the report
+    as :attr:`ValidationReport.required`; omitted, nothing changes.
     """
     if not commands:
         logger.debug("no validation commands configured — vacuous pass "
                      "(a green oracle here proves nothing)")
-        return ValidationReport(legs=[], output="(no validation commands configured)")
+        return ValidationReport(legs=[], output="(no validation commands configured)",
+                                required=frozenset(must_run or ()))
     chunks: list[str] = []
     legs: list[ValidationLeg] = []
     baseline_failed = baseline_failed or set()
@@ -564,12 +771,24 @@ def run_validation_report(commands: list[str], cwd: Path, *, timeout: int = 1800
         else:
             _add(cmd, LEG_FAILED, rc=proc.returncode)
 
-    report = ValidationReport(legs=legs, output="\n".join(c for c in chunks if c.strip()))
+    report = ValidationReport(legs=legs, output="\n".join(c for c in chunks if c.strip()),
+                              required=frozenset(must_run or ()))
     logger.debug("validation finished: ok=%s across %d command(s) "
                  "(%d failed, %d could not run, %d pre-existing)",
                  report.ok, len(commands), len(report.failed),
                  len(report.infrastructure), len(report.preexisting))
-    if report.stalled:
+    if report.stalled and report.unproven:
+        # A leg DID run here — it just was not one of the legs that had to. Saying
+        # "no command judged the diff" would be false, and this line is what an
+        # operator greps when a task goes red without a failure.
+        logger.error("validation proved nothing about this diff: %d REQUIRED "
+                     "command(s) never ran (%s); the %d command(s) that did run are "
+                     "not the operator's oracle and cannot stand in for it — red as "
+                     "infrastructure, not green on somebody else's check",
+                     len(report.unproven),
+                     trunc(", ".join(lg.command for lg in report.unproven), 160),
+                     len(report.legs) - len(report.unproven))
+    elif report.stalled:
         logger.error("validation proved NOTHING: no command judged the diff "
                      "(%d could not run, %d pre-existing) — reporting red as "
                      "infrastructure rather than passing vacuously",
@@ -832,7 +1051,8 @@ def run_context_validation(ctx: ImplementContext, *,
                                      timeout=timeout, cache_key=ctx.task.id,
                                      git_lock=ctx.git_lock)
     report = run_validation_report(ctx.validation, ctx.worktree, timeout=timeout,
-                                   baseline_failed=baseline)
+                                   baseline_failed=baseline,
+                                   must_run=ctx.operator_validation)
     return _unexcuse_diff_broken_legs(ctx, report, timeout=timeout)
 
 

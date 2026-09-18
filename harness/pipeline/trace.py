@@ -10,7 +10,7 @@ to ``<repo>/.harness/trace.jsonl``:
      "backend": "agent-cli", "ok": true, "duration_s": 212.4,
      "tokens": 48211, "cost_usd": 0.61, ...}
 
-This module docstring is the **authoritative span vocabulary** — 21 types. Adding
+This module docstring is the **authoritative span vocabulary** — 22 types. Adding
 a span means adding it here first; PIPELINE.md's span table and LOGGING.md both
 point at this list, and a type that exists only in a call site is one no
 documented ``jq`` query or ``--type`` filter will ever find.
@@ -59,6 +59,9 @@ Gates
     broke rather than the diff being wrong).
     ``dep_blame`` — the dependency-blame gate fired.
     ``freeze`` — a frozen acceptance test was modified; review fails outright.
+    ``protected_path`` — a dirty path matched a ``protected_paths`` rule
+    (``path``, ``rule``), so the catch-all ``git add -A`` was refused and review
+    failed before the oracle ran; nothing staged, committed or reset.
     ``mutation`` — the mutation gate's score for the change.
     ``review`` — the review gate's verdict (``passed``, ``risk``, ``files``).
 
@@ -70,9 +73,24 @@ Git / delivery
     ``pr`` — a PR was opened or refused.
 
 Fleet
-    ``recovery`` — a provably-crashed task was rolled back and re-armed.
-    ``recovery_skipped`` — a stale-*looking* task was left alone: liveness could
-    not be established, and a rollback needs positive proof of death.
+    ``recovery`` — a provably-crashed task was rolled back and re-armed, with
+    ``reset_outcome`` (``reset`` / ``no-op`` / ``failed`` / ``unknown``),
+    ``reset_ok`` and ``reset_reason`` read back from the tree rather than
+    assumed — only ``reset`` and ``no-op`` leave a state that was proved.
+    ``recovery_skipped`` — a stale-*looking* task was left alone, with
+    ``reason`` naming the gate that withheld it. Recovery is destructive, so
+    every one of these is a refusal to act without positive proof:
+    ``unknown-liveness`` (liveness could not be established, and absence of
+    proof of life is not proof of death), ``claim-held`` (an owner is alive
+    right now — a held flock dies with its holder), ``unclaimable`` (the claim
+    could not be HELD: ``TaskClaim.acquire`` fail-opened on an unopenable
+    ``claim.lock``, and nothing authorises the reset), ``pid-alive-kill-off``
+    (the heartbeat's pid is alive and ``kill_worktree_procs`` is off),
+    ``worktree-busy`` (processes are still running inside the worktree),
+    ``survivors`` (some were still running after a kill pass), ``recent-writes``
+    (a fresh mtime is the only evidence of a writer whose cwd is outside the
+    tree), ``unverified-scan`` (the tree could not be scanned at all, and an
+    unprovable scan is never proof of quiet).
     ``prune`` — a worktree was reclaimed, refused-and-reported, or errored.
 
 Span types are ``snake_case`` without exception: they are jq keys and grep

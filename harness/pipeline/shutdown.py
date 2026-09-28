@@ -13,7 +13,14 @@ So the handler here does four things, in the order that matters:
 1. **Terminate the registered children.** Mandatory, per the detachment above.
    Registration carries the *killer* with the process (see :meth:`_State.killable`),
    so this module never has to know about process groups — ``agent_cli`` passes
-   its own group-wide signaller.
+   its own group-wide signaller. That signal reaches the CLI and whatever stayed
+   in its group, but not tool commands the CLI started in sessions of their own:
+   some agent CLIs exit within about a second of SIGTERM having only TERMed their
+   tool process groups, before their own SIGKILL backstop fires, so a tool process
+   that ignores TERM outlives the CLI. The backend therefore sweeps the worktree
+   by cwd once the call returns and, while anything there is still running or
+   cannot be ruled out, leaves the worktree as it is instead of discarding it
+   (``agent_cli._reclaim_worktree``).
 2. **Set the flag**, which every loop checks (:func:`requested`) at the points
    where starting more work would be wrong: the top of an iteration, right after
    an agent call returns, and inside the retry backoff (:func:`sleep`). The flag

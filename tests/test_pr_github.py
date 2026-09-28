@@ -84,6 +84,10 @@ def gh(monkeypatch, tmp_path):
     monkeypatch.setattr(gitutil, "commits_ahead", lambda repo, base, branch: 1)
     monkeypatch.setattr(gitutil, "head_sha", lambda repo, ref="HEAD": "cafe1234beef")
     monkeypatch.setattr(gitutil, "is_ancestor", lambda cwd, a, d: True)
+    # A faked git proves no worktree either way; the push's ownership gate is
+    # exercised against real repositories in tests/test_markerless_worktrees.py.
+    monkeypatch.setattr(gitutil, "worktree_owner_proof",
+                        lambda path: gitutil.OwnerProof(True))
     # Authenticated by default; individual tests override.
     fake.set("auth", "status", out='{"hosts": {"github.com": [{"active": true}]}}')
     return fake
@@ -133,9 +137,18 @@ def test_already_exists_is_case_insensitive_and_adopts_open_pr(gh, tmp_path):
                'Already Exists:\nhttps://github.com/o/r/pull/3\n')
     gh.set("pr", "list", out='[{"url": "https://github.com/o/r/pull/3", '
                              '"headRefName": "agent/t1", "isCrossRepository": false}]')
-    res = _open(gh, tmp_path)
+    # Adoption re-publishes the attestation, and only over a body harness
+    # wrote for this same task and nobody has edited since (see
+    # tests/test_pr_refresh.py).
+    live = "old\n" + prmod.attestation_trailer("t1", "low", "fedcba987654", "old\n")
+    gh.set("pr", "view", out='{"title": "Do the thing [t1]", "body": "'
+                             + live.replace("\n", "\\n") + '"}')
+    res = _open(gh, tmp_path, body="## body\n- `a.py`\n"
+                                   "<!-- harness:task=t1 risk=low head=cafe1234beef -->\n")
     assert res.ok and res.url == "https://github.com/o/r/pull/3"
     assert "already exists" in res.detail.lower()
+    assert gh.argv_for("pr", "edit")[:4] == ["gh", "pr", "edit",
+                                             "https://github.com/o/r/pull/3"]
 
 
 def test_identical_head_and_base_error_is_not_mistaken_for_a_duplicate(gh, tmp_path):

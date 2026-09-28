@@ -56,6 +56,14 @@ zero verifiers asked and a DEBUG line as the only trace — a failure to run
 reported as a pass. So that case **abstains**, which raises the task to human
 review, naming the manifest entries that have no rendered hunks. ``skip`` survives
 only for the honest version: no diff and no manifest either.
+
+Nor on a call the backend reports it could not make for a reason that is not an
+outage (``OneshotResult.abstain``): the OS refused to exec the verifier because
+its argv is over the exec limit (E2BIG — deterministic, so every sample is
+refused the same way), or a verifier that ran with tools was terminated and left
+processes running in the worktree it judged. When no sample could vote for that
+reason the gate **abstains**, naming it, rather than reporting "no parseable
+verdict" as a skip.
 """
 
 from __future__ import annotations
@@ -250,11 +258,15 @@ def verify_change(
     confidences: list[float] = []
     reasons: list[str] = []
     errors: list[str] = []          # contract breakages — these must NOT fail open
+    refusals: list[str] = []        # calls refused outright — nor may these
     first_raw = ""
     for k in range(n):
-        answer, structured, err = _one_answer(ask, ask_structured, prompt, k, n)
+        answer, structured, err, refused = _one_answer(ask, ask_structured, prompt, k, n)
         if k == 0:
             first_raw = answer
+        if refused:
+            refusals.append(refused)
+            continue
         if err:
             errors.append(err)
             continue
@@ -290,6 +302,8 @@ def verify_change(
             return VerifierReport(
                 verdict="fail", raw=first_raw[:2000], error=errors[0],
                 reasons=_dedup(errors))
+        if refusals:
+            return _refused_call_abstain(refusals, n)
         logger.info("verifier: no parseable verdict from %d sample(s) — failing open "
                     "(skip, does not block)", n)
         return VerifierReport(verdict="skip", raw=first_raw[:2000],
@@ -465,6 +479,27 @@ def _unrendered_change_abstain(file_manifest: str) -> VerifierReport:
               "(a file whose content is not UTF-8 renders as an empty chunk), so no "
               "verifier was asked and nothing was judged. Abstaining to a human "
               "rather than reporting a gate that never ran as a pass"],
+    )
+
+
+def _refused_call_abstain(refusals: list[str], n: int) -> VerifierReport:
+    """The verdict when no sample voted because the calls were refused outright.
+
+    ABSTAIN, as in :func:`_unrendered_change_abstain`: the backend reported that
+    the call could not be made for a reason that is not an outage — the OS would
+    not exec an argv this large (E2BIG, refused the same way on every sample), or
+    a verifier with tools left processes running in the worktree it judged. No
+    verifier judged the change, and ``skip`` would report that as a pass.
+    """
+    reasons = _dedup(refusals)
+    logger.warning("verifier ABSTAIN: %d of %d sample(s) could not be asked and "
+                   "none voted — %s", len(refusals), n, reasons[0])
+    return VerifierReport(
+        verdict="abstain",
+        reasons=[f"{len(refusals)} of {n} verifier sample(s) could not be asked and "
+                 f"no sample voted, so nothing judged this change: {reason} — "
+                 f"abstaining to a human rather than reporting a gate that never "
+                 f"ran as a pass" for reason in reasons],
     )
 
 
@@ -645,14 +680,17 @@ def _name_list(paths: list[str], limit: int = 8) -> str:
 
 
 def _one_answer(ask: Ask | None, ask_structured: AskStructured | None,
-                prompt: str, k: int, n: int) -> tuple[str, dict | None, str]:
-    """Run ONE verifier sample. Returns ``(text, structured, error)``.
+                prompt: str, k: int, n: int) -> tuple[str, dict | None, str, str]:
+    """Run ONE verifier sample. Returns ``(text, structured, error, refused)``.
 
     *error* is non-empty ONLY for the case the gate must not fail open on: the
     backend enforced :data:`VERDICT_SCHEMA` and the answer still did not conform.
-    Infrastructure failures (backend unavailable, launch failure, timeout,
-    non-zero exit, an exception) return ``("", None, "")`` — no vote, no error,
-    gate skips, exactly as before.
+    *refused* is non-empty when the call could not be made and the backend says
+    that must not read as a skip either (``OneshotResult.abstain`` — an E2BIG
+    launch refusal, or a verifier with tools that left processes running); it
+    carries the backend's detail. Infrastructure failures (backend unavailable,
+    launch failure, timeout, non-zero exit, an exception) return
+    ``("", None, "", "")`` — no vote, no error, gate skips, exactly as before.
     """
     if ask_structured is not None:
         try:
@@ -660,27 +698,34 @@ def _one_answer(ask: Ask | None, ask_structured: AskStructured | None,
         except Exception as exc:  # noqa: BLE001 — the verifier must never crash review
             logger.warning("verifier sample %d/%d raised (%s: %s) — treated as no vote",
                            k + 1, n, type(exc).__name__, exc)
-            return "", None, ""
+            return "", None, "", ""
+        if res is not None and not getattr(res, "ran", False) \
+                and getattr(res, "abstain", False):
+            refused = (getattr(res, "detail", "")
+                       or "the one-shot call was refused")
+            logger.warning("verifier sample %d/%d: the one-shot call was refused (%s) "
+                           "— no vote, and not a skip", k + 1, n, refused)
+            return "", None, "", refused
         if res is None or not getattr(res, "ran", False):
             logger.debug("verifier sample %d/%d: the one-shot call did not complete "
                          "(%s) — no vote, gate fails open", k + 1, n,
                          getattr(res, "detail", "") or "backend unavailable")
-            return "", None, ""
+            return "", None, "", ""
         text = getattr(res, "text", "") or ""
         data = getattr(res, "structured", None)
         if isinstance(data, dict):
-            return text, data, ""
+            return text, data, "", ""
         if getattr(res, "schema_enforced", False):
             return text, None, (
                 "the verifier backend enforced harness's answer schema but returned no "
-                "conforming object — the gate's output contract has drifted")
-        return text, None, ""       # no schema knob: fall back to the prose trailer
+                "conforming object — the gate's output contract has drifted"), ""
+        return text, None, "", ""   # no schema knob: fall back to the prose trailer
     try:
-        return (ask(prompt) if ask else "") or "", None, ""
+        return (ask(prompt) if ask else "") or "", None, "", ""
     except Exception as exc:  # noqa: BLE001 — the verifier must never crash review
         logger.warning("verifier sample %d/%d raised (%s: %s) — treated as no vote",
                        k + 1, n, type(exc).__name__, exc)
-        return "", None, ""
+        return "", None, "", ""
 
 
 def _parse_structured(data: dict) -> tuple[str | None, float | None, list[str]]:

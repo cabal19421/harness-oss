@@ -37,17 +37,21 @@ ide-handoff or fails it loudly — it never silently does nothing).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from harness.log import fmt_cmd, get_logger, redact, trunc
 
-from .. import gitutil, shutdown
+from .. import gitutil, procutil, shutdown
 from ..looptools import (
     LoopBudget,
     ProgressLedger,
@@ -95,6 +99,22 @@ _CLI_HELP_CACHE: dict[str, str] = {}
 #: over-long detail merely reads badly.
 _CLASSIFY_TAIL_CHARS = 4000
 _DETAIL_TAIL_CHARS = 400
+
+#: Wall-clock ceiling of one implement invocation, and of one verifier one-shot.
+#: ``worktree_stale_seconds`` is sized against the first — raise that with it.
+_AGENT_TIMEOUT_SECONDS = 3600
+_ONESHOT_TIMEOUT_SECONDS = 600
+
+#: Byte bounds on the prompt's feedback section. The whole prompt crosses the
+#: exec boundary as ONE argv element, which Linux caps at 32 pages
+#: (MAX_ARG_STRLEN), while ``base._tail`` bounds a validation leg by LINES only:
+#: one 200 KB line of failing output made the next invocation unexecutable. The
+#: section is harness-generated (validation output + grounding findings) and the
+#: agent can regenerate it by running the oracle, so clipping it is safe; the
+#: task description is the instruction and is never clipped. The total keeps a
+#: typical three-leg failure (~40 lines × 3 × ~150 bytes) whole.
+_FEEDBACK_LINE_BYTES = 2 * 1024
+_FEEDBACK_BYTES = 24 * 1024
 
 #: Flags a gate agent needs so the repository it is judging cannot configure it.
 #: Both are required together under ``untrusted_designs``: ``--setting-sources``
@@ -308,9 +328,23 @@ def _oracle_allowed_tools(ctx: ImplementContext) -> str:
     return _allowed_tools_arg(cfg, [*ctx.validation, *(c for c in configured if c)])
 
 
-def _agent_env() -> dict[str, str]:
-    """Environment for an agent invocation (inherit the process environment)."""
-    return dict(os.environ)
+def _agent_env(worktree: Path | str | None = None) -> dict[str, str]:
+    """Environment for an agent invocation run in *worktree*.
+
+    Inherits the process environment and — given *worktree* — sets
+    ``GIT_CEILING_DIRECTORIES`` to its parent (any inherited ceilings kept
+    behind it). The agent's own git commands never pass through gitutil's
+    ownership proof, so in a worktree that lost its ``.git`` marker they would
+    otherwise resolve the ENCLOSING repository — the superproject, for a
+    submodule target — and commit, stash or reset there. The ceiling only
+    bounds discovery upward from the working directory: a healthy linked
+    worktree finds its own ``.git`` file first and follows it to the main
+    repository's git dir as before.
+    """
+    env = dict(os.environ)
+    if worktree is not None:
+        env["GIT_CEILING_DIRECTORIES"] = gitutil._ceiling_for(gitutil.pwd_for(worktree))
+    return env
 
 
 class AgentCliBackend(CodingBackend):
@@ -449,8 +483,24 @@ class AgentCliBackend(CodingBackend):
                 # the call above returned. Record the interruption rather than
                 # blaming the agent for a failure the operator caused — and
                 # checked AFTER budget.add so the killed call's spend still counts.
-                return self._interrupted(ctx, i, last_oracle, runlog,
-                                         preserve_worktree=preserve)
+                return self._interrupted(
+                    ctx, i, last_oracle, runlog,
+                    preserve_worktree=preserve or run.preserve_worktree,
+                    live=run.detail if run.preserve_worktree else "")
+            if run.preserve_worktree:
+                # _run_agent could not prove the tree quiet after terminating
+                # the agent: a retry would launch a second writer into it, and
+                # any discard would reset under the first.
+                logger.error("stopping %s on iteration %d without a retry or a "
+                             "reset — %s", ctx.task.id, i,
+                             trunc(redact(run.detail), 300))
+                runlog.append("abort", "live processes left in the worktree",
+                              detail=run.detail, iteration=i)
+                ctx.log(f"  ⚠️  stopped without a retry or a reset — "
+                        f"{trunc(run.detail, 200)}")
+                return self._stopped(ctx, i, last_oracle, f"stopped — {run.detail}",
+                                     runlog, preserve_worktree=True,
+                                     preserve_reason=run.detail)
             if run.permanent:
                 logger.error("permanent agent error on iteration %d for %s — "
                              "aborting (no retry): %s",
@@ -633,13 +683,17 @@ class AgentCliBackend(CodingBackend):
     class _Run:
         def __init__(self, ok: bool, *, detail: str = "", tokens: int = 0,
                      cost: float = 0.0, permanent: bool = False,
-                     text: str = "") -> None:
+                     text: str = "", preserve_worktree: bool = False) -> None:
             self.ok = ok
             self.detail = detail
             self.tokens = tokens
             self.cost = cost
             self.permanent = permanent
             self.text = text          # the agent's final assistant text (for ABSTAIN)
+            # Set (always with permanent) when processes the terminated agent
+            # started are still running in the worktree, or could not be ruled
+            # out: the loop stops and leaves the tree exactly as it is.
+            self.preserve_worktree = preserve_worktree
 
     def _run_with_retries(self, ctx: ImplementContext, feedback: str,
                           pending_commit_failure: str | None, runlog: RunLog,
@@ -776,19 +830,35 @@ class AgentCliBackend(CodingBackend):
         logger.debug("%s", fmt_cmd(
             [*cmd[:2], f"<prompt: {len(prompt)} chars>", *cmd[3:]],
             cwd=ctx.worktree))
-        # Run the agent in its own process group: the agent CLI spawns
-        # grandchildren (Bash tool commands, MCP servers) that a plain
-        # subprocess.run timeout would orphan — leaving them mutating the
-        # worktree while the loop resets it and launches the next fresh agent
-        # in the same tree.
+        # The agent runs in a session of its own, so a terminal Ctrl-C does not
+        # reach it and a group signal (the timeout's, the shutdown handler's)
+        # reaches the CLI and every child left in its process group. Its tool
+        # commands need not be among them: a CLI may start each in a session of
+        # its own, and some agent CLIs exit within about a second of SIGTERM
+        # having only TERMed their tool process groups — so a tool process that
+        # ignores or outlives TERM survives the CLI, cwd in the worktree. Every
+        # path that terminated the CLI therefore ends in _reclaim_worktree's cwd
+        # sweep before anything retries into the tree or resets it.
+        env = _agent_env(ctx.worktree)
         t0 = time.monotonic()
         try:
             proc = subprocess.Popen(
-                cmd, cwd=str(ctx.worktree), env=_agent_env(),
+                cmd, cwd=str(ctx.worktree), env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True,
             )
         except OSError as exc:
+            if exc.errno == errno.E2BIG:
+                # Deterministic for this argv and environment: every retry is
+                # refused identically, so it must never enter the retry ladder.
+                detail = _e2big_detail("prompt", cmd, env, prompt, [
+                    ("task description", sanitize_design(ctx.task.description)),
+                    ("failure feedback", _clip_feedback(feedback)),
+                ])
+                logger.error("agent CLI launch refused by the OS — classified "
+                             "PERMANENT (the same argv is refused on every "
+                             "attempt): %s", detail)
+                return self._Run(False, detail=detail, permanent=True)
             logger.warning("agent CLI failed to launch (%s: %s) — counted as "
                            "a transient invocation failure",
                            type(exc).__name__, exc)
@@ -796,16 +866,28 @@ class AgentCliBackend(CodingBackend):
         # Registered for the length of the call only: a shutdown signal that
         # arrives now must reach the whole detached group (Ctrl-C cannot — see
         # harness.pipeline.shutdown), and one that arrives after it must not
-        # signal a pid this process no longer owns.
+        # signal a pid this process no longer owns — which is also why the
+        # sweep after a timeout runs outside this block, once the leader is
+        # reaped.
+        timed_out = False
         with shutdown.killable(proc, _signal_process_group):
             try:
-                out, err = proc.communicate(timeout=3600)
+                out, err = proc.communicate(timeout=_AGENT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                logger.warning("agent invocation timed out after 3600s — killing "
-                               "its process group (pid=%s) so orphaned children "
-                               "stop mutating the worktree", proc.pid)
+                logger.warning("agent invocation timed out after %ss — "
+                               "terminating its process group (pid=%s), then "
+                               "sweeping the worktree for the tool processes "
+                               "that signal cannot reach",
+                               _AGENT_TIMEOUT_SECONDS, proc.pid)
                 _kill_process_group(proc)
-                return self._Run(False, detail="timed out after 3600s")
+                timed_out = True
+        if timed_out:
+            why = f"timed out after {_AGENT_TIMEOUT_SECONDS}s"
+            sweep = _reclaim_worktree(ctx)
+            if sweep.busy:
+                return self._Run(False, permanent=True, preserve_worktree=True,
+                                 detail=_live_process_detail(why, sweep))
+            return self._Run(False, detail=why + sweep.note())
 
         tokens, cost = parse_agent_usage(out or "")
         logger.debug("agent CLI exited rc=%s in %.1fs — stdout=%d chars, "
@@ -826,6 +908,22 @@ class AgentCliBackend(CodingBackend):
         # `or denials[:6]` keeps the message no worse than before when the CLI
         # omits tool_input entirely.
         denied_calls = parse_permission_denial_details(out or "") or denials[:6]
+        # A CLI that exited on SIGTERM — the shutdown handler's, or anyone
+        # else's — left behind whatever of its tools no TERM stopped; one
+        # killed by any other signal (the OOM killer's SIGKILL) ran no
+        # teardown at all. Under a shutdown the loop is about to discard the
+        # tree however the CLI exited.
+        sigtermed = proc.returncode in (143, -signal.SIGTERM)
+        reclaimed = ""
+        if sigtermed or proc.returncode < 0 or shutdown.requested():
+            sweep = _reclaim_worktree(ctx)
+            if sweep.busy:
+                return self._Run(False, permanent=True, preserve_worktree=True,
+                                 tokens=tokens, cost=cost,
+                                 detail=_live_process_detail(
+                                     f"the CLI {_how_it_ended(proc.returncode)}",
+                                     sweep))
+            reclaimed = sweep.note()
         if proc.returncode != 0:
             err_text = (err or "").strip()
             out_text = (out or "").strip()
@@ -862,17 +960,21 @@ class AgentCliBackend(CodingBackend):
                 parts.append("stdout tail: "
                              + _tail_elided(redact(out_text), _DETAIL_TAIL_CHARS))
             detail = "\n".join(parts) or "non-zero exit"
-            if proc.returncode in (143, -signal.SIGTERM):
-                # 128+SIGTERM: the CLI does a real teardown on SIGTERM (abort
-                # the turn, kill the Bash process tree, run session-end hooks)
-                # and exits 143. That is a termination somebody asked for, not an
-                # opaque agent error — name it so the log doesn't read as a bug.
+            if sigtermed:
+                # rc 143 encodes SIGTERM as an exit status (128+SIGTERM);
+                # -SIGTERM is a death by the signal itself. A CLI that catches
+                # the signal may first run its own teardown (abort the turn,
+                # TERM each tool command's process group, run session-end hooks)
+                # and exit without waiting for those tools to die. Either way it
+                # is a termination somebody asked for, not an opaque agent error
+                # — name it so the log doesn't read as a bug.
                 logger.warning("agent CLI exited %s — terminated by SIGTERM (harness "
                                "teardown or an operator signal), not an agent error",
                                proc.returncode)
                 return self._Run(False, tokens=tokens, cost=cost,
                                  detail=f"terminated by SIGTERM (rc={proc.returncode}) "
-                                        f"— the agent CLI ran its teardown and exited")
+                                        f"— harness teardown or an operator signal, "
+                                        f"not an agent error{reclaimed}")
             if denials:
                 # Build the actionable block FIRST and give the raw tail only the
                 # budget that is left: slicing the assembled string (as this used
@@ -923,7 +1025,8 @@ class AgentCliBackend(CodingBackend):
             logger.debug("agent CLI non-zero exit classified as %s; detail tail: %s",
                          "permanent" if permanent else "transient",
                          trunc(redact(detail), 300))
-            return self._Run(False, detail=detail, tokens=tokens, cost=cost, permanent=permanent)
+            return self._Run(False, detail=detail + reclaimed, tokens=tokens, cost=cost,
+                             permanent=permanent)
         if denials:
             # The agent finished anyway (it routed around the blocked tool), so
             # this is not a failure — but it is the operator's cue to widen the
@@ -976,7 +1079,8 @@ class AgentCliBackend(CodingBackend):
                 f"{frozen}"
             )
         if feedback:
-            sections.append(f"\n## What is still failing (fix this)\n\n{feedback}")
+            sections.append(f"\n## What is still failing (fix this)\n\n"
+                            f"{_clip_feedback(feedback)}")
         sections.append(
             "\n## If you cannot ground this task\n"
             "If the codebase genuinely lacks the APIs, types, or evidence to "
@@ -990,10 +1094,14 @@ class AgentCliBackend(CodingBackend):
         sections.append(
             "\n## Instructions\n"
             "1. Make the smallest change that satisfies the task and the oracle.\n"
-            "2. Run the oracle commands yourself.\n"
-            "3. Commit your work with git ONLY once every oracle command passes. "
+            "2. Do not create, edit or delete AGENTS.md, GEMINI.md or anything "
+            "under .gemini/ unless this task explicitly asks for it. Iteration "
+            "memory is carried by the harness (the earlier-iterations section), "
+            "not by those files.\n"
+            "3. Run the oracle commands yourself.\n"
+            "4. Commit your work with git ONLY once every oracle command passes. "
             "Do not commit a red result.\n"
-            "4. Then stop."
+            "5. Then stop."
         )
         return "\n".join(sections)
 
@@ -1023,7 +1131,11 @@ class AgentCliBackend(CodingBackend):
         non-conforming answer is drift, not merely "unparseable".
 
         Fails open (``ran=False``) on any launch/timeout/non-zero-exit problem,
-        so the verifier gate can never wedge or crash a review.
+        so the verifier gate can never wedge or crash a review — except the two
+        failures that must not read as a skip, which also set ``abstain``: the
+        OS refused to exec the call (E2BIG — the same argv is refused on every
+        sample), or a call that ran WITH tools was terminated and its tool
+        processes are still running in the worktree it was judging.
         """
         ok, _ = self.available()
         if not ok:
@@ -1044,29 +1156,69 @@ class AgentCliBackend(CodingBackend):
                                "verifier falls back to parsing the prose VERDICT "
                                "trailer, which silently opens the gate on output "
                                "drift", self.cli)
-        cmd += _read_only_flags(self.cli) if read_only else [
-            "--allowedTools", _oracle_allowed_tools(ctx)]
+        tool_flags = (_read_only_flags(self.cli) if read_only
+                      else ["--allowedTools", _oracle_allowed_tools(ctx)])
+        # Only `--tools ""` leaves the call without tool processes to orphan:
+        # the `--allowedTools ""` fallback keeps the built-in (read-only) Bash
+        # set. The operator's own checkout (`harness verify-diff`) is never
+        # swept — its tenants are the operator's editor and shells.
+        sweep_after_termination = (tool_flags[:2] != ["--tools", ""]
+                               and not _is_target_checkout(ctx))
+        cmd += tool_flags
         cmd += suppression
         cmd += _model_flags(self.cli, ctx.config)
         logger.debug("%s", fmt_cmd([*cmd[:2], f"<prompt: {len(prompt)} chars>", *cmd[3:]],
                                    cwd=ctx.worktree))
+        env = _agent_env(ctx.worktree)
         try:
             proc = subprocess.Popen(
-                cmd, cwd=str(ctx.worktree), env=_agent_env(),
+                cmd, cwd=str(ctx.worktree), env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
         except OSError as exc:
+            if exc.errno == errno.E2BIG:
+                detail = _e2big_detail("verifier prompt", cmd, env, prompt,
+                                       _quoted_description(ctx, prompt))
+                logger.error("verifier one-shot agent call refused by the OS — "
+                             "the verifier ABSTAINS instead of skipping (the same "
+                             "argv is refused on every sample): %s", detail)
+                return OneshotResult(ran=False, detail=detail, abstain=True)
             logger.warning("verifier one-shot agent call failed to launch (%s: %s) "
                            "— verifier fails open (skipped)", type(exc).__name__, exc)
             return OneshotResult(ran=False, detail=f"{type(exc).__name__}: {exc}")
+        timed_out = False
         with shutdown.killable(proc, _signal_process_group):
             try:
-                out, _err = proc.communicate(timeout=600)
+                out, _err = proc.communicate(timeout=_ONESHOT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                logger.warning("verifier one-shot agent call timed out — killing it and "
-                               "failing open (verifier skipped)")
+                if sweep_after_termination:
+                    logger.warning("verifier one-shot agent call (with tools) timed "
+                                   "out — killing it, then sweeping the worktree for "
+                                   "the tool processes that signal cannot reach")
+                else:
+                    logger.warning("verifier one-shot agent call timed out — killing "
+                                   "it and failing open (verifier skipped)")
                 _kill_process_group(proc)
-                return OneshotResult(ran=False, detail="timed out after 600s")
+                timed_out = True
+        # Outside the registration: the leader is reaped, and its pid may
+        # already belong to an unrelated process.
+        terminated = (timed_out or shutdown.requested()
+                      or (proc.returncode or 0) < 0 or proc.returncode == 143)
+        if sweep_after_termination and terminated:
+            why = (f"the verifier call timed out after {_ONESHOT_TIMEOUT_SECONDS}s"
+                   if timed_out else
+                   f"the verifier call {_how_it_ended(proc.returncode)}")
+            sweep = _reclaim_worktree(ctx)
+            if sweep.busy:
+                detail = (f"{why}, and {sweep.busy} — it ran with tools, and "
+                          f"what they left running is still in the worktree it "
+                          f"was judging")
+                logger.error("verifier one-shot agent call: %s — the verifier "
+                             "ABSTAINS instead of skipping", detail)
+                return OneshotResult(ran=False, detail=detail, abstain=True)
+        if timed_out:
+            return OneshotResult(ran=False,
+                                 detail=f"timed out after {_ONESHOT_TIMEOUT_SECONDS}s")
         if proc.returncode != 0:
             logger.debug("verifier one-shot agent call exited rc=%s — failing open",
                          proc.returncode)
@@ -1164,7 +1316,8 @@ class AgentCliBackend(CodingBackend):
     def _interrupted(self, ctx: ImplementContext, iterations: int,
                      last_oracle: OracleResult | None,
                      runlog: RunLog, *,
-                     preserve_worktree: bool = False) -> ImplementOutcome:
+                     preserve_worktree: bool = False,
+                     live: str = "") -> ImplementOutcome:
         """Stop cleanly on Ctrl-C / SIGTERM, leaving the task resumable.
 
         The shutdown handler has already terminated the agent's process group
@@ -1175,10 +1328,17 @@ class AgentCliBackend(CodingBackend):
 
         The task is left at ``failed``, which is the resumable status: the next
         run picks it up rather than treating the interruption as terminal.
+
+        ``live`` is the agent's report that processes it started are still
+        running in the worktree (or could not be ruled out); the caller then
+        also sets ``preserve_worktree``, and the reason is carried into the
+        outcome so the operator knows what to stop before resuming.
         """
         signame = shutdown.signame() or "SIGINT"
         detail = (f"interrupted by {signame} after {iterations} iteration(s) — the "
                   f"agent was terminated and the task left resumable")
+        if live:
+            detail += f"; the worktree was left as it is: {live}"
         logger.warning("task %s: %s", ctx.task.id, detail)
         ctx.log(f"  ⏹ interrupted by {signame} after {iterations} iteration(s) — "
                 f"stopping cleanly; the task stays resumable")
@@ -1188,25 +1348,32 @@ class AgentCliBackend(CodingBackend):
                        iteration=iterations, worktree_preserved=preserve_worktree)
         return self._stopped(ctx, iterations, last_oracle, detail, runlog,
                              preserve_worktree=preserve_worktree,
-                             beat_status="aborted")
+                             beat_status="aborted", preserve_reason=live)
 
     def _stopped(self, ctx: ImplementContext, iterations: int,
                  last_oracle: OracleResult | None, detail: str, runlog: RunLog,
                  *, oracle_passed: bool = False,
                  preserve_worktree: bool = False,
-                 beat_status: str = "failed") -> ImplementOutcome:
+                 beat_status: str = "failed",
+                 preserve_reason: str = "") -> ImplementOutcome:
         """Build a terminal ``failed`` outcome, leaving the worktree clean.
 
         ``preserve_worktree`` is set when there is green-but-uncommitted work
         pending repair: discarding it would destroy a passing solution the
         operator could otherwise recover by hand, so the worktree is left as-is.
+        It is also set — with ``preserve_reason`` naming them — when processes
+        the terminated agent started are still running in the worktree, or
+        could not be ruled out: a discard would reset under a live writer.
 
         ``beat_status`` is the last heartbeat this run writes; it defaults to
         the outcome's own ``failed`` but an interruption records ``aborted``, so
         a morning-after reader can tell "the loop gave up" from "somebody
         stopped it".
         """
-        if preserve_worktree:
+        if preserve_worktree and preserve_reason:
+            logger.warning("preserving worktree %s on failure — %s",
+                           ctx.worktree, trunc(redact(preserve_reason), 300))
+        elif preserve_worktree:
             logger.info("preserving worktree %s on failure — green-but-"
                         "uncommitted work is left for manual recovery",
                         ctx.worktree)
@@ -1227,24 +1394,31 @@ class AgentCliBackend(CodingBackend):
 
 
 #: How long each signal in the teardown ladder is given before escalating.
-#: SIGTERM gets 15s, not 5s: an agent CLI that does a REAL teardown on SIGTERM
-#: (abort the turn, kill the Bash process tree, run session-end hooks, exit 143)
-#: needs more than a 5s grace — cutting it short turns an orderly shutdown into
-#: a SIGKILL that leaves the hooks unrun. SIGKILL stays short: nothing can
-#: ignore it.
+#: SIGTERM gets 15s, not 5s: an agent CLI may run its own teardown on SIGTERM
+#: (abort the turn, TERM each tool command's process group, run session-end
+#: hooks, exit 143), and a 5s grace could cut that short with a SIGKILL that
+#: leaves the hooks unrun. The grace bounds the CLI alone: its tool commands may
+#: run in sessions of their own, and some agent CLIs exit within about a second
+#: of SIGTERM having only TERMed their tool process groups — so a tool process
+#: that ignores TERM outlives the whole ladder, and only
+#: :func:`_reclaim_worktree`'s cwd sweep reaches it. SIGKILL stays short:
+#: nothing can ignore it.
 _TEARDOWN_GRACE_SECONDS = {signal.SIGTERM: 15.0, signal.SIGKILL: 5.0}
 
 
 def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
-    """Send *sig* to the agent's whole process group — no wait, no reap.
+    """Send *sig* to the CLI's process group — no wait, no reap.
 
     The shutdown handler's killer (see :mod:`harness.pipeline.shutdown`): it
     runs *inside* a signal handler, in the very thread that is blocked in
     ``proc.communicate()``, so it must not wait for anything. Reaping is left to
     that blocked ``communicate``, which returns as soon as the child dies.
 
-    Falls back to signalling the leader alone when the group cannot be resolved
-    (already reaped) — its grandchildren then cannot be addressed as a group.
+    The group holds the CLI and whichever of its children stayed in it — not the
+    tool commands a CLI may start in sessions of their own and TERM itself on
+    SIGTERM (what that leaves behind is :func:`_reclaim_worktree`'s job). Falls
+    back to signalling the leader alone when the group cannot be resolved
+    (already reaped).
     """
     try:
         pgid = os.getpgid(proc.pid)
@@ -1268,10 +1442,14 @@ def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    """SIGTERM then SIGKILL the agent's whole process group; reap the leader.
+    """SIGTERM then SIGKILL the CLI's process group; reap the leader.
 
-    Killing only the direct child leaves its Bash/MCP grandchildren running —
-    still writing into the worktree the caller is about to reset.
+    Reaches the CLI and whichever of its children stayed in its group, not the
+    tool commands it starts in sessions of their own: a CLI that TERMs those
+    from its SIGTERM handler and exits without waiting for them lets this ladder
+    return in its TERM phase with a TERM-ignoring tool process still alive and
+    cwd'd in the worktree. A caller must follow it with
+    :func:`_reclaim_worktree` before retrying into, or resetting, that tree.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
         _signal_process_group(proc, sig)
@@ -1287,6 +1465,254 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
                          "escalating", proc.pid, sig.name,
                          type(exc).__name__, exc)
             continue
+
+
+#: How long a sweep that may not signal waits for processes the CLI already
+#: TERMed to exit on their own before it calls them live: a CLI can pass TERM
+#: on and exit without waiting. A sweep that may signal needs no wait here —
+#: ``procutil.terminate_in_dir`` grants its own grace before SIGKILL.
+_SWEEP_SETTLE_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class _Sweep:
+    """What :func:`_reclaim_worktree` established about the worktree."""
+
+    #: Why nothing may touch the tree yet — it names the live pids, or says the
+    #: scan could not be completed. ``""`` means the tree was proven quiet.
+    busy: str = ""
+    #: Pids the sweep terminated on the way to proving it quiet.
+    reclaimed: tuple[int, ...] = ()
+
+    def note(self) -> str:
+        """A detail suffix naming what was reclaimed (``""`` when nothing was)."""
+        if not self.reclaimed:
+            return ""
+        return (f" (terminated {len(self.reclaimed)} leftover process(es) in the "
+                f"worktree: pids {_pid_list(self.reclaimed)})")
+
+
+def _pid_list(pids: list[int] | tuple[int, ...]) -> str:
+    """``1, 2, 3 (+5 more)`` — bounded, so a detail stays readable."""
+    shown = ", ".join(str(p) for p in pids[:8])
+    return shown if len(pids) <= 8 else f"{shown} (+{len(pids) - 8} more)"
+
+
+def _is_target_checkout(ctx: ImplementContext) -> bool:
+    """True when *ctx* runs in the target repo itself, not a managed worktree.
+
+    ``harness verify-diff`` judges the checkout in place, so its tenants are the
+    operator's editor and shells. A path that cannot be resolved answers True:
+    this only ever decides that nothing is signalled.
+    """
+    try:
+        return Path(ctx.worktree).resolve() == Path(ctx.config.repo).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def _reclaim_worktree(ctx: ImplementContext) -> _Sweep:
+    """Prove the worktree quiet after the CLI was terminated, reclaiming leftovers.
+
+    Every path that terminated the CLI — its timeout, the shutdown handler, a
+    SIGTERM from anyone else — needs this before anything retries into the tree
+    or resets it: a CLI's SIGTERM teardown may only TERM its tool commands (each
+    in a session of its own, beyond any signal to the CLI's group) and exit
+    without waiting for them, so a tool process that ignores or outlives TERM
+    keeps running here.
+
+    The same cwd-keyed, identity-checked primitives and the same fail-closed
+    reading as ``Supervisor._worktree_quiet``: a scan that could not be
+    completed, a live process that may not be signalled, or a survivor of
+    termination leaves ``busy`` set, and the caller must then neither retry into
+    the tree nor reset it. Signalling follows ``kill_worktree_procs``, and the
+    target repo itself is never signalled. Never raises.
+    """
+    wt = ctx.worktree
+    kill_on = bool(getattr(ctx.config, "kill_worktree_procs", True))
+    may_signal = kill_on and not _is_target_checkout(ctx)
+    pids = procutil.pids_in_dir_strict(wt)
+    if pids and not may_signal:
+        deadline = time.monotonic() + _SWEEP_SETTLE_SECONDS
+        while pids and time.monotonic() < deadline:
+            time.sleep(0.1)
+            pids = procutil.pids_in_dir_strict(wt)
+    if pids is None:
+        logger.warning("the process scan of %s could not be completed after the "
+                       "agent was terminated — the worktree cannot be proven "
+                       "quiet", wt)
+        return _Sweep(busy="the process scan of the worktree could not be "
+                           "completed, so it cannot be proven quiet")
+    if not pids:
+        return _Sweep()
+    if not may_signal:
+        why_not = ("kill_worktree_procs is off" if not kill_on else
+                   "it is the target repo itself, which is never signalled")
+        logger.warning("%d process(es) still running in %s after the agent was "
+                       "terminated (%s) — not signalled: %s",
+                       len(pids), wt, pids, why_not)
+        return _Sweep(busy=f"{len(pids)} process(es) are still running in the "
+                           f"worktree (pids {_pid_list(pids)}) and {why_not}")
+    term = procutil.terminate_in_dir(wt)
+    if term.unverified:
+        logger.warning("a process scan during termination in %s could not be "
+                       "completed — the worktree cannot be proven quiet", wt)
+        return _Sweep(busy="a process scan during termination in the worktree "
+                           "could not be completed, so it cannot be proven quiet")
+    if term.survivors:
+        logger.warning("%d process(es) in %s survived termination (%s)",
+                       len(term.survivors), wt, term.survivors)
+        return _Sweep(busy=f"{len(term.survivors)} process(es) survived "
+                           f"termination in the worktree (pids "
+                           f"{_pid_list(term.survivors)})")
+    if term.signalled:
+        logger.warning("terminated %d process(es) the agent's tools left running "
+                       "in %s after the CLI exited (%s) — kill_worktree_procs is "
+                       "on", len(term.signalled), wt, term.signalled)
+    return _Sweep(reclaimed=tuple(term.signalled))
+
+
+def _how_it_ended(returncode: int | None) -> str:
+    """How a terminated CLI exited, as a predicate: ``was terminated by SIGTERM (rc=143)``."""
+    if returncode in (143, -signal.SIGTERM):
+        return f"was terminated by SIGTERM (rc={returncode})"
+    if returncode is not None and returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"was killed by {name} (rc={returncode})"
+    return f"exited rc={returncode} during a shutdown"
+
+
+def _live_process_detail(why: str, sweep: _Sweep) -> str:
+    """The detail of an agent run stopped on a worktree it could not prove quiet."""
+    return (f"{why}, and {sweep.busy} — stopping without a retry or a reset so "
+            f"nothing races a live writer; the worktree is left exactly as it is "
+            f"(stop those processes, then resume the task)")
+
+
+def _nbytes(text: str) -> int:
+    """Bytes *text* occupies in an exec argv (``subprocess`` uses os.fsencode)."""
+    try:
+        return len(os.fsencode(text))
+    except UnicodeError:
+        return len(text.encode("utf-8", "replace"))
+
+
+def _arg_limits() -> tuple[int | None, int | None]:
+    """``(one argument, argv + environment)`` exec limits in bytes; ``None`` = unknown.
+
+    Linux refuses any single argument over MAX_ARG_STRLEN = 32 pages: 131072
+    bytes on 4 KiB pages, but 512 KiB / 2 MiB on 16 / 64 KiB-page kernels, so it
+    is derived from the page size, never hard-coded. Other platforms (macOS)
+    have no per-argument cap and limit only the total, ARG_MAX.
+    """
+    per_arg: int | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            per_arg = int(os.sysconf("SC_PAGESIZE")) * 32
+        except (AttributeError, OSError, ValueError):
+            per_arg = None
+    total: int | None
+    try:
+        total = int(os.sysconf("SC_ARG_MAX"))
+    except (AttributeError, OSError, ValueError):
+        total = None
+    return (per_arg if per_arg and per_arg > 0 else None,
+            total if total and total > 0 else None)
+
+
+def _shrink_advice(part: str) -> str:
+    if part == "task description":
+        return ("shorten the task description (harness never clips it: it is "
+                "the instruction)")
+    return f"the largest part is the {part}: shrink it"
+
+
+def _e2big_detail(what: str, cmd: list[str], env: dict[str, str], prompt: str,
+                  sections: list[tuple[str, str]]) -> str:
+    """Why exec refused *cmd* with E2BIG: the part to shrink, with byte counts.
+
+    *sections* are named parts of *prompt*; what they do not cover is the rest
+    of the prompt. When the prompt alone is over the per-argument limit its
+    largest part is named; otherwise argv plus environment was over ARG_MAX
+    (always the case on macOS, which has no per-argument cap).
+    """
+    prompt_bytes = _nbytes(prompt)
+    sized = [(name, _nbytes(text)) for name, text in sections if text]
+    sized.append(("rest of the prompt",
+                  max(0, prompt_bytes - sum(size for _, size in sized))))
+    per_arg, total = _arg_limits()
+    if per_arg is not None and prompt_bytes + 1 > per_arg:    # the NUL counts
+        parts = ", ".join(f"{name} {size} bytes" for name, size in sized)
+        largest = max(sized, key=lambda part: part[1])[0]
+        return (f"launch refused by the OS (E2BIG): the {what} is {prompt_bytes} "
+                f"bytes ({parts}), over this system's {per_arg}-byte limit on a "
+                f"single argument (Linux MAX_ARG_STRLEN, 32 pages) — "
+                f"{_shrink_advice(largest)}")
+    env_bytes = sum(_nbytes(k) + _nbytes(v) + 2 for k, v in env.items())
+    argv_bytes = sum(_nbytes(arg) + 1 for arg in cmd)
+    sized.append(("environment", env_bytes))
+    parts = ", ".join(f"{name} {size} bytes" for name, size in sized)
+    largest = max(sized, key=lambda part: part[1])[0]
+    if sys.platform == "darwin":
+        scope = "macOS limits argv and environment together, not each argument"
+    elif per_arg is not None:
+        scope = f"the {what} alone is within the {per_arg}-byte per-argument limit"
+    else:
+        scope = "this platform limits argv and environment together"
+    limit = f"ARG_MAX of {total} bytes" if total else "ARG_MAX"
+    return (f"launch refused by the OS (E2BIG): argv plus environment is "
+            f"{argv_bytes + env_bytes} bytes ({parts}), over the system's "
+            f"{limit} — {scope}; {_shrink_advice(largest)}")
+
+
+def _quoted_description(ctx: ImplementContext, prompt: str) -> list[tuple[str, str]]:
+    """The task description as a named section of *prompt*, when it quotes it."""
+    description = sanitize_design(ctx.task.description or "")
+    return ([("task description", description)]
+            if description and description in prompt else [])
+
+
+def _clip_line_bytes(line: str, limit: int) -> str:
+    """*line* cut to about *limit* UTF-8 bytes, head and tail kept around a marker."""
+    raw = line.encode("utf-8", "replace")
+    if len(raw) <= limit:
+        return line
+    head, tail = limit * 3 // 4, limit // 4
+    return (f"{raw[:head].decode('utf-8', 'ignore')}"
+            f"…(+{len(raw) - head - tail} bytes of this line elided)…"
+            f"{raw[len(raw) - tail:].decode('utf-8', 'ignore')}")
+
+
+def _clip_feedback(feedback: str) -> str:
+    """*feedback* bounded in bytes — each line, then the whole section.
+
+    Byte-identical when nothing is over either bound. Past the total, whole
+    lines are kept from both ends (the first leg's command and head, the last
+    leg's summary and the grounding findings) around one marker.
+    """
+    if not feedback:
+        return feedback
+    lines = [_clip_line_bytes(line, _FEEDBACK_LINE_BYTES)
+             for line in feedback.split("\n")]
+    sizes = [len(line.encode("utf-8", "replace")) + 1 for line in lines]
+    if sum(sizes) - 1 <= _FEEDBACK_BYTES:
+        return "\n".join(lines)
+    half = _FEEDBACK_BYTES // 2
+    head, used = 0, 0
+    while head < len(lines) and used + sizes[head] <= half:
+        used += sizes[head]
+        head += 1
+    tail, used = len(lines), 0
+    while tail > head and used + sizes[tail - 1] <= half:
+        tail -= 1
+        used += sizes[tail]
+    marker = (f"…({tail - head} line(s), {sum(sizes[head:tail])} bytes of feedback "
+              f"elided to keep the prompt launchable — run the oracle commands "
+              f"yourself for the full output)…")
+    return "\n".join([*lines[:head], marker, *lines[tail:]])
 
 
 def _clip(text: str, n: int) -> str:

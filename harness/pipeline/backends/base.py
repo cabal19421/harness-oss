@@ -539,13 +539,18 @@ class ImplementOutcome:
 class OneshotResult:
     """Outcome of a one-shot *judgment* call (the independent verifier's call).
 
-    :meth:`CodingBackend.ask_oneshot` collapses three very different situations
+    :meth:`CodingBackend.ask_oneshot` collapses four very different situations
     into ``""``. The verifier gate has to tell them apart, because only the first
     of them may fail open:
 
     * ``ran=False`` — the call could not be made or completed at all (backend
       unavailable, launch failure, timeout, non-zero exit). Infrastructure: the
       gate skips, exactly like every other fail-open branch in the pipeline.
+    * ``ran=False`` with ``abstain`` set — the call could not be made, for a
+      reason that must NOT read as a skip: the OS refused to exec it (E2BIG,
+      refused identically on every sample), or a call that ran with tools was
+      terminated and its tool processes are still in the worktree it judged.
+      ``detail`` says which; the gate abstains (high risk, human review).
     * ``ran=True`` with ``structured`` set — the backend enforced harness's JSON
       schema on the answer, so the verdict is read out of a validated object and
       no prose is parsed at all.
@@ -564,6 +569,7 @@ class OneshotResult:
     structured: dict | None = None
     schema_enforced: bool = False
     detail: str = ""
+    abstain: bool = False
 
 
 class CodingBackend(ABC):

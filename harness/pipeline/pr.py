@@ -7,12 +7,15 @@ Two strategies behind one interface (chosen per-run with ``--pr``):
   push however you like. Works fully offline.
 * :class:`GitHubPR` — uses the ``gh`` CLI to push the branch and open a real PR.
   Degrades to a clear error (never a crash) when ``gh`` is missing/unauthed or
-  the repo has no GitHub remote.
+  the repo has no GitHub remote. An open PR already on the branch is adopted
+  only once its body attests the reviewed head.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -23,6 +26,7 @@ from pathlib import Path
 from harness.log import fmt_cmd, get_logger, redact, step, trunc
 
 from . import gitutil
+from .sanitize import _HARNESS_MARKER_RE
 
 logger = get_logger(__name__)
 
@@ -32,6 +36,97 @@ class PrResult:
     ok: bool
     url: str = ""
     detail: str = ""
+
+
+# The signature on every PR body harness publishes. ``head`` binds the verdict
+# to the commit that earned it, so a body left behind by a later push reads as
+# attesting an earlier head instead of vouching for the new one; ``body`` is the
+# digest of the text above the trailer, so an adopted PR edited by hand since
+# harness wrote it is told apart from harness's own. The adoption path parses
+# it back and must recognise every trailer harness ever published, including
+# the legacy forms that carried no ``head`` or no ``body``.
+_ATTESTATION_RE = re.compile(
+    r"<!-- harness:task=(?P<task>\S+) risk=(?:low|medium|high)"
+    r"(?: head=(?:[0-9a-f]{7,40}|unknown))?"
+    r"(?: body=(?P<digest>[0-9a-f]{16}))? -->")
+
+
+def _body_digest(text: str) -> str:
+    """Edit detector for the published text above the trailer — not a signature.
+
+    Normalised the way a body round-trips through GitHub (``\\r\\n`` from a
+    browser save, trailing whitespace), so only a real edit changes it. Anyone
+    who can edit the PR can recompute it: it shows that nobody changed the text
+    since harness wrote it, never who wrote it.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    norm = "\n".join(line.rstrip() for line in lines).strip()
+    return hashlib.sha256(norm.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def attestation_trailer(task_id: str, risk: str, reviewed_sha: str,
+                        body: str) -> str:
+    """The marker line that signs *body*, the PR body it is appended to.
+
+    Appended AFTER :func:`~harness.pipeline.sanitize.sanitize_publication` has
+    run over *body* — that ordering is what makes it the only marker in it.
+    A reviewed commit that could not be read is written ``head=unknown``, never
+    omitted: an omitted head is what an unbound legacy trailer looks like.
+    """
+    head = reviewed_sha[:12] if reviewed_sha else "unknown"
+    return (f"<!-- harness:task={task_id} risk={risk} head={head} "
+            f"body={_body_digest(body)} -->\n")
+
+
+def attested_task(body: str) -> str:
+    """The task id *body* is harness's attestation for, or ``""`` if none.
+
+    A body harness assembled ends in exactly one trailer, and nothing above it
+    survives the publication scrub in a marker's shape. No trailer, a trailer
+    that is not the last line (someone wrote below it), or a second marker
+    above it is a body harness cannot claim as its own.
+    """
+    lines = body.replace("\r\n", "\n").rstrip().split("\n")
+    m = _ATTESTATION_RE.fullmatch(lines[-1].strip())
+    if m is None or _HARNESS_MARKER_RE.search("\n".join(lines[:-1])):
+        return ""
+    return m.group("task")
+
+
+def attestation_intact(body: str) -> bool | None:
+    """Is *body* still the text its trailer attests — or ``None``: cannot tell.
+
+    ``False`` when the text above the trailer no longer matches the trailer's
+    digest (a reviewer's note added above it, a paragraph rewritten), ``None``
+    when the trailer carries no digest to check (one published before digests
+    existed) or there is no trailer at all. Unknown is never a proof: a caller
+    about to overwrite the body must read ``None`` as "may have been edited".
+    """
+    lines = body.replace("\r\n", "\n").rstrip().split("\n")
+    m = _ATTESTATION_RE.fullmatch(lines[-1].strip())
+    if m is None or m.group("digest") is None:
+        return None
+    return _body_digest("\n".join(lines[:-1])) == m.group("digest")
+
+
+def _unowned_push(worktree: Path, branch: str) -> PrResult | None:
+    """The refusal to push *branch* from *worktree*, or ``None`` when it may run.
+
+    Both pushes — the plain one and the lease-guarded retry — run IN the
+    worktree, so they need the proof every destructive gitutil helper takes
+    (:func:`gitutil.worktree_owner_proof`): a tree that lost its ``.git``
+    marker resolves the ENCLOSING repository, and a push there publishes that
+    repository's same-named branch (``-u`` also writes its upstream config).
+    Asked here, at each push, rather than inside
+    :func:`gitutil.force_push_with_lease`, whose contract stays the lease.
+    """
+    proof = gitutil.worktree_owner_proof(worktree)
+    if proof.ok:
+        return None
+    detail = (f"refusing to push {branch!r} from {worktree}: it is not provably "
+              f"its own repository — {proof.reason}")
+    logger.error("github PR not opened: %s", detail)
+    return PrResult(ok=False, detail=detail)
 
 
 def head_bound_to_review(worktree: Path, reviewed_sha: str) -> tuple[bool, str]:
@@ -99,6 +194,10 @@ class PrCreator(ABC):
         Empty (the default) keeps the historical behaviour exactly; a match
         returns a failed :class:`PrResult` instead of committing, leaving index
         and worktree as they were.
+
+        *body* ends in :func:`attestation_trailer`; a strategy that finds a PR
+        already open for *branch* may overwrite only a body attesting the same
+        task and unedited since (:func:`attestation_intact`).
         """
         ...
 
@@ -210,26 +309,38 @@ class GitHubPR(PrCreator):
                            "ahead of %r — nothing to push", branch, base)
             return PrResult(ok=False, detail=f"branch '{branch}' has no commits ahead of '{base}'.")
 
+        refused = _unowned_push(worktree, branch)
+        if refused is not None:
+            return refused
         logger.debug("%s", fmt_cmd(["git", "push", "-u", "origin", branch],
                                    cwd=worktree))
-        push = gitutil.git(["push", "-u", "origin", branch], cwd=worktree, timeout=300)
+        # Confined like the destructive helpers: a marker lost after the proof
+        # above still cannot send the push to an enclosing repository.
+        push = gitutil.git(["push", "-u", "origin", branch], cwd=worktree,
+                           timeout=300, confine=True)
         if not push.ok:
             logger.warning("push of %r rejected (rc=%d): %s — evaluating safe "
                            "retry", branch, push.code,
                            trunc(redact(push.err or push.out), 300))
+            # Re-proven: the first push can take minutes.
+            refused = _unowned_push(worktree, branch)
+            if refused is not None:
+                return refused
             push = self._safe_repush(worktree, branch, push)
             if not push.ok:
                 logger.warning("push of %r still failing after retry decision "
                                "(rc=%d) — PR not opened", branch, push.code)
                 return PrResult(ok=False, detail=f"git push failed: {push.err or push.out}")
 
-        # Idempotent on re-run: if a PR for this branch already exists (a prior
-        # run created it but didn't record 'done'), treat it as success.
+        # Idempotent on re-run, but adoption is not success by itself: the new
+        # head is already on the remote, so the PR must be made to attest it.
         existing = self._existing_pr(repo, branch)
         if existing:
-            logger.info("PR already exists for branch %r: %s — adopting as "
-                        "success (idempotent re-run)", branch, existing)
-            return PrResult(ok=True, url=existing, detail="PR already exists for branch")
+            logger.info("PR already exists for branch %r: %s — adopting it once "
+                        "its body attests the reviewed head",
+                        branch, existing)
+            return self._refresh_adopted(repo, existing, branch=branch,
+                                         body=body)
 
         # The explicit `--head` is LOAD-BEARING, not cosmetic: a non-empty
         # HeadBranch makes gh return `skipPushRefs{}` and bypass
@@ -269,8 +380,10 @@ class GitHubPR(PrCreator):
                 existing = self._existing_pr(repo, branch)
                 if existing:
                     logger.info("PR already exists for branch %r: %s — adopting "
-                                "as success", branch, existing)
-                    return PrResult(ok=True, url=existing, detail="PR already exists for branch")
+                                "it once its body attests the reviewed head",
+                                branch, existing)
+                    return self._refresh_adopted(repo, existing, branch=branch,
+                                                 body=body)
             logger.warning("gh pr create failed (rc=%d): %s — PR not opened",
                            proc.returncode, trunc(redact(err), 300))
             return PrResult(ok=False, detail=err[:500])
@@ -519,6 +632,139 @@ class GitHubPR(PrCreator):
                 return url
         logger.debug("existing-PR probe for %r → (none open)", branch)
         return ""
+
+    def _refresh_adopted(self, repo: Path, url: str, *, branch: str,
+                         body: str) -> PrResult:
+        """Make an adopted open PR attest the reviewed head, or fail closed.
+
+        Adoption happens with a NEW head already pushed onto the PR's branch —
+        a ``requeue --force``d task re-run on its intact branch, or a crash
+        between ``gh pr create`` and saving ``done`` followed by a re-review.
+        The live body still attests whatever head it was written for (its risk
+        level, oracle, changed files), and the PR is the one place a human is
+        guaranteed to look, so the task may only be recorded done once that
+        attestation is current.
+
+        Only a body harness published for THIS task, unedited since, is
+        overwritten: the live body and *body* must both be attestations of the
+        same task (:func:`attested_task`), and the live text above the trailer
+        must still match the trailer's digest (:func:`attestation_intact`).
+        ``_existing_pr`` adopts any same-repo open PR on the branch, including
+        one a human opened by hand; a human's narrative — a whole PR, or a note
+        added to harness's — is reported, never clobbered. The title is never
+        re-published: it attests nothing, and whoever set it last keeps it.
+
+        Every outcome that cannot prove the refresh — a live PR that cannot be
+        read, is not ours or was edited, or an edit that fails — returns
+        ``ok=False`` WITH the URL, which the orchestrator records as
+        ``review``, never ``done``.
+        """
+        stale = "it still attests an earlier head"
+        ours = attested_task(body)
+        if not ours:
+            detail = (f"open PR {url} was adopted but the body to publish carries "
+                      "no harness attestation, so nothing ties the live PR to "
+                      f"this task — not overwritten; {stale}")
+            logger.error("adopted PR %s NOT refreshed: %s", url, detail)
+            return PrResult(ok=False, url=url, detail=detail)
+        live = self._live_pr(repo, url)
+        if live is None:
+            detail = (f"open PR {url} was adopted but its live title/body could "
+                      "not be read, so harness cannot tell whether it wrote "
+                      f"them — not overwritten; {stale}")
+            logger.warning("adopted PR %s NOT refreshed (fail-closed): %s", url, detail)
+            return PrResult(ok=False, url=url, detail=detail)
+        _live_title, live_body = live
+        owner = attested_task(live_body)
+        if owner != ours:
+            detail = (f"open PR {url} on {branch!r} does not end in task {ours}'s "
+                      f"harness attestation (found: "
+                      f"{'task ' + trunc(owner, 60) if owner else 'none'}) — refusing to "
+                      "overwrite a PR body harness did not write for this task; "
+                      "it does not attest the reviewed head. Review it by hand, "
+                      "or close it and re-run.")
+            logger.error("adopted PR %s NOT refreshed: %s", url, detail)
+            return PrResult(ok=False, url=url, detail=detail)
+        if live_body.replace("\r\n", "\n").strip() == body.strip():
+            logger.info("adopted PR %s already carries this exact body — its "
+                        "attestation is current, nothing to refresh", url)
+            return PrResult(ok=True, url=url, detail="PR already exists for "
+                            "branch; it already attests the reviewed head")
+        intact = attestation_intact(live_body)
+        if not intact:
+            why = ("its text above the trailer was edited after harness "
+                   "published it (it no longer matches the trailer's digest)"
+                   if intact is False else
+                   "its trailer predates body digests, so harness cannot prove "
+                   "nobody has edited it")
+            detail = (f"open PR {url} on {branch!r} is task {ours}'s, but {why} "
+                      f"— not overwritten; {stale}. Review it by hand, or close "
+                      "it and re-run.")
+            logger.error("adopted PR %s NOT refreshed: %s", url, detail)
+            return PrResult(ok=False, url=url, detail=detail)
+
+        # Body on STDIN for the same reasons as `gh pr create` above. No
+        # `--title`: the live title is kept, whoever set it.
+        argv = ["gh", "pr", "edit", url, "--body-file", "-"]
+        logger.debug("%s", redact(fmt_cmd(argv, cwd=repo))
+                     + f"  <body elided: {len(body)} chars on stdin>")
+        try:
+            with step(logger, "gh pr edit (refresh adopted PR)", url=url):
+                proc = subprocess.run(argv, cwd=str(repo), input=body, text=True,
+                                      capture_output=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("gh pr edit failed to execute (%s: %s) — adopted PR %s "
+                           "NOT refreshed; failing closed", type(exc).__name__,
+                           exc, url)
+            return PrResult(ok=False, url=url, detail=(
+                f"open PR {url} was adopted but its body could not be refreshed "
+                f"for the reviewed head (gh pr edit: {type(exc).__name__}: "
+                f"{trunc(redact(str(exc)), 160)}); {stale}"))
+        logger.debug("gh pr edit rc=%d", proc.returncode)
+        if proc.returncode != 0:
+            err = trunc(redact((proc.stderr or proc.stdout or "").strip()), 200)
+            logger.warning("gh pr edit failed (rc=%d): %s — adopted PR %s NOT "
+                           "refreshed; failing closed", proc.returncode, err, url)
+            return PrResult(ok=False, url=url, detail=(
+                f"open PR {url} was adopted but its body could not be refreshed "
+                f"for the reviewed head (gh pr edit rc={proc.returncode}: {err}); "
+                f"{stale}"))
+        logger.info("PR adopted (mode=github): %s — body refreshed to attest "
+                    "the reviewed head", url)
+        return PrResult(ok=True, url=url, detail="PR already exists for branch; "
+                        "body refreshed for the reviewed head")
+
+    @staticmethod
+    def _live_pr(repo: Path, url: str) -> tuple[str, str] | None:
+        """The open PR's live ``(title, body)``, or ``None`` when unreadable."""
+        try:
+            with step(logger, "gh pr view (adopted-PR ownership probe)", url=url):
+                view = subprocess.run(
+                    ["gh", "pr", "view", url, "--json", "title,body"],
+                    cwd=str(repo), capture_output=True, text=True, timeout=60,
+                    check=False,
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("adopted-PR probe for %s swallowed %s: %s — live body "
+                           "unknown", url, type(exc).__name__, exc)
+            return None
+        if view.returncode != 0:
+            logger.warning("adopted-PR probe for %s failed (rc=%d): %s — live body "
+                           "unknown", url, view.returncode,
+                           trunc(redact((view.stderr or view.stdout or "").strip()), 200))
+            return None
+        raw = (view.stdout or "").strip()
+        try:
+            payload = json.loads(raw) if raw else None
+        except ValueError:
+            payload = None
+        title = payload.get("title") if isinstance(payload, dict) else None
+        body = payload.get("body") if isinstance(payload, dict) else None
+        if not isinstance(title, str) or not isinstance(body, str):
+            logger.warning("adopted-PR probe for %s returned no readable title/body "
+                           "(%s) — live body unknown", url, trunc(redact(raw), 120))
+            return None
+        return title, body
 
 
 def get_pr_creator(mode: str) -> PrCreator:

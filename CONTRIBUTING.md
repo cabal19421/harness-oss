@@ -194,7 +194,9 @@ harness/
 │   ├── test_detached_children.py  test_publication_guards.py
 │   ├── test_recovery_integrity.py  test_ref_safety.py
 │   ├── test_run_entry_guards.py  test_untrusted_gates.py
-│   └── test_verifier_manifest_guard.py  test_worktree_process_safety.py
+│   ├── test_verifier_manifest_guard.py  test_worktree_process_safety.py
+│   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
+│   └── test_pr_refresh.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
 ├── loopeng/                    # Shell-script loop the pipeline grew from
@@ -476,7 +478,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 1033 passing, 1 skipped at the time of writing
+# Run all tests — 1160 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -618,7 +620,7 @@ Harness has two observability channels (full guide in **[LOGGING.md](LOGGING.md)
    | If you change… | Also update |
    |---|---|
    | a `PipelineConfig` field or `HARNESS_*` var | [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference) (+ the README env table if it is one most runs touch) |
-   | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) — and, when the *number* of types changes, the counts quoted in PIPELINE.md's span-traces intro, ARCHITECTURE.md (the `trace.py` module row **and** § Observability) and LOGGING.md's channel table |
+   | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) — and, when the *number* of types changes, the counts quoted in PIPELINE.md's span-traces intro, ARCHITECTURE.md (the `trace.py` module row **and** § Observability) and LOGGING.md (the channel table **and** the span-types rule in § Conventions) |
    | a CLI flag | ARCHITECTURE.md's subcommand tree + the run-book snippet that uses it |
    | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md |
    | the test count | the README badge and the counts in this file |

@@ -136,12 +136,14 @@ class WorktreeClean:
     # two different clean trees and two different unclean ones, and the note,
     # span and record must not have to guess which they are looking at:
     #   "reset"   — a reset ran and the read-back proved the tree clean
-    #   "no-op"   — provably nothing to reset (no worktree recorded, not a git
-    #               repo, no uncommitted changes): clean, but no reset happened
+    #   "no-op"   — provably nothing to reset (no worktree recorded, its
+    #               directory gone, no uncommitted changes): clean, but no
+    #               reset happened
     #   "failed"  — a reset was attempted and the tree is still dirty
-    #   "unknown" — the tree could not be read, so nothing was attempted and
-    #               nothing about its state is claimed (``reset_ok`` is false
-    #               because an unprovable read-back never counts as clean)
+    #   "unknown" — the tree could not be read, or is not provably its own
+    #               repository, so nothing was attempted and nothing about its
+    #               state is claimed (``reset_ok`` is false because an
+    #               unprovable read-back never counts as clean)
     outcome: str = "reset"
 
 
@@ -833,17 +835,32 @@ class Supervisor:
         against the tree: the caller states this outcome in the task note, the
         span and the durable record, so it must never have to infer it from the
         fact that the attempt was made.
+
+        A recorded worktree that is on disk but not provably its own repository
+        (:func:`~harness.pipeline.gitutil.worktree_owner_proof`) is never
+        stashed or reset: with its ``.git`` marker gone, every git command in
+        it resolves the repository that encloses it, and the stash and reset
+        would sweep up THAT repository's uncommitted work. Its outcome is
+        ``unknown`` — its state was not read, nothing was attempted.
         """
         if not task.worktree:
             logger.debug("clean worktree %s: task has no worktree recorded — nothing to clean",
                          task.id)
             return WorktreeClean(outcome="no-op", reason="the task records no worktree")
         wt = Path(task.worktree)
-        if not wt.is_dir() or not gitutil.is_repo(wt):
-            logger.debug("clean worktree %s: %s is missing or not a git repo — nothing to clean",
+        if not wt.is_dir():
+            logger.debug("clean worktree %s: %s is missing — nothing to clean",
                          task.id, wt)
-            return WorktreeClean(outcome="no-op",
-                                 reason=f"{wt} is missing or not a git repo")
+            return WorktreeClean(outcome="no-op", reason=f"{wt} is missing")
+        proof = gitutil.worktree_owner_proof(wt)
+        if not proof.ok:
+            reason = f"not provably the task's own worktree: {proof.reason}"
+            logger.warning("clean worktree %s: %s is %s — nothing was stashed and "
+                           "nothing was reset: neither would act on this worktree",
+                           task.id, wt, reason)
+            self.log(f"  ⚠️  {task.id}: worktree {wt} is not provably its own "
+                     "repository — nothing was stashed or reset")
+            return WorktreeClean(outcome="unknown", reset_ok=False, reason=reason)
         dirty, unreadable = _status_dirty(wt)
         if dirty is None:
             # The entry gate answers the same question as the exit gate and must
@@ -921,8 +938,12 @@ def _status_dirty(wt: Path) -> tuple[int | None, str]:
     severed worktree link) as a tree with nothing in it — and "cannot tell" must
     never collapse into "clean" on a path that then reports a reset. The second
     element is the reason, non-empty only for the unreadable case.
+
+    Discovery is confined to *wt* itself: a tree that loses its ``.git``
+    marker after the ownership proof reads as unreadable, never as the clean
+    or dirty state of the repository that encloses it.
     """
-    res = gitutil.status_porcelain(wt)
+    res = gitutil.status_porcelain(wt, confine=True)
     if not res.ok:
         # git's own diagnosis is worth carrying: it is what tells an operator a
         # corrupt index apart from a worktree whose repo has gone.

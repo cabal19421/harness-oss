@@ -1190,7 +1190,10 @@ class PipelineOrchestrator:
                 self.log(f"  ↻ {task.id}: seeded {len(missing)} new dependency "
                          f"branch(es) — diff base now {seed[:12]}")
                 return seed
-            gitutil.git(["merge", "--abort"], cwd=wt.path)
+            # Guarded like the merge: a merge refused because the worktree is
+            # not provably its own repository must not be followed by an abort
+            # that resolves the enclosing one and aborts ITS merge in progress.
+            gitutil.merge_abort(wt.path)
 
         # Fail SAFE and loudly: merge what we can in place and KEEP the old base.
         # The review diff is then a SUPERSET (it also contains the seeded
@@ -1235,7 +1238,7 @@ class PipelineOrchestrator:
             # sign the seed merge commit and we'd silently skip dependency seeding.
             res = gitutil.merge(wt.path, ref, message=f"seed dependency {branch}")
             if not res.ok:
-                gitutil.git(["merge", "--abort"], cwd=wt.path)
+                gitutil.merge_abort(wt.path)      # guarded — see _seed_dependencies
                 logger.warning("task %s: dependency %r (branch %r) did not merge "
                                "cleanly — merge aborted; implementing WITHOUT its "
                                "code seeded, so the branches may diverge",

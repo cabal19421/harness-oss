@@ -23,7 +23,7 @@ from harness.log import get_logger, redact, step, trunc
 
 from . import gitutil
 from .backends.base import ImplementContext, OracleResult, ValidationReport
-from .pr import PrResult, get_pr_creator, head_bound_to_review
+from .pr import PrResult, attestation_trailer, get_pr_creator, head_bound_to_review
 from .spec import RiskLevel, Task
 from .trace import Tracer
 from .verifier import (
@@ -88,6 +88,48 @@ def _declared(path: str, declared: list[str]) -> bool:
         if p == d or fnmatch.fnmatchcase(p, d) or p.startswith(d.rstrip("/") + "/"):
             return True
     return False
+
+
+# Files an agent session auto-loads from the tree it runs in: memory files at
+# any depth (a nested one loads once a session works in that subtree) and the
+# agent-config locations. Compared casefolded — on a case-insensitive
+# filesystem `gemini.md` IS the file an agent CLI opens as GEMINI.md, and
+# `agents.md` the one it opens as AGENTS.md.
+_AGENT_CONFIG_BASENAMES = frozenset({
+    "agents.md", "gemini.md", ".mcp.json",
+})
+
+
+def _agent_config_paths(changed: list[str]) -> list[str]:
+    """The changed paths that are agent memory/config.
+
+    Basenames in :data:`_AGENT_CONFIG_BASENAMES`, plus anything under a
+    ``.gemini/`` or ``.cursor/rules/`` directory, at any depth — and a path
+    that IS one of those directories, or the ``.cursor`` above ``rules/``. Git
+    records a symlink or a submodule as a single path: ``.gemini -> cfg/``
+    committed beside ``cfg/settings.json`` changes exactly those two paths,
+    and every agent session in the tree then loads ``cfg/`` as ``.gemini/``.
+    """
+    hits: list[str] = []
+    for p in changed:
+        parts = _norm_declared(p).casefold().rstrip("/").split("/")
+        cursor_rules = any(parts[i:i + 2] == [".cursor", "rules"]
+                           for i in range(len(parts) - 1))
+        if (parts[-1] in _AGENT_CONFIG_BASENAMES or parts[-1] == ".cursor"
+                or ".gemini" in parts or cursor_rules):
+            hits.append(p)
+    return hits
+
+
+def _named_explicitly(path: str, declared: list[str]) -> bool:
+    """Does a ``paths:`` entry name *path* itself — not a glob, not a prefix?
+
+    Stricter than :func:`_declared` on purpose: ``(paths: *)`` or ``docs/``
+    covers an agent-memory file only by accident, and the exemption it buys is
+    meant for a design that asked for exactly that edit.
+    """
+    p = _norm_declared(path)
+    return any(_norm_declared(d) == p for d in declared)
 
 
 @dataclass
@@ -198,7 +240,8 @@ class ReviewGate:
 
         risk, reasons = self._assess_risk(
             task, oracle, changed,
-            no_operator_oracle=ctx.untrusted_without_operator_oracle)
+            no_operator_oracle=ctx.untrusted_without_operator_oracle,
+            untrusted_design=bool(ctx.config.untrusted_designs))
         passed = oracle.passed
         extra_feedback: list[str] = []
         mutation_survivors: list[str] = []
@@ -583,7 +626,8 @@ class ReviewGate:
 
     def _assess_risk(self, task: Task, oracle: OracleResult,
                      changed: list[str], *,
-                     no_operator_oracle: bool = False) -> tuple[RiskLevel, list[str]]:
+                     no_operator_oracle: bool = False,
+                     untrusted_design: bool = False) -> tuple[RiskLevel, list[str]]:
         """The advisory risk level for this task, and why.
 
         *no_operator_oracle* is
@@ -593,6 +637,11 @@ class ReviewGate:
         risk is the documented "a human must look at this" channel, and an
         unconfigured oracle is an infrastructure gap, which fails open here like
         every other one.
+
+        *untrusted_design* is ``config.untrusted_designs``. It only withdraws the
+        agent-memory escalator's exemption: under ``--untrusted`` the design's
+        own ``paths:`` is no evidence the operator wanted the repo's agent
+        config changed.
         """
         reasons: list[str] = []
         logger.debug("[%s] risk checks: grounding_ok=%s oracle_passed=%s "
@@ -618,6 +667,34 @@ class ReviewGate:
                          "→ high", task.id)
             reasons.append("task tagged high risk in the design")
             return "high", reasons
+        # Every later agent session whose cwd is this tree loads these files:
+        # the retry after a review FAIL, commit repair, dependants seeded from
+        # this branch, the verifier's own one-shot calls, and every session
+        # after merge. An edit the task never asked for is an instruction that
+        # outlives the run, so it escalates. Never a refusal — a requested edit
+        # is legitimate, and "requested" means the design NAMES the path.
+        agent_cfg = _agent_config_paths(changed)
+        if agent_cfg:
+            declared = [] if untrusted_design else list(task.target_paths or [])
+            undeclared = [p for p in agent_cfg if not _named_explicitly(p, declared)]
+            if undeclared:
+                logger.warning("[%s] risk escalator hit: %d changed path(s) are "
+                               "agent memory/config that every future agent "
+                               "session in this repo loads (%s), and %s → high "
+                               "(advisory: a human must look)", task.id,
+                               len(undeclared), ", ".join(undeclared[:4]),
+                               "under --untrusted the design's own paths: "
+                               "exempts nothing" if untrusted_design else
+                               "the task's paths: does not name them")
+                more = (f" (+{len(undeclared) - 4} more)"
+                        if len(undeclared) > 4 else "")
+                reasons.append("edits agent memory/config that loads into every "
+                               "future agent session: "
+                               + ", ".join(undeclared[:4]) + more)
+                return "high", reasons
+            logger.debug("[%s] agent memory/config path(s) %s are named "
+                         "explicitly by the task's paths: — no escalation",
+                         task.id, ", ".join(agent_cfg[:4]))
         if no_operator_oracle:
             # Last of the hard escalators, so it never displaces a more specific
             # reason — but it is a hard one: no amount of green, and no size of
@@ -673,7 +750,8 @@ class ReviewGate:
         body = self._pr_body(task, risk, oracle, changed,
                              validation=ctx.validation,
                              rejected=ctx.rejected_validation,
-                             no_operator_oracle=ctx.untrusted_without_operator_oracle)
+                             no_operator_oracle=ctx.untrusted_without_operator_oracle,
+                             reviewed_sha=reviewed_sha)
         branch = task.branch or gitutil.current_branch(ctx.worktree)
         # The push/commit is the only repo-level git mutation → serialise it.
         with step(logger, "open PR (includes wait on repo git lock)",
@@ -702,7 +780,8 @@ class ReviewGate:
     def _pr_body(self, task: Task, risk: RiskLevel, oracle: OracleResult,
                  changed: list[str], *, validation: list[str] | None = None,
                  rejected: list[str] | None = None,
-                 no_operator_oracle: bool = False) -> str:
+                 no_operator_oracle: bool = False,
+                 reviewed_sha: str = "") -> str:
         """Render the PR body. *validation* is the oracle that actually **ran**.
 
         It defaults to ``task.validation`` — the list the design declared — but a
@@ -723,6 +802,9 @@ class ReviewGate:
         (``--untrusted`` with nothing configured or autodetected). The PR is the
         one place a human is guaranteed to look, so it says so there rather than
         letting "✅ all green" stand over a suite the reviewed design picked.
+
+        *reviewed_sha* is the commit the verdict is about; the trailer names it,
+        so a body that outlives a later push visibly attests an earlier head.
         """
         from .sanitize import sanitize_publication
 
@@ -772,9 +854,12 @@ Result: {'✅ all green' if oracle.passed else '❌ not green'} — {oracle.grou
         # The attestation trailer is appended AFTER the scrub, and that ordering
         # is what makes it worth anything: a forged `<!-- harness:` in the
         # description is defanged above it, so the marker below is the only one
-        # in the body harness itself wrote.
-        return (f"{sanitize_publication(body)}"
-                f"<!-- harness:task={task.id} risk={risk} -->\n")
+        # in the body harness itself wrote — which is also how an adopted PR is
+        # recognised as harness's own before it may be overwritten. The trailer
+        # also carries the digest of exactly this scrubbed text, which is how an
+        # adopted PR edited by hand since is told apart from harness's own.
+        published = sanitize_publication(body)
+        return f"{published}{attestation_trailer(task.id, risk, reviewed_sha, published)}"
 
     def _summary(self, task: Task, passed: bool, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str],

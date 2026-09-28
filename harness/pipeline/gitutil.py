@@ -93,6 +93,7 @@ def git(
     check: bool = False,
     timeout: int = 120,
     strip: bool = True,
+    confine: bool = False,
 ) -> GitResult:
     """Run ``git <args>`` in *cwd* and return a :class:`GitResult`.
 
@@ -108,6 +109,13 @@ def git(
     named ``" lead.txt"`` or ``"trail2 "`` and git does not quote either shape,
     so the trim eats a real character off the first and last entry — producing
     a name that matches nothing when it is handed back as a pathspec.
+
+    *confine* pins repository discovery to *cwd* itself: git may not climb out
+    of it (``GIT_CEILING_DIRECTORIES`` names its parent), so a directory that
+    has lost its ``.git`` marker fails with "not a git repository" instead of
+    resolving whatever repository encloses it. The destructive helpers set it
+    on the command their :func:`worktree_owner_proof` authorised, so a marker
+    that vanishes between the proof and the command still cannot redirect it.
     """
     # Log lines identify the call by its subcommand (skips ``-c k=v`` hardening
     # flags); the full argv is on the preceding ``$ git …`` line.
@@ -115,6 +123,14 @@ def git(
                args[0] if args else "?")
     logger.debug("%s", redact(fmt_cmd(["git", *args], cwd=cwd)))
     t0 = time.monotonic()
+    pwd = pwd_for(cwd)
+    # PWD is set explicitly, not inherited: our own PWD points at the
+    # ORCHESTRATOR's directory, and anything git spawns that trusts $PWD
+    # (hooks, credential helpers, `sh -c` aliases) would then act on the main
+    # repo instead of this worktree.
+    env = {**os.environ, **_HARDENED_ENV, "PWD": pwd}
+    if confine:
+        env["GIT_CEILING_DIRECTORIES"] = _ceiling_for(pwd)
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -123,11 +139,7 @@ def git(
             text=True,
             timeout=timeout,
             check=False,   # non-zero degrades to a GitResult; GitError is raised below
-            # PWD is set explicitly, not inherited: our own PWD points at the
-            # ORCHESTRATOR's directory, and anything git spawns that trusts $PWD
-            # (hooks, credential helpers, `sh -c` aliases) would then act on the
-            # main repo instead of this worktree.
-            env={**os.environ, **_HARDENED_ENV, "PWD": pwd_for(cwd)},
+            env=env,
         )
     except subprocess.TimeoutExpired:
         res = GitResult(124, "", f"git {' '.join(args)} timed out after {timeout}s")
@@ -152,6 +164,19 @@ def git(
     if check and not res.ok:
         raise GitError(f"git {' '.join(args)} failed ({res.code}): {res.err or res.out}")
     return res
+
+
+def _ceiling_for(pwd: str) -> str:
+    """``GIT_CEILING_DIRECTORIES`` that stops discovery from leaving *pwd*.
+
+    git never excludes the directory it starts in, so naming the PARENT lets it
+    find a ``.git`` in *pwd* itself and nowhere above. Any ceilings the caller
+    already exported are kept after it, in their original order — an empty
+    entry there changes how the entries behind it are resolved.
+    """
+    inherited = os.environ.get("GIT_CEILING_DIRECTORIES", "")
+    parent = str(Path(pwd).parent)
+    return parent + (os.pathsep + inherited if inherited else "")
 
 
 def is_repo(path: Path | str) -> bool:
@@ -203,6 +228,107 @@ def main_repo_root(path: Path | str) -> Path:
         return p
     logger.debug("main_repo_root: %s is inside a linked worktree of %s", p, root)
     return root
+
+
+# ── ownership proof (markerless trees are never resolved) ─────────────────────────
+
+# ``GitResult.code`` for a destructive helper that refused to run because
+# :func:`worktree_owner_proof` failed: git was never invoked. Distinct from
+# git's own codes and from the wrapper's 124/125/127.
+_UNOWNED_RC = 126
+
+
+@dataclass(frozen=True)
+class OwnerProof:
+    """What :func:`worktree_owner_proof` established: ``ok``, or why not."""
+
+    ok: bool
+    reason: str = ""
+
+
+def worktree_owner_proof(path: Path | str) -> OwnerProof:
+    """Positive proof that git run in *path* acts on *path* itself.
+
+    A worktree whose ``.git`` file is gone is still a directory full of files,
+    and git run inside it does not fail: discovery walks UP and resolves
+    whatever repository encloses it — for a submodule target that is the
+    superproject, whose work tree holds the default ``worktree_root``. Every
+    destructive command then lands there instead: a stash and hard reset of
+    the operator's uncommitted work, a catch-all commit on its branch. So both
+    legs below must be answered positively before harness stashes, resets,
+    cleans, stages, commits or merges in a worktree path:
+
+    * **marker** — ``<path>/.git`` exists (a linked worktree's gitfile, or a
+      checkout's own ``.git`` directory);
+    * **toplevel** — ``git rev-parse --show-toplevel`` run in *path* names
+      *path* itself, never a directory above it. The marker alone is not
+      enough: git skips a ``.git`` it cannot use and keeps walking up.
+
+    It establishes where git's discovery lands, not which clone the tree
+    belongs to. A leg that cannot be answered (git absent, a probe that fails,
+    a path that cannot be compared) fails the proof: unknown is never a proof.
+    Read-only, and it never raises.
+    """
+    p = Path(path)
+    dot_git = p / ".git"
+    try:
+        if not p.is_dir():
+            return _unproven(p, f"{p} is not a directory")
+        marker = dot_git.exists()
+    except OSError as exc:
+        return _unproven(p, f"could not stat {dot_git} ({type(exc).__name__}: {exc})")
+    # Runs even when the marker is missing, read-only, to name the repository
+    # a command here would have hit — the most useful thing a refusal can say.
+    # strip=False: the answer is a PATH, and a directory may end in whitespace.
+    res = git(["rev-parse", "--show-toplevel"], cwd=p, strip=False)
+    top = res.out.splitlines()[0] if res.ok and res.out else ""
+    if not marker:
+        where = (f"git run there resolves the enclosing repository at {top}"
+                 if top else "git finds no repository there at all")
+        return _unproven(p, f"{dot_git} does not exist — {where}")
+    if not top:
+        return _unproven(p, "`git rev-parse --show-toplevel` could not be answered "
+                            f"there (rc={res.code}): {_one_line(res.err or res.out)}")
+    if not _same_dir(Path(top), p):
+        return _unproven(p, f"git run there resolves the repository at {top}, "
+                            f"not {p} itself")
+    return OwnerProof(True)
+
+
+def _unproven(path: Path, reason: str) -> OwnerProof:
+    logger.debug("worktree_owner_proof: %s NOT proven — %s", path, reason)
+    return OwnerProof(False, reason)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(trunc(redact(text), 160).split())
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    """Do *a* and *b* name the same directory? An unanswerable stat is a no."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _refuse_unowned(cwd: Path | str, action: str) -> GitResult | None:
+    """The refusal to run ``git <action>`` in *cwd*, or ``None`` when it may run.
+
+    Every destructive helper asks this first, so the loop's rollback and
+    catch-all commit, recovery's stash and reset and warm reuse's reset all
+    share one gate without each caller having to remember it. A refusal is a
+    non-ok :class:`GitResult` (``_UNOWNED_RC``) rather than an exception — this
+    module degrades, and each caller already handles its helper failing.
+    """
+    proof = worktree_owner_proof(cwd)
+    if proof.ok:
+        return None
+    logger.warning("refusing `git %s` in %s: it is not provably its own "
+                   "repository — %s", action, cwd, proof.reason)
+    return GitResult(_UNOWNED_RC, "",
+                     f"refused `git {action}` in {cwd}: not provably its own "
+                     f"repository — {proof.reason}")
 
 
 def current_branch(repo: Path | str) -> str:
@@ -416,13 +542,21 @@ def changed_files(
     lister's output is run through :func:`_unquote_path`, because the quoted
     form (``"caf\\303\\251.txt"``) matches nothing when it is handed straight
     back as a pathspec — which is what every caller does with this list.
+
+    ``--no-renames`` on both diffs, for the reason :func:`status_porcelain_z`
+    gives: with git's default rename detection a rename lists only its
+    DESTINATION, so the source path vanishes from the change. Every consumer
+    matches this list by path — the frozen-acceptance guard, the risk
+    escalators — and renaming a guarded file away (a frozen test, an agent
+    memory file) would slip past all of them. A rename is its delete plus its
+    add, and both are listed.
     """
     paths: set[str] = set()
 
     if base:
         if git(["rev-parse", "--verify", base], cwd=cwd).ok:
-            diff = git(["diff", "--name-only", f"{base}...HEAD"], cwd=cwd,
-                       strip=False)
+            diff = git(["diff", "--name-only", "--no-renames", f"{base}...HEAD"],
+                       cwd=cwd, strip=False)
             paths.update(_path_lines(diff.out))
         else:
             # A missing base ref silently dropping the committed diff reads
@@ -438,7 +572,8 @@ def changed_files(
 
     # Uncommitted (staged + unstaged) changes.
     paths.update(_path_lines(
-        git(["diff", "--name-only", "HEAD"], cwd=cwd, strip=False).out))
+        git(["diff", "--name-only", "--no-renames", "HEAD"], cwd=cwd,
+            strip=False).out))
     # Untracked, non-ignored files.
     paths.update(_path_lines(
         git(["ls-files", "--others", "--exclude-standard"], cwd=cwd,
@@ -637,7 +772,12 @@ def diff_manifest(
 
 
 def add_all(cwd: Path | str) -> GitResult:
-    return git(["add", "-A"], cwd=cwd)
+    # Refused in a directory that is not provably its own repository: `add -A`
+    # there stages the ENCLOSING repository's work, the operator's included.
+    refused = _refuse_unowned(cwd, "add -A")
+    if refused is not None:
+        return refused
+    return git(["add", "-A"], cwd=cwd, confine=True)
 
 
 def status_porcelain_z(cwd: Path | str) -> list[str] | None:
@@ -984,8 +1124,14 @@ def nothing_to_commit(cwd: Path | str) -> bool:
     never possible, or reports a push that had nothing to push.
 
     ``True`` only when the index is provably empty AND no merge/cherry-pick/
-    revert/rebase is waiting to be recorded. Anything unproven returns ``False``
-    — the caller attempts the commit exactly as it always did.
+    revert/rebase is waiting to be recorded AND the index read is *cwd*'s own
+    (:func:`worktree_owner_proof`). Anything unproven returns ``False`` — the
+    caller attempts the commit exactly as it always did. The ownership leg is
+    what keeps a refusal from being swallowed: in a tree that lost its ``.git``
+    marker the index read here is the ENCLOSING repository's, usually empty,
+    and a ``True`` would let the caller skip the commit and report "no commit
+    ahead" — while ``False`` sends it to :func:`commit`, whose own guard
+    refuses with the reason, into the caller's commit-failure handling.
 
     One narrow, deliberate consequence of skipping: ``git commit`` never runs,
     so a pre-commit hook that would have ADDED content to the index (a formatter
@@ -995,6 +1141,11 @@ def nothing_to_commit(cwd: Path | str) -> bool:
     """
     if staged_changes_present(cwd) is not False:
         return False                   # staged content, or cannot tell
+    if not worktree_owner_proof(cwd).ok:
+        logger.debug("index read in %s is empty, but %s is not provably its own "
+                     "repository — not 'nothing to commit': the commit is "
+                     "attempted and its guard reports the refusal", cwd, cwd)
+        return False
     in_progress = in_progress_operation(cwd)
     if in_progress is not None:
         logger.debug("index is empty in %s but %s is in progress — committing "
@@ -1010,8 +1161,13 @@ def nothing_to_commit(cwd: Path | str) -> bool:
 
 
 def commit(cwd: Path | str, message: str) -> GitResult:
+    # Refused in a directory that is not provably its own repository: the
+    # commit would land on whatever branch the ENCLOSING repository has out.
+    refused = _refuse_unowned(cwd, "commit")
+    if refused is not None:
+        return refused
     # ``_NO_SIGN`` keeps an unattended commit from blocking on a GPG passphrase.
-    return git([*_NO_SIGN, "commit", "-m", message], cwd=cwd)
+    return git([*_NO_SIGN, "commit", "-m", message], cwd=cwd, confine=True)
 
 
 def merge(cwd: Path | str, branch: str, *, message: str, no_ff: bool = True) -> GitResult:
@@ -1021,15 +1177,37 @@ def merge(cwd: Path | str, branch: str, *, message: str, no_ff: bool = True) -> 
     must carry ``_NO_SIGN`` or a ``commit.gpgsign=true`` repo blocks the
     unattended run on a passphrase prompt (which ``GIT_TERMINAL_PROMPT=0`` does
     not cover). ``--no-edit`` avoids the editor.
+
+    Refused (non-ok, ``_UNOWNED_RC``) unless *cwd* is provably its own
+    repository — see :func:`worktree_owner_proof`.
     """
+    refused = _refuse_unowned(cwd, "merge")
+    if refused is not None:
+        return refused
     args = [*_NO_SIGN, "merge"]
     if no_ff:
         args.append("--no-ff")
     args += ["--no-edit", branch, "-m", message]
-    return git(args, cwd=cwd)
+    return git(args, cwd=cwd, confine=True)
 
 
-def status_porcelain(cwd: Path | str) -> GitResult:
+def merge_abort(cwd: Path | str) -> GitResult:
+    """``git merge --abort`` after a failed :func:`merge` — guarded like it.
+
+    The seed merge's failure path runs it after ANY failed merge, including one
+    :func:`merge` refused because *cwd* is not provably its own repository.
+    Unguarded, the abort would then resolve the ENCLOSING repository and abort
+    whatever merge is in progress there — the operator's own. Refused (non-ok,
+    ``_UNOWNED_RC``) on the same proof, and confined like every destructive
+    helper.
+    """
+    refused = _refuse_unowned(cwd, "merge --abort")
+    if refused is not None:
+        return refused
+    return git(["merge", "--abort"], cwd=cwd, confine=True)
+
+
+def status_porcelain(cwd: Path | str, *, confine: bool = False) -> GitResult:
     """``git status --porcelain`` with the config-independence flags pinned.
 
     The single place those flags live. Every reader that asks "is this tree
@@ -1038,10 +1216,14 @@ def status_porcelain(cwd: Path | str) -> GitResult:
     still considers dirty. Returns the raw :class:`GitResult` so a caller that
     needs to tell "clean" from "could not read" (rc≠0) still can.
 
+    *confine* (see :func:`git`) makes a tree without its own ``.git`` marker
+    an unreadable one (rc≠0) rather than a read of the repository enclosing it
+    — what a read-back that certifies a reset of THIS tree needs.
+
     See :func:`working_tree_dirty` for what each flag is overriding and why.
     """
     return git(["status", "--porcelain", "--untracked-files=normal",
-                "--ignore-submodules=none"], cwd=cwd)
+                "--ignore-submodules=none"], cwd=cwd, confine=confine)
 
 
 def working_tree_dirty(cwd: Path | str) -> bool:
@@ -1074,8 +1256,19 @@ def working_tree_dirty(cwd: Path | str) -> bool:
 
 
 def reset_hard(cwd: Path | str, ref: str = "HEAD") -> GitResult:
-    """``git reset --hard <ref>`` — discard tracked changes in the worktree."""
-    return git(["reset", "--hard", ref], cwd=cwd)
+    """``git reset --hard <ref>`` — discard tracked changes in the worktree.
+
+    Refused (non-ok, ``_UNOWNED_RC``) unless *cwd* is provably its own
+    repository — see :func:`worktree_owner_proof`.
+    """
+    refused = _refuse_unowned(cwd, f"reset --hard {ref}")
+    if refused is not None:
+        return refused
+    return _reset_hard(cwd, ref)
+
+
+def _reset_hard(cwd: Path | str, ref: str) -> GitResult:
+    return git(["reset", "--hard", ref], cwd=cwd, confine=True)
 
 
 def clean_untracked(cwd: Path | str, *, keep_ignored: bool = True) -> GitResult:
@@ -1084,9 +1277,19 @@ def clean_untracked(cwd: Path | str, *, keep_ignored: bool = True) -> GitResult:
     *keep_ignored* (default) drops ``-x`` so git-ignored paths (``node_modules``,
     ``.venv``, build caches) survive — this is what makes a reused worktree
     "warm" instead of forcing a cold dependency reinstall every task.
+
+    Refused (non-ok, ``_UNOWNED_RC``) unless *cwd* is provably its own
+    repository — see :func:`worktree_owner_proof`.
     """
+    refused = _refuse_unowned(cwd, "clean")
+    if refused is not None:
+        return refused
+    return _clean_untracked(cwd, keep_ignored=keep_ignored)
+
+
+def _clean_untracked(cwd: Path | str, *, keep_ignored: bool) -> GitResult:
     args = ["clean", "-fd"] if keep_ignored else ["clean", "-fdx"]
-    return git(args, cwd=cwd)
+    return git(args, cwd=cwd, confine=True)
 
 
 def stash_push(cwd: Path | str, message: str, *, include_untracked: bool = True) -> str | None:
@@ -1099,17 +1302,23 @@ def stash_push(cwd: Path | str, message: str, *, include_untracked: bool = True)
     was nothing to stash or git refused — the caller continues either way,
     because failing to preserve is not a reason to fail recovery.
 
+    Also ``None``, with nothing run, when *cwd* is not provably its own
+    repository (:func:`worktree_owner_proof`): the stash would sweep up the
+    ENCLOSING repository's uncommitted work instead.
+
     ``_NO_SIGN`` matters: ``git stash`` writes commits, so a repo with
     ``commit.gpgsign=true`` would otherwise block on a passphrase prompt.
     """
-    if not git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd=cwd).ok:
+    if _refuse_unowned(cwd, "stash push") is not None:
+        return None
+    if not git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd=cwd, confine=True).ok:
         logger.debug("stash_push in %s: no commit on HEAD yet — nothing stashable", cwd)
         return None
     args = [*_NO_SIGN, "stash", "push"]
     if include_untracked:
         args.append("--include-untracked")
     args += ["-m", message]
-    res = git(args, cwd=cwd)
+    res = git(args, cwd=cwd, confine=True)
     if not res.ok:
         logger.warning("stash_push: git stash push failed in %s (rc=%s): %s — "
                        "uncommitted changes were NOT preserved",
@@ -1118,7 +1327,7 @@ def stash_push(cwd: Path | str, message: str, *, include_untracked: bool = True)
     if "No local changes" in res.out:
         logger.debug("stash_push in %s: git reported no local changes to save", cwd)
         return None
-    sha = git(["rev-parse", "--verify", "refs/stash"], cwd=cwd).out
+    sha = git(["rev-parse", "--verify", "refs/stash"], cwd=cwd, confine=True).out
     if not sha:
         logger.warning("stash_push: stashed in %s but refs/stash is unreadable — the "
                        "changes are on the stash without a recorded ref", cwd)
@@ -1133,15 +1342,24 @@ def discard_changes(cwd: Path | str, ref: str = "HEAD", *, keep_ignored: bool = 
 
     Used to wipe a failed iteration's half-written edits so they don't bleed
     into the next fresh agent, and to recycle a worktree for reuse.
+
+    Runs NOTHING when *cwd* is not provably its own repository
+    (:func:`worktree_owner_proof`): both halves would otherwise hard-reset and
+    clean the repository that encloses it — with *ref* possibly one of that
+    repository's own commits, since a diff base read in such a tree is its
+    HEAD. Like every other failure here it degrades rather than raising, so
+    callers that must know what happened read the tree back.
     """
     logger.debug("discard_changes in %s: reset --hard %s + clean untracked "
                  "(keep_ignored=%s)", cwd, ref, keep_ignored)
-    res = reset_hard(cwd, ref)
+    if _refuse_unowned(cwd, f"reset --hard {ref} + clean") is not None:
+        return
+    res = _reset_hard(cwd, ref)
     if not res.ok:
         logger.warning("discard_changes: reset --hard %s failed in %s (rc=%s): %s "
                        "— stale tracked edits may bleed into the next iteration",
                        ref, cwd, res.code, trunc(redact(res.err or res.out), 200))
-    res = clean_untracked(cwd, keep_ignored=keep_ignored)
+    res = _clean_untracked(cwd, keep_ignored=keep_ignored)
     if not res.ok:
         logger.warning("discard_changes: git clean failed in %s (rc=%s): %s — "
                        "untracked cruft may survive into the next iteration",

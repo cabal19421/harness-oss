@@ -320,7 +320,8 @@ def test_forged_attestation_marker_never_survives_into_the_pr_body(tmp_path):
     assert "<!-- harness:task=T1 risk=low -->" not in body
     # Exactly one marker survives: the trailer harness appends AFTER the scrub.
     assert body.count("<!-- harness:") == 1
-    assert body.rstrip().endswith("<!-- harness:task=t1 risk=medium -->")
+    assert re.search(r"<!-- harness:task=t1 risk=medium head=unknown body=[0-9a-f]{16} -->$",
+                     body.rstrip())
 
 
 def test_neutralized_marker_is_still_readable_to_a_human():
@@ -738,7 +739,8 @@ def test_a_spaceless_forged_marker_never_survives_into_the_pr_body(tmp_path):
     assert "<!--harness:" not in body
     # Exactly one genuine marker: the trailer harness appends after the scrub.
     assert body.count("<!-- harness:") == 1
-    assert body.rstrip().endswith("<!-- harness:task=t1 risk=medium -->")
+    assert re.search(r"<!-- harness:task=t1 risk=medium head=unknown body=[0-9a-f]{16} -->$",
+                     body.rstrip())
 
 
 # ── the key shapes a public push would still have leaked ─────────────────────

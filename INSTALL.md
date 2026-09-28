@@ -48,7 +48,7 @@ pip install -e ".[z3,proc,dev]" # all three
 | Extra | Package | Unlocks | Fallback if absent |
 |---|---|---|---|
 | `z3` | `z3-solver>=4.12` | The SMT-decided grounding checks: **call binding** (one satisfiability model per call site — positional capacity, required-parameter coverage, and what keyword arguments may bind) and **guard exclusivity** (`if`/`elif` branches that can never run). Not a speed-up — a capability | A stdlib solver that decides call **arity**; the two SMT-only kinds abstain to `unverified`, which never fails a gate (use `--require-z3` to make the downgrade a hard error instead) |
-| `proc` | `psutil>=7.1.3` | Terminating processes still running **inside a worktree** before it is removed or reset (`pipeline prune`, `pipeline supervise` recovery), and carrying the process handle across the SIGTERM→SIGKILL window so a **recycled pid** can never be killed by mistake | On Linux, a `/proc` cwd scan — same protection, no pid-reuse guard on the kill. On **macOS/Windows the sweep is a no-op**: removal proceeds without reclaiming anything |
+| `proc` | `psutil>=7.1.3` | Terminating processes still running **inside a worktree** before it is removed or reset (`pipeline prune`, `pipeline supervise` recovery), and carrying the process handle across the SIGTERM→SIGKILL window so a **recycled pid** can never be killed by mistake | On Linux, a `/proc` cwd scan — same protection, with `/proc/<pid>/stat`'s start time as the pid-reuse guard. On **macOS/Windows there is no fallback**: the scan cannot be completed, so every step that needs a provably quiet worktree fails closed — `prune` keeps the worktree (`unverified-scan`), recovery skips the task, and a terminated `agent-cli` invocation stops the loop with the worktree preserved |
 | `dev` | `pytest>=9.1.1`, `mypy>=2.0,<3`, … | `pytest -q` runs the test suite | — |
 
 The `z3` floor is a *lower* bound only — no upper cap, deliberately: z3-solver
@@ -114,7 +114,7 @@ lands in that area.
 ```bash
 harness status               # environment doctor: grounding solver, backends, deps, extensions
 harness pipeline backends    # which code-writing backends are usable here
-pytest -q                    # (after `.[dev]`) → 1033 passed, 1 skipped
+pytest -q                    # (after `.[dev]`) → 1160 passed, 1 skipped
 harness verify - --lang go <<<'package main
 import "fmtx"
 func main(){}'               # grounding smoke test (should FAIL on the bad import)
@@ -143,11 +143,13 @@ loop.
 | + z3 | Grounding also decides **call binding** (SMT model per call site) and **guard exclusivity** (dead `if`/`elif` branches); without it those checks abstain to `unverified`. `--require-z3` / `HARNESS_REQUIRE_Z3=1` fails fast rather than degrading |
 | + psutil (`.[proc]`) | Process reclamation inside a worktree carries the process handle across the SIGTERM→SIGKILL window, so a **recycled pid** can never be killed by mistake. Optional on Linux (a `/proc` scan is the fallback); the **only** implementation on macOS/Windows |
 
-> `pipeline supervise`/`prune` and the unattended-safety/recovery features need
-> only **git** and the stdlib — no extra tools. `psutil` is optional: on Linux
-> the harness falls back to a `/proc` scan without it, but on macOS/Windows
-> stray-process termination degrades to a no-op (`pip install -e ".[proc]"` is
-> recommended for unattended use on non-Linux). They work with any backend.
+> `pipeline supervise`/`prune` and the unattended-safety/recovery features work
+> with any backend, and on Linux need only **git** and the stdlib — a `/proc`
+> scan stands in for `psutil`. On macOS/Windows nothing replaces `psutil`, so
+> install it there (`pip install -e ".[proc]"`): without it every step that
+> needs a provably quiet worktree fails closed — `prune` keeps the worktree,
+> recovery skips the task, and a terminated `agent-cli` invocation stops the
+> loop with the worktree preserved.
 
 ### Overnight runs on a laptop
 

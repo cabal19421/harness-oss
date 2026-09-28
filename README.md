@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 ![Grounding](https://img.shields.io/badge/grounding-Python%20%2B%20Go-blueviolet)
-![Tests](https://img.shields.io/badge/tests-1033%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-1160%20passing-brightgreen)
 
 ---
 
@@ -39,7 +39,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 - 🌙 **Unattended-safe** — built to start and walk away from: a failed iteration is **rolled back** (no broken edits bleed forward), a transient model overload **backs off** (jittered, honouring a server `Retry-After`), a depleted-credit error **aborts**, an exhausted subscription **quota window is waited out** rather than burned through, a green change a hook rejects is **kept for repair**, and `--max-tokens` / `--max-cost` bound spend on every backend (the USD cap needs a known per-model rate — set `HARNESS_MODEL_PRICES` on `openai`/`gemini`, whose default models ship unpriced). A host **sleep inhibitor** holds the machine awake, and **Ctrl-C is safe** — the detached agent's process group is terminated, the abort is journaled, and the task stays resumable.
 - 🛟 **Supervised & self-healing** — `harness pipeline supervise` reports per-task **liveness** (heartbeats bound to a *process identity*, a monotonic clock and a per-incarnation generation token, so a recycled pid, a clock step or a leftover record can never read as alive) and `--recover` rolls back **provably** crashed/hung runs, keeping committed work and parking uncommitted edits on the **stash**. Anything unverifiable is `unknown`: reported, never acted on. `harness pipeline prune` deletes only branches whose work has **landed** and reconciles worktree directories the plan lost track of; teardown is refuse-and-report, never bulldoze.
 - 🛡️ **Safe on untrusted input** — design text is scrubbed of secrets + prompt-injection before it reaches a backend; `--untrusted` allowlist-filters a design's `(validate:)` commands *below* the executable (multiplexer subcommands, output-redirecting flags, and the `NAME=value` env prefix each get their own allowlist), adds what survives to the operator's oracle instead of substituting for it, and drops the branch's own agent config; validation runs shell-free where it can; re-pushes use `--force-with-lease`, never a blind force.
-- 🔒 **Bound to the reviewed commit** — the risk level a PR carries only means something if the pushed tree earned it. The review freezes one SHA, and immediately before the push (under the repo git lock) a HEAD that no longer is — or descends from — that SHA withholds the PR and records a `push_guard` span. On GitHub, `gh auth` is checked *before* the push and an existing PR is adopted only when its head ref matches and it is not cross-repository.
+- 🔒 **Bound to the reviewed commit** — the risk level a PR carries only means something if the pushed tree earned it. The review freezes one SHA, and immediately before the push (under the repo git lock) a HEAD that no longer is — or descends from — that SHA withholds the PR and records a `push_guard` span. On GitHub, `gh auth` is checked *before* the push and an existing PR is adopted only when its head ref matches and it is not cross-repository — and counts as done only once its body has been re-published for the reviewed head, which harness does only over a body that is this task's own and unedited since.
 - 🖥️ **Two front-ends** — Editor-first **VSCodium tasks** (the default), *or* a **tmux cockpit** (`harness pipeline tmux`) that runs several features simultaneously, one per window, with a live dashboard.
 - 🔌 **Provider-agnostic backends** — the only model-coupled piece. `ide-handoff`, `agent-cli`, **`openai` (ChatGPT)**, and **`gemini`** ship in-tree (`agent-cli` drives an external agentic CLI — `gemini` by default; register a drop-in built on `AgentCliBackend(cli="<binary>")` to drive another — probing its `--help` and withholding the optional flags a CLI doesn't advertise; the API backends are direct, stdlib-HTTP, no SDK; truncated replies and refusals are detected from `finish_reason`/`refusal` and re-prompted rather than written to disk). Register your own (OpenCode, aider, an Azure endpoint, …) with one call. The grounding + test gate judges every backend identically. Risk level (low/medium/high) is **advisory routing metadata for review** — harness never auto-merges on it.
 
@@ -56,7 +56,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 **Foundations**
 - 🔍 **Dependency doctor** — `harness status` reports the grounding solver and the constraint kinds it decides, backend availability, every external tool it can use — `git`, `gh`, `tmux`, `agent` (the agent CLI driving the `agent-cli` backend; default binary `gemini`), `go`, `npm` — with its detected-vs-required version, the optional Python extras, and an extensions summary. See **[INSTALL.md](INSTALL.md)**.
 - 📓 **Two observability channels** — an append-only JSONL **span trace** (`.harness/trace.jsonl`, one line per consequential decision) and a **verbose log** (`-v`/`-vv`, `HARNESS_LOG`) whose output is secret-redacted *and* terminal-safe. See **[LOGGING.md](LOGGING.md)**.
-- 🧪 **Tested** — **1033 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
+- 🧪 **Tested** — **1160 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
 
 ---
 
@@ -355,7 +355,7 @@ harness/
 │       ├── cockpit.py         # tmux cockpit (run features simultaneously)
 │       ├── orchestrator.py    # Ties ingest→ground→implement→verify→review→PR; recovery + supervise/prune
 │       └── store.py           # Repo-local plan persistence (.harness/pipeline.json) + the run lock
-├── tests/                     # 1033 passing, 1 skipped (pytest; config in pytest.toml)
+├── tests/                     # 1160 passing, 1 skipped (pytest; config in pytest.toml)
 │   ├── conftest.py            # Isolated cwd/data per test
 │   ├── test_grounding.py      test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py   test_grounding_precision.py
@@ -367,7 +367,9 @@ harness/
 │   ├── test_detached_children.py     test_publication_guards.py
 │   ├── test_recovery_integrity.py    test_ref_safety.py
 │   ├── test_run_entry_guards.py      test_untrusted_gates.py
-│   └── test_verifier_manifest_guard.py  test_worktree_process_safety.py
+│   ├── test_verifier_manifest_guard.py  test_worktree_process_safety.py
+│   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
+│   └── test_pr_refresh.py
 ├── designs/                   # ← drop your design .md files here (pipeline input)
 │   ├── TEMPLATE.md
 │   └── example-pipeline-clean.md

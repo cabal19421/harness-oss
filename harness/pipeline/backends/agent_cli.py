@@ -30,9 +30,11 @@ The loop is hardened for genuinely unattended runs (see
 The backend never assumes a particular CLI's flag surface: it probes
 ``<cli> --help`` once and only passes a flag the installed CLI advertises.
 
-If the configured agent CLI is not installed, the backend reports itself
-unavailable with a clear reason (the orchestrator then routes the task to
-ide-handoff or fails it loudly — it never silently does nothing).
+If the configured agent CLI is not installed — or a hard version floor is
+pinned for it and the CLI is below that floor or cannot say which version it
+is — the backend reports itself unavailable with a clear reason (the
+orchestrator then routes the task to ide-handoff or fails it loudly — it never
+silently does nothing).
 """
 
 from __future__ import annotations
@@ -46,21 +48,25 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from harness.log import fmt_cmd, get_logger, redact, trunc
 
 from .. import gitutil, procutil, shutdown
 from ..looptools import (
+    FailureKind,
     LoopBudget,
     ProgressLedger,
     backoff_seconds,
     classify_invocation_failure,
+    cli_reset_clause,
+    cli_reset_slack,
+    cli_usage_limit_kind,
     commit_repair_prompt,
     parse_agent_usage,
     parse_permission_denial_details,
     parse_permission_denials,
+    quota_reset_seconds,
     quota_wait_seconds,
     wait_out_quota_window,
 )
@@ -73,7 +79,11 @@ from .base import (
     ImplementOutcome,
     OneshotResult,
     OracleResult,
+    WorktreeSweep,
     parse_abstention,
+    pid_list,
+    sweep_after_return,
+    tenant_baseline,
 )
 
 logger = get_logger(__name__)
@@ -340,11 +350,51 @@ def _agent_env(worktree: Path | str | None = None) -> dict[str, str]:
     bounds discovery upward from the working directory: a healthy linked
     worktree finds its own ``.git`` file first and follows it to the main
     repository's git dir as before.
+
+    The base is :func:`gitutil.inherited_env`, not ``os.environ``: a ceiling
+    cannot bound an explicit ``GIT_DIR``, so an inherited repository-location
+    variable (:data:`gitutil.REPO_LOCATION_ENV`) — git exports ``GIT_DIR`` to
+    every hook and ``!`` alias it runs — would point the agent's git at
+    whatever repository launched harness, wherever its working directory is.
     """
-    env = dict(os.environ)
+    env = gitutil.inherited_env()
     if worktree is not None:
         env["GIT_CEILING_DIRECTORIES"] = gitutil._ceiling_for(gitutil.pwd_for(worktree))
     return env
+
+
+def _sweep_nested_repos(ctx: ImplementContext, before: gitutil.NestedRepoIds | None,
+                        iteration: int) -> str:
+    """After a discard the loop owns: remove what the attempt created, report what survives.
+
+    ``git clean -fd`` never removes an untracked nested repository, so a red
+    attempt's ``git init``/``git clone`` outlived the discard and refused the
+    next green attempt's commit. Only repositories whose ``.git`` identity
+    was not in *before* (the iteration's start) are removed
+    (:func:`~harness.pipeline.gitutil.sweep_attempt_nested_repos`); one that
+    survives, or a sweep that could not decide, is a console line and a
+    ``git`` span (``op="discard-readback"``) — and so is every removal: harness
+    deleted a directory, and the operator hears it where they look, not only
+    in the log. Returns the paragraph the next agent is told — ``""`` when
+    there is nothing to tell.
+    """
+    sweep = gitutil.sweep_attempt_nested_repos(ctx.worktree, before)
+    said = sweep.summary()
+    if said:
+        ctx.trace.span(
+            "git", op="discard-readback", iteration=iteration,
+            ok=not (sweep.survivors or sweep.unknown),
+            removed=", ".join(gitutil.display_path(p) for p in sweep.removed)[:200],
+            survivors=", ".join(gitutil.display_path(p) for p in sweep.survivors)[:200],
+            # The attempt's own repositories left because something in them is
+            # older than the attempt (gitutil._held_from_before).
+            kept=", ".join(gitutil.display_path(p) for p in sweep.kept)[:200],
+            detail=(sweep.unknown or sweep.kept_reasons())[:200])
+    if sweep.survivors or sweep.unknown:
+        ctx.log(f"  ⚠️  {said}")
+    elif said:
+        ctx.log(f"  ✂️  {said}")
+    return sweep.agent_note()
 
 
 class AgentCliBackend(CodingBackend):
@@ -365,12 +415,27 @@ class AgentCliBackend(CodingBackend):
         # "Installed" is not "safe to run": harness executes every agent
         # invocation inside a git WORKTREE, and operators can pin version floors
         # for their agent CLI in TOOL_MIN_VERSIONS / TOOL_HARD_MIN_VERSIONS. A
-        # hard floor fails CLOSED; a soft floor only warns — the tool allowlist
-        # is the containment boundary, but refusing to run would break working
-        # setups over a risk the operator may accept.
+        # hard floor fails CLOSED: below it, and also when the version cannot be
+        # verified at all (`--version` fails, hangs, or prints no recognisable
+        # version line; or the binary is found only through an empty or
+        # relative PATH entry, which is never probed), since unknown is never a
+        # proof. There is deliberately no override: a known-old CLI has none
+        # either. A soft floor only warns — the tool allowlist is the
+        # containment boundary, but refusing to run would break working setups
+        # over a risk the operator may accept.
         from harness.config import warn_if_outdated
 
         version = warn_if_outdated("agent", self.cli)
+        if version.blocked and not version.detected:
+            return False, (
+                f"{version.detail}. harness runs every agent invocation inside a "
+                "git worktree, and a CLI whose version it cannot verify may sit "
+                "below the hard floor you pinned for it and predate the fix that "
+                f"floor names. Make `{self.cli} --version` print its version from "
+                "a binary on an absolute PATH entry (PATH decides which binary "
+                "runs; an empty or relative entry is never probed), upgrade the "
+                "CLI, or use --backend ide-handoff."
+            )
         if version.blocked:
             return False, (
                 f"{version.detail}: {version.detected} predates the pinned hard "
@@ -459,6 +524,12 @@ class AgentCliBackend(CodingBackend):
                 return self._stopped(ctx, i, last_oracle, f"stopped on budget — {why}", runlog,
                                      preserve_worktree=preserve)
 
+            # The untracked nested repositories there BEFORE this attempt, by
+            # .git identity. LOCAL, never on self — one backend instance serves
+            # every worker thread: a discard below may remove only what this
+            # attempt created (_sweep_nested_repos).
+            nested = (gitutil.untracked_nested_repos(ctx.worktree)
+                      if cfg.reset_on_failure else None)
             t_it = ctx.trace.timed()
             run = self._run_with_retries(ctx, feedback, pending_commit_failure, runlog, i,
                                          budget=budget)
@@ -466,7 +537,14 @@ class AgentCliBackend(CodingBackend):
                            permanent=run.permanent, tokens=run.tokens,
                            cost_usd=round(run.cost, 4),
                            duration_s=Tracer.duration(t_it),
-                           detail="" if run.ok else run.detail[:300])
+                           # An ok run's detail is set only when the CLI exited 0
+                           # leaving processes, and the sweep reclaimed them.
+                           detail=run.detail[:300])
+            if run.ok and run.detail:
+                # So an operator learns that agents leave processes behind.
+                runlog.append("reclaim", "processes the agent left running were "
+                              "terminated after it exited 0",
+                              detail=run.detail, iteration=i)
             budget.add(tokens=run.tokens, cost_usd=run.cost)
             if budget.active and run.ok and run.tokens == 0 and run.cost == 0 and not warned_no_usage:
                 # parse_agent_usage returns silent zeros on shape drift; with a
@@ -508,7 +586,7 @@ class AgentCliBackend(CodingBackend):
                 runlog.append("abort", "permanent agent error", detail=run.detail, iteration=i)
                 return self._stopped(ctx, i, last_oracle,
                                      f"aborted — permanent agent error: {run.detail}", runlog,
-                                     preserve_worktree=preserve)
+                                     preserve_worktree=preserve, nested=nested)
             if not run.ok:
                 consecutive_failures += 1
                 logger.warning("agent invocation failed on iteration %d for %s "
@@ -522,6 +600,8 @@ class AgentCliBackend(CodingBackend):
                                  "back to %r after failed invocation",
                                  ctx.diff_base or "HEAD")
                     gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+                    feedback = gitutil.with_nested_note(
+                        feedback, _sweep_nested_repos(ctx, nested, i))
                 if consecutive_failures >= cfg.max_consecutive_failures:
                     logger.error("aborting %s after %d consecutive agent "
                                  "failures", ctx.task.id, consecutive_failures)
@@ -538,7 +618,7 @@ class AgentCliBackend(CodingBackend):
             if abstain:
                 logger.info("task %s: agent abstained on iteration %d — %s",
                             ctx.task.id, i, trunc(redact(abstain), 200))
-                return self._abstained(ctx, i, abstain, runlog,
+                return self._abstained(ctx, i, abstain, runlog, nested=nested,
                                        preserve_worktree=pending_commit_failure is not None)
 
             # Fresh beat before the (potentially long) validation+grounding
@@ -546,6 +626,42 @@ class AgentCliBackend(CodingBackend):
             # period the oracle is allowed.
             runlog.beat("implementing", iteration=i)
             oracle = self.run_oracle(ctx)
+            if oracle.validation_left_running and not shutdown.requested():
+                # No verdict either (a clean exit is not a finished tree): a
+                # validation command left processes in the worktree that the
+                # sweep after it could not reclaim. Nothing of the run is
+                # recorded — no `fail` note, feedback, failure count or
+                # no-progress signature — and nothing races the writer: no
+                # commit, no retry, no reset. The iteration's work stays exactly
+                # where it is, unjudged.
+                live = oracle.validation_left_running
+                logger.error("stopping %s on iteration %d without a retry or a "
+                             "reset — %s", ctx.task.id, i, trunc(redact(live), 300))
+                runlog.append("abort", "live processes left in the worktree",
+                              detail=live, iteration=i)
+                ctx.log(f"  ⚠️  stopped without a retry or a reset — {trunc(live, 200)}")
+                return self._stopped(ctx, i, last_oracle, f"stopped — {live}", runlog,
+                                     preserve_worktree=True, preserve_reason=live)
+            if oracle.validation_interrupted or shutdown.requested():
+                # No verdict (the rule: a validation run the signal cut short
+                # has no verdict): the handler terminated the validation group,
+                # and its exit status is the signal's, not the code's. Recording
+                # it would turn every Ctrl-C into a red — a `fail` note,
+                # feedback for an agent that never runs again, a consecutive
+                # failure, a no-progress signature — so none of that happens,
+                # and the interruption exit gets the PREVIOUS oracle. The
+                # iteration itself finished — it is unjudged, not half written —
+                # so it is kept for the next run to re-validate (the API loops
+                # keep theirs too). A validation process that left its group
+                # (setsid) survives the group signal, so the tree is still swept
+                # under kill_worktree_procs: left running, it would only make
+                # the next relaunch refuse the tree.
+                sweep = _reclaim_worktree(ctx)
+                return self._interrupted(
+                    ctx, i, last_oracle, runlog, preserve_worktree=True,
+                    live=(_live_process_detail("the validation run was terminated",
+                                               sweep) if sweep.busy else ""),
+                    stage="validation")
             last_oracle = oracle
 
             if oracle.passed:
@@ -564,7 +680,7 @@ class AgentCliBackend(CodingBackend):
                                    i, ctx.task.id, commit_failures,
                                    cfg.max_consecutive_failures,
                                    trunc(pending_commit_failure, 300))
-                    runlog.append("commit-fail", "oracle green but commit failed",
+                    runlog.append("commit-fail", f"{oracle.green_summary} but commit failed",
                                   detail=pending_commit_failure, iteration=i)
                     if commit_failures >= cfg.max_consecutive_failures:
                         logger.error("failing %s: commit kept failing %d times "
@@ -573,7 +689,7 @@ class AgentCliBackend(CodingBackend):
                                      ctx.task.id, commit_failures)
                         return self._stopped(
                             ctx, i, last_oracle,
-                            f"oracle green but commit kept failing ({commit_failures}×) — "
+                            f"{oracle.green_summary} but commit kept failing ({commit_failures}×) — "
                             f"work left in the worktree for repair: {pending_commit_failure}",
                             runlog, preserve_worktree=True)
                     continue
@@ -581,18 +697,23 @@ class AgentCliBackend(CodingBackend):
                 commit_failures = 0
                 pending_commit_failure = None
                 if ctx.own_commits_ahead() > 0:
-                    logger.info("%s: implementing → done (oracle green after %d "
+                    logger.info("%s: implementing → done (%s after %d "
                                 "iteration(s), %s — %s)",
-                                ctx.task.id, i, budget.summary(),
-                                oracle.grounding.summary)
-                    runlog.append("ok", f"green after {i} iteration(s)",
+                                ctx.task.id, oracle.green_summary, i,
+                                budget.summary(), oracle.grounding.summary)
+                    # An empty oracle validated nothing: the run log and the
+                    # outcome detail (the `agent` span's) say so, as the console does.
+                    runlog.append("ok", (f"{oracle.green_summary} after {i} iteration(s)"
+                                         if oracle.validation_vacuous
+                                         else f"green after {i} iteration(s)"),
                                   detail=oracle.grounding.summary, iteration=i)
                     runlog.beat("done", iteration=i)
-                    ctx.log(f"  ✓ oracle green after {i} iteration(s) — {oracle.grounding.summary}")
+                    ctx.log(f"  ✓ {oracle.green_summary} after {i} iteration(s) — "
+                            f"{oracle.grounding.summary}")
                     return ImplementOutcome(
                         status="implemented", iterations=i, oracle_passed=True,
                         grounding_ok=oracle.grounding_ok,
-                        detail="validation + grounding green",
+                        detail=oracle.done_detail,
                         grounding_summary=oracle.grounding.summary,
                     )
                 # When the "work" was unstageable dirt, the generic advice below
@@ -600,17 +721,17 @@ class AgentCliBackend(CodingBackend):
                 # operator to rewrite an oracle that is doing its job. Say what
                 # actually happened instead, on every surface this exit writes to.
                 unstageable = gitutil.unstageable_dirt_reason(ctx.worktree)
-                logger.warning("failing %s: oracle green but no commit ahead of "
+                logger.warning("failing %s: %s but no commit ahead of "
                                "%r — %s (validation=%s)",
-                               ctx.task.id, ctx.diff_base,
+                               ctx.task.id, oracle.green_summary, ctx.diff_base,
                                unstageable or "the task may need no change, or "
                                "its validation is too weak",
                                ctx.validation or "none")
                 msg = (
-                    f"oracle is green but the branch has no commit ahead of "
+                    f"{oracle.green_summary} but the branch has no commit ahead of "
                     f"'{ctx.diff_base}' — {unstageable}."
                     if unstageable else
-                    f"oracle is green but the branch has no commit ahead of "
+                    f"{oracle.green_summary} but the branch has no commit ahead of "
                     f"'{ctx.diff_base}' — the task may require no change, or its "
                     f"validation is too weak to constrain the work "
                     f"(validation={ctx.validation or 'none'}). Strengthen the oracle."
@@ -646,6 +767,7 @@ class AgentCliBackend(CodingBackend):
                 return self._abstained(
                     ctx, i, f"no progress — {why}. Last oracle: "
                     f"{oracle.grounding.summary}", runlog, last_oracle=oracle,
+                    nested=nested,
                     preserve_worktree=pending_commit_failure is not None)
             if pending_commit_failure is None and cfg.reset_on_failure:
                 # Discard this attempt so the next fresh agent starts from the
@@ -655,14 +777,22 @@ class AgentCliBackend(CodingBackend):
                 # a red repair attempt must NOT wipe the preserved green work
                 # the commit-repair prompt promises is still in the worktree.
                 gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+                # `clean -fd` keeps a nested repository the attempt created;
+                # it goes now, and the next agent hears about any that stay.
+                feedback = gitutil.with_nested_note(
+                    feedback, _sweep_nested_repos(ctx, nested, i))
             if consecutive_failures >= cfg.max_consecutive_failures:
                 logger.error("aborting %s after %d consecutive non-green "
                              "iterations (last grounding: %s)",
                              ctx.task.id, consecutive_failures,
                              oracle.grounding.summary)
+                # With a commit repair pending no red discard ran above, so this
+                # stop's discard is the attempt's only one, and sweeps for it.
                 return self._stopped(ctx, i, last_oracle,
                                      f"aborted after {consecutive_failures} consecutive "
-                                     "non-green iterations", runlog)
+                                     "non-green iterations", runlog,
+                                     nested=(nested if pending_commit_failure is not None
+                                             else None))
 
         detail = "did not converge"
         if pending_commit_failure is not None:
@@ -683,7 +813,9 @@ class AgentCliBackend(CodingBackend):
     class _Run:
         def __init__(self, ok: bool, *, detail: str = "", tokens: int = 0,
                      cost: float = 0.0, permanent: bool = False,
-                     text: str = "", preserve_worktree: bool = False) -> None:
+                     text: str = "", preserve_worktree: bool = False,
+                     limit_kind: FailureKind | None = None,
+                     limit_text: str = "") -> None:
             self.ok = ok
             self.detail = detail
             self.tokens = tokens
@@ -694,6 +826,15 @@ class AgentCliBackend(CodingBackend):
             # started are still running in the worktree, or could not be ruled
             # out: the loop stops and leaves the tree exactly as it is.
             self.preserve_worktree = preserve_worktree
+            # The CLI's OWN usage-limit refusal, carried as fields and never as
+            # text inside `detail`: the detail quotes the agent's prose
+            # ("agent report: …"), so a marker there could be forged by an agent
+            # quoting the wording. Set only from an envelope the CLI marked
+            # (_cli_limit_text) on a CLI that exited 1, denied tool calls or
+            # not; `limit_kind` is cli_usage_limit_kind's regime for
+            # `limit_text` and decides _run_with_retries' classification.
+            self.limit_kind = limit_kind
+            self.limit_text = limit_text
 
     def _run_with_retries(self, ctx: ImplementContext, feedback: str,
                           pending_commit_failure: str | None, runlog: RunLog,
@@ -708,6 +849,23 @@ class AgentCliBackend(CodingBackend):
         5-hour), which makes an exhausted window the single most likely way an
         overnight run dies. Returns the last result; ``permanent`` / ``not ok``
         tell the caller how to proceed.
+
+        The CLI's own usage-limit refusal (``_Run.limit_kind`` /
+        ``limit_text``, from :func:`_cli_limit_text`) outranks the detail: a
+        stated reset is waited out (each wait capped at
+        ``quota_wait_cap_seconds``, at most ``max_quota_waits`` of them), a named
+        window with no reset gets the bounded default wait, an operator-action
+        refusal never reaches this method's waits (``_run_agent`` already made
+        it permanent), and a reset beyond what the remaining waits can cover
+        stops at once as permanent, naming when the window reopens. A time-only
+        reset read as a window that has just reopened (the slack in
+        :func:`~harness.pipeline.looptools.cli_reset_seconds`) gets a grace
+        wait; the same clause back after it is read with the narrower repeat
+        slack (:func:`~harness.pipeline.looptools.cli_reset_slack`) — still
+        just reopened while it was printed under five minutes ago, so a window
+        seconds from reopening gets further grace waits (each one of
+        ``max_quota_waits``), and that time tomorrow past it. Never with no
+        slack: that stopped such a window as one nearly a day away.
         """
         cfg = ctx.config
         attempts = max(1, cfg.max_agent_retries + 1)
@@ -715,6 +873,8 @@ class AgentCliBackend(CodingBackend):
         spent_tokens = 0
         spent_cost = 0.0
         quota_waits = 0
+        # The CLI's reset clause the last quota wait read as "just reopened".
+        reopened_clause = ""
         attempt = 0
         while attempt < attempts:
             attempt += 1
@@ -737,11 +897,47 @@ class AgentCliBackend(CodingBackend):
                 logger.debug("agent attempt %d ended during a graceful shutdown "
                              "— not retrying", attempt)
                 return last
-            kind = classify_invocation_failure(last.detail)
+            # The CLI's own usage-limit refusal decides the regime when there is
+            # one: it arrived as fields read from the envelope the CLI marked
+            # (_cli_limit_text), so nothing an agent writes can pick it. Any
+            # other failure is classified from the detail, as before.
+            kind: FailureKind = (last.limit_kind
+                                 or classify_invocation_failure(last.detail))
             if kind == "quota-window":
-                wait = quota_wait_seconds(last.detail, cap=cfg.quota_wait_cap_seconds)
+                # The wait comes from that refusal's own reset clause when there
+                # is one (in the zone it names); from the detail otherwise. A
+                # time-only clause the last wait read as "just reopened" that is
+                # back unchanged is read with the narrower repeat slack: the
+                # window may still be seconds from reopening (the CLI truncates
+                # the minute; the clock may run fast), so it stays "just
+                # reopened" while printed under five minutes ago — a bounded
+                # grace wait each — and is that time tomorrow past it.
+                clause = cli_reset_clause(last.limit_text) if last.limit_kind else ""
+                slack = cli_reset_slack(clause, reopened_clause)
+                wait = quota_wait_seconds(last.limit_text or last.detail,
+                                          cap=cfg.quota_wait_cap_seconds,
+                                          cli_slack=slack)
+                waits_left = cfg.max_quota_waits - quota_waits
+                reset = (quota_reset_seconds(last.limit_text, cli_slack=slack)
+                         if last.limit_kind and wait > 0 and waits_left > 0 else None)
+                budget_s = cfg.quota_wait_cap_seconds * waits_left
+                if reset is not None and reset > budget_s:
+                    # A reset the remaining waits cannot reach (a weekly limit
+                    # days away): idling through the whole budget would end in
+                    # the same stop, so stop now and say when it reopens.
+                    why = (f"usage limit: the window reopens in ~{reset / 3600:.1f}h, "
+                           f"beyond the remaining quota-wait budget of "
+                           f"{budget_s / 3600:.1f}h ({waits_left} wait(s) of at most "
+                           f"quota_wait_cap_seconds={cfg.quota_wait_cap_seconds:.0f}s)"
+                           f" — stopping now instead of waiting it out")
+                    logger.error("%s (iteration %d) — treating as permanent: %s",
+                                 why, iteration, trunc(redact(last.limit_text), 300))
+                    last.detail = f"{why}: {last.detail}"
+                    last.permanent = True
+                    return last
                 if wait > 0 and quota_waits < cfg.max_quota_waits:
                     quota_waits += 1
+                    reopened_clause = clause if reset == 0.0 else ""
                     spent_tokens = last.tokens
                     spent_cost = last.cost
                     attempt -= 1          # waiting is not one of the retries
@@ -840,6 +1036,11 @@ class AgentCliBackend(CodingBackend):
         # path that terminated the CLI therefore ends in _reclaim_worktree's cwd
         # sweep before anything retries into the tree or resets it.
         env = _agent_env(ctx.worktree)
+        # The tenants cwd'd in the worktree BEFORE the CLI launched (in the
+        # operator's own checkout, the human's editor and shells): the sweep
+        # after a clean exit is differential — it excludes them, so only what
+        # the CLI leaves behind is a leftover.
+        tenants_before = tenant_baseline(ctx.worktree)
         t0 = time.monotonic()
         try:
             proc = subprocess.Popen(
@@ -975,7 +1176,21 @@ class AgentCliBackend(CodingBackend):
                                  detail=f"terminated by SIGTERM (rc={proc.returncode}) "
                                         f"— harness teardown or an operator signal, "
                                         f"not an agent error{reclaimed}")
-            if denials:
+            # The CLI's own usage-limit refusal, read out of the envelope's
+            # structured fields only (_cli_limit_text), and only from a CLI that
+            # exited the way it does on is_error (rc 1) — one a signal killed
+            # built no result of its own, so whatever its stdout holds is not its
+            # refusal. When there is one it decides the regime by itself and
+            # rides on the run as fields, never as a marker in `detail`, so an
+            # agent quoting the same wording in its prose stays on the classifier
+            # path below. It is read BEFORE the denied-call rule: a limit that
+            # ends a turn after a denied call is a window to wait out (or a cap an
+            # operator lifts), not the allow rules refusing every retry — mid-turn
+            # refusals that carried a denial were aborted at once as "permission
+            # denied", with no quota wait and no regime.
+            limit_text = _cli_limit_text(out or "") if proc.returncode == 1 else ""
+            limit_kind = cli_usage_limit_kind(limit_text) if limit_text else None
+            if denials and limit_kind is None:
                 # Build the actionable block FIRST and give the raw tail only the
                 # budget that is left: slicing the assembled string (as this used
                 # to) always cut the part the operator needs, because the CLI JSON
@@ -992,6 +1207,23 @@ class AgentCliBackend(CodingBackend):
                              "; ".join(denied_calls))
                 return self._Run(False, detail=detail, tokens=tokens, cost=cost,
                                  permanent=True)
+            if denials:
+                # The usage limit ended this turn, not the denied calls — but they
+                # are still the operator's cue to widen the allow list, as on a
+                # clean exit: logged the way the success path logs them, and kept
+                # in the detail right after the CLI's own words.
+                logger.warning("agent CLI was refused by its usage limit, and %d "
+                               "tool call(s) earlier in the turn were denied by the "
+                               "allow rules (%s) — widen PipelineConfig.allowed_tools "
+                               "if the agent needs them",
+                               len(denials), "; ".join(denied_calls))
+                parts.insert(1 if cli_error else 0,
+                             f"permission denied for tool call(s) earlier in this "
+                             f"turn: {'; '.join(denied_calls)} — no allow rule "
+                             f"covers them; add matching rules to "
+                             f"PipelineConfig.allowed_tools (currently: "
+                             f"{ctx.config.allowed_tools}) if the agent needs them")
+                detail = "\n".join(parts)
             # Classified from BOTH streams — a stderr tail alone masked a real
             # stdout error, and vice versa. Unredacted on purpose: the marker
             # phrases the classifier keys on are the CLI's own error text, and
@@ -1021,12 +1253,16 @@ class AgentCliBackend(CodingBackend):
                 agent_text[:_CLASSIFY_TAIL_CHARS],
                 out_text[-_CLASSIFY_TAIL_CHARS:],
             ) if t)
-            permanent = classify_invocation_failure(classify_text) == "permanent"
+            if limit_kind is not None:
+                permanent = limit_kind == "permanent"
+            else:
+                permanent = classify_invocation_failure(classify_text) == "permanent"
             logger.debug("agent CLI non-zero exit classified as %s; detail tail: %s",
-                         "permanent" if permanent else "transient",
+                         limit_kind or ("permanent" if permanent else "transient"),
                          trunc(redact(detail), 300))
             return self._Run(False, detail=detail + reclaimed, tokens=tokens, cost=cost,
-                             permanent=permanent)
+                             permanent=permanent, limit_kind=limit_kind,
+                             limit_text=limit_text if limit_kind else "")
         if denials:
             # The agent finished anyway (it routed around the blocked tool), so
             # this is not a failure — but it is the operator's cue to widen the
@@ -1035,8 +1271,27 @@ class AgentCliBackend(CodingBackend):
                            "allow rules (%s) — widen PipelineConfig.allowed_tools "
                            "if the agent needs them",
                            len(denials), "; ".join(denied_calls))
+        # A clean exit is not a finished tree. A helper an allowed launcher
+        # started (python3, make, npm, a test that leaks one) outlives the CLI
+        # with its cwd in the worktree and keeps writing, in a group and a
+        # session of its own — the CLI's own group is empty by now, so no probe
+        # of it would see one. Proved quiet HERE, for every caller, before
+        # anything parses an ABSTAIN, judges, commits or reviews the tree;
+        # stragglers that exit on their own (a detached `git gc --auto`, MCP
+        # servers shutting down) are settled first.
+        sweep = sweep_after_return(ctx, after="the CLI exited 0",
+                                   settle=_SWEEP_SETTLE_SECONDS,
+                                   baseline=tenants_before)
+        if sweep.busy:
+            return self._Run(False, permanent=True, preserve_worktree=True,
+                             tokens=tokens, cost=cost,
+                             detail=_live_process_detail("the CLI exited 0", sweep))
+        # An ok run carries a detail only when leftovers were reclaimed: the loop
+        # puts it in the run log and the `agent` span.
         return self._Run(True, tokens=tokens, cost=cost,
-                         text=_result_text(out or ""))
+                         text=_result_text(out or ""),
+                         detail=(f"the CLI exited 0{sweep.note()}" if sweep.reclaimed
+                                 else ""))
 
     # ── prompt + commit ───────────────────────────────────────────────────────
 
@@ -1131,11 +1386,15 @@ class AgentCliBackend(CodingBackend):
         non-conforming answer is drift, not merely "unparseable".
 
         Fails open (``ran=False``) on any launch/timeout/non-zero-exit problem,
-        so the verifier gate can never wedge or crash a review — except the two
+        so the verifier gate can never wedge or crash a review — except the
         failures that must not read as a skip, which also set ``abstain``: the
         OS refused to exec the call (E2BIG — the same argv is refused on every
-        sample), or a call that ran WITH tools was terminated and its tool
-        processes are still running in the worktree it was judging.
+        sample), a call that ran WITH tools was terminated and its tool
+        processes are still running in the worktree it was judging, or the
+        usage limit refused the call (``usage_limit`` carries the CLI's own
+        refusal, read as :func:`_cli_limit_text` reads it on a CLI that exited
+        1, and ``usage_limit_kind`` its regime), which ends the review with no
+        verdict.
         """
         ok, _ = self.available()
         if not ok:
@@ -1219,6 +1478,22 @@ class AgentCliBackend(CodingBackend):
         if timed_out:
             return OneshotResult(ran=False,
                                  detail=f"timed out after {_ONESHOT_TIMEOUT_SECONDS}s")
+        # A refusal by the usage limit is not an outage to skip past: every
+        # further sample is refused the same way until the window reopens (or
+        # an operator lifts a cap), so the gate must end with no verdict rather
+        # than fail open. Read from the envelope the CLI marked, on a CLI that
+        # exited 1, exactly as the implement loop reads it — never from the
+        # model's prose; its regime travels with it.
+        limit = _cli_limit_text(out or "") if proc.returncode == 1 else ""
+        limit_kind = cli_usage_limit_kind(limit) if limit else None
+        if limit_kind is not None:
+            logger.warning("verifier one-shot agent call refused by the usage "
+                           "limit (%s, rc=%s): %s — no verdict, not a skip",
+                           limit_kind, proc.returncode, trunc(redact(limit), 200))
+            return OneshotResult(ran=False, abstain=True, usage_limit=limit,
+                                 usage_limit_kind=limit_kind,
+                                 detail=f"refused by the usage limit: "
+                                        f"{trunc(redact(limit), 300)}")
         if proc.returncode != 0:
             logger.debug("verifier one-shot agent call exited rc=%s — failing open",
                          proc.returncode)
@@ -1255,17 +1530,46 @@ class AgentCliBackend(CodingBackend):
         the worktree at the one place it renders it
         (:func:`~harness.pipeline.gitutil.unstageable_dirt_reason`), where the
         index it describes is still exactly as this left it.
+
+        Edits hidden behind index flags are exposed before the status gate
+        (:func:`~harness.pipeline.gitutil.expose_hidden_edits`): the oracle
+        just went green on them in the worktree, and ``git status`` / ``git
+        add -A`` would otherwise leave them out of the commit. Flags that
+        cannot be cleared come back as a failed commit, like a protected path.
+
+        A ``git status`` that fails is not a clean tree: the stage is still
+        attempted, and a stage git cannot complete — a submodule ``.git``
+        that points nowhere, a nested ``git init`` with no commit, a stale
+        ``index.lock`` — raises
+        :class:`~harness.pipeline.gitutil.StageFailedError`, which comes back
+        as a failed commit carrying git's own error. Read as "nothing to
+        commit", it ended a green task as "strengthen the oracle".
         """
-        if gitutil.working_tree_dirty(ctx.worktree):
-            logger.debug("worktree %s dirty — the agent left uncommitted work; "
-                         "committing it on its behalf", ctx.worktree)
+        try:
+            gitutil.expose_hidden_edits(ctx.worktree)
+        except gitutil.ProtectedPathError as exc:
+            # Same route as the refusal below: the commit-repair path, which
+            # re-prompts with this detail and never resets the worktree.
+            logger.error("%s: refusing the automatic commit for %s — %s",
+                         self.name, ctx.task.id, exc)
+            return gitutil.GitResult(1, "", str(exc))
+        dirty = gitutil.working_tree_dirty(ctx.worktree)
+        if dirty is not False:
+            # None (`git status` failed) is unknown, never clean: stage anyway,
+            # and let a stage git cannot complete name its own error below.
+            logger.debug("worktree %s %s — committing the agent's uncommitted "
+                         "work on its behalf", ctx.worktree,
+                         "dirty" if dirty else "unreadable by `git status`")
             try:
                 gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
             except gitutil.ProtectedPathError as exc:
                 # Reported as a failed commit on purpose: the caller already has
                 # the repair path for "oracle green but the commit did not
                 # happen", which re-prompts with this detail and never resets the
-                # worktree. Nothing was staged, so index and worktree are intact.
+                # worktree. Nothing was staged for a protected path or a stage
+                # git could not complete (StageFailedError); for an unregistered
+                # gitlink only that gitlink was unstaged again — the worktree is
+                # intact either way.
                 logger.error("%s: refusing the automatic commit for %s — %s",
                              self.name, ctx.task.id, exc)
                 return gitutil.GitResult(1, "", str(exc))
@@ -1284,7 +1588,8 @@ class AgentCliBackend(CodingBackend):
 
     def _abstained(self, ctx: ImplementContext, iterations: int, reason: str,
                    runlog: RunLog, *, last_oracle: OracleResult | None = None,
-                   preserve_worktree: bool = False) -> ImplementOutcome:
+                   preserve_worktree: bool = False,
+                   nested: gitutil.NestedRepoIds | None = None) -> ImplementOutcome:
         """Escalate to a human as an abstention, leaving the worktree clean.
 
         Routed through the ``awaiting-human`` status the orchestrator already
@@ -1294,10 +1599,17 @@ class AgentCliBackend(CodingBackend):
         ``preserve_worktree`` is set when green-but-uncommitted work is pending
         commit repair — an abstention must never destroy a passing solution the
         human it escalates to could recover by hand.
+
+        *nested* is the iteration's snapshot of untracked nested repositories:
+        the discard here removes the ones the abstaining attempt created, as
+        the loop's own discards do. ``None`` removes none. A tree ``git
+        status`` cannot read is not discarded at all.
         """
         if (not preserve_worktree and ctx.config.reset_on_failure
                 and gitutil.working_tree_dirty(ctx.worktree)):
             gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+            if nested is not None:
+                _sweep_nested_repos(ctx, nested, iterations)
         elif preserve_worktree:
             logger.info("abstention with green-but-uncommitted work pending — "
                         "preserving worktree %s for manual recovery", ctx.worktree)
@@ -1317,14 +1629,21 @@ class AgentCliBackend(CodingBackend):
                      last_oracle: OracleResult | None,
                      runlog: RunLog, *,
                      preserve_worktree: bool = False,
-                     live: str = "") -> ImplementOutcome:
-        """Stop cleanly on Ctrl-C / SIGTERM, leaving the task resumable.
+                     live: str = "", stage: str = "agent") -> ImplementOutcome:
+        """Stop cleanly on Ctrl-C / SIGTERM / SIGHUP, leaving the task resumable.
 
         The shutdown handler has already terminated the agent's process group
         (that is why the invocation returned); what is left is to say so in the
         audit log — an interruption, not an agent failure — and to RETURN, so
         the orchestrator's ``finally`` releases the :class:`TaskClaim` instead
         of leaving it to the OS's flock release on process death.
+
+        Records before chatter: the ``abort`` note, the ``shutdown`` span and the
+        ``aborted`` beat are all written before the operator's line. After a
+        hangup that line goes to a terminal that may be gone, and a write that
+        raised there used to unwind past every record — the task read as an
+        orchestrator error, with no abort note and its heartbeat left
+        ``implementing``.
 
         The task is left at ``failed``, which is the resumable status: the next
         run picks it up rather than treating the interruption as terminal.
@@ -1333,29 +1652,41 @@ class AgentCliBackend(CodingBackend):
         running in the worktree (or could not be ruled out); the caller then
         also sets ``preserve_worktree``, and the reason is carried into the
         outcome so the operator knows what to stop before resuming.
+
+        ``stage="validation"`` is the oracle's interruption: the agent call had
+        finished and its validation run was terminated instead, so that run has
+        no verdict and *last_oracle* is the one before it.
         """
         signame = shutdown.signame() or "SIGINT"
-        detail = (f"interrupted by {signame} after {iterations} iteration(s) — the "
-                  f"agent was terminated and the task left resumable")
+        what = ("its validation run was terminated (no verdict — not recorded as "
+                "a failure)" if stage == "validation" else "the agent was terminated")
+        detail = (f"interrupted by {signame} after {iterations} iteration(s) — "
+                  f"{what} and the task left resumable")
         if live:
             detail += f"; the worktree was left as it is: {live}"
         logger.warning("task %s: %s", ctx.task.id, detail)
-        ctx.log(f"  ⏹ interrupted by {signame} after {iterations} iteration(s) — "
-                f"stopping cleanly; the task stays resumable")
         runlog.append("abort", f"interrupted by {signame}", detail=detail,
                       iteration=iterations)
         ctx.trace.span("shutdown", backend=self.name, signal=signame,
-                       iteration=iterations, worktree_preserved=preserve_worktree)
-        return self._stopped(ctx, iterations, last_oracle, detail, runlog,
-                             preserve_worktree=preserve_worktree,
-                             beat_status="aborted", preserve_reason=live)
+                       iteration=iterations, worktree_preserved=preserve_worktree,
+                       stage=stage)
+        kept = live or ("the iteration finished before its validation was "
+                        "interrupted — it is kept, unjudged, for the next run to "
+                        "re-validate" if stage == "validation" else "")
+        outcome = self._stopped(ctx, iterations, last_oracle, detail, runlog,
+                                preserve_worktree=preserve_worktree,
+                                beat_status="aborted", preserve_reason=kept)
+        ctx.log(f"  ⏹ interrupted by {signame} after {iterations} iteration(s) — "
+                f"stopping cleanly; the task stays resumable")
+        return outcome
 
     def _stopped(self, ctx: ImplementContext, iterations: int,
                  last_oracle: OracleResult | None, detail: str, runlog: RunLog,
                  *, oracle_passed: bool = False,
                  preserve_worktree: bool = False,
                  beat_status: str = "failed",
-                 preserve_reason: str = "") -> ImplementOutcome:
+                 preserve_reason: str = "",
+                 nested: gitutil.NestedRepoIds | None = None) -> ImplementOutcome:
         """Build a terminal ``failed`` outcome, leaving the worktree clean.
 
         ``preserve_worktree`` is set when there is green-but-uncommitted work
@@ -1369,6 +1700,12 @@ class AgentCliBackend(CodingBackend):
         the outcome's own ``failed`` but an interruption records ``aborted``, so
         a morning-after reader can tell "the loop gave up" from "somebody
         stopped it".
+
+        *nested* is the iteration's snapshot of untracked nested repositories,
+        passed by a stop whose attempt no earlier discard swept (a permanent
+        agent error; the non-green abort while a commit repair was pending):
+        the discard here then removes the ones that attempt created, as the
+        loop's own discards do. ``None`` removes none.
         """
         if preserve_worktree and preserve_reason:
             logger.warning("preserving worktree %s on failure — %s",
@@ -1382,6 +1719,10 @@ class AgentCliBackend(CodingBackend):
             logger.debug("terminal-failure cleanup: discarding dirty worktree "
                          "%s back to %r", ctx.worktree, ctx.diff_base or "HEAD")
             gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+            if nested is not None:
+                # `clean -fd` keeps a nested repository the attempt created;
+                # left, a resumed run would read it as pre-existing for good.
+                _sweep_nested_repos(ctx, nested, iterations)
         logger.debug("%s: implementing → failed after %d iteration(s): %s",
                      ctx.task.id, iterations, trunc(detail, 300))
         runlog.beat(beat_status, iteration=iterations)
@@ -1406,39 +1747,16 @@ class AgentCliBackend(CodingBackend):
 _TEARDOWN_GRACE_SECONDS = {signal.SIGTERM: 15.0, signal.SIGKILL: 5.0}
 
 
-def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
-    """Send *sig* to the CLI's process group — no wait, no reap.
-
-    The shutdown handler's killer (see :mod:`harness.pipeline.shutdown`): it
-    runs *inside* a signal handler, in the very thread that is blocked in
-    ``proc.communicate()``, so it must not wait for anything. Reaping is left to
-    that blocked ``communicate``, which returns as soon as the child dies.
-
-    The group holds the CLI and whichever of its children stayed in it — not the
-    tool commands a CLI may start in sessions of their own and TERM itself on
-    SIGTERM (what that leaves behind is :func:`_reclaim_worktree`'s job). Falls
-    back to signalling the leader alone when the group cannot be resolved
-    (already reaped).
-    """
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (OSError, ProcessLookupError) as exc:
-        logger.debug("cannot resolve process group of pid=%s (%s: %s) — "
-                     "falling back to signalling the leader only",
-                     proc.pid, type(exc).__name__, exc)
-        pgid = None
-    try:
-        if pgid is not None:
-            os.killpg(pgid, sig)
-        elif sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
-    except (OSError, ProcessLookupError) as exc:
-        # Already exited — harmless; the caller's communicate() reaps the leader.
-        logger.debug("could not send %s to pid=%s/pgid=%s (%s: %s) — process "
-                     "likely already gone", getattr(sig, "name", sig), proc.pid,
-                     pgid, type(exc).__name__, exc)
+#: Sends a signal to the CLI's process group — no wait, no reap. The shutdown
+#: handler's killer for every call this backend detaches, and the first step of
+#: :func:`_kill_process_group`'s ladder. It lives in :mod:`harness.pipeline.shutdown`
+#: (:func:`~harness.pipeline.shutdown.group_killer`) so the validation oracle in
+#: ``backends.base`` registers its commands with the same one; the name stays
+#: here because this module's callers look it up at call time. The group holds
+#: the CLI and whichever of its children stayed in it — not the tool commands a
+#: CLI may start in sessions of their own and TERM itself on SIGTERM (what that
+#: leaves behind is :func:`_reclaim_worktree`'s job).
+_signal_process_group = shutdown.group_killer
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -1470,32 +1788,15 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 #: How long a sweep that may not signal waits for processes the CLI already
 #: TERMed to exit on their own before it calls them live: a CLI can pass TERM
 #: on and exit without waiting. A sweep that may signal needs no wait here —
-#: ``procutil.terminate_in_dir`` grants its own grace before SIGKILL.
+#: ``procutil.terminate_in_dir`` grants its own grace before SIGKILL. The sweep
+#: after a CLI that exited 0 (``base.sweep_after_return``) settles this long in
+#: BOTH modes, so what exits on its own is never signalled.
 _SWEEP_SETTLE_SECONDS = 2.0
 
-
-@dataclass(frozen=True)
-class _Sweep:
-    """What :func:`_reclaim_worktree` established about the worktree."""
-
-    #: Why nothing may touch the tree yet — it names the live pids, or says the
-    #: scan could not be completed. ``""`` means the tree was proven quiet.
-    busy: str = ""
-    #: Pids the sweep terminated on the way to proving it quiet.
-    reclaimed: tuple[int, ...] = ()
-
-    def note(self) -> str:
-        """A detail suffix naming what was reclaimed (``""`` when nothing was)."""
-        if not self.reclaimed:
-            return ""
-        return (f" (terminated {len(self.reclaimed)} leftover process(es) in the "
-                f"worktree: pids {_pid_list(self.reclaimed)})")
-
-
-def _pid_list(pids: list[int] | tuple[int, ...]) -> str:
-    """``1, 2, 3 (+5 more)`` — bounded, so a detail stays readable."""
-    shown = ", ".join(str(p) for p in pids[:8])
-    return shown if len(pids) <= 8 else f"{shown} (+{len(pids) - 8} more)"
+#: What :func:`_reclaim_worktree` (and the sweep after a clean exit) established
+#: about the worktree — one type with the validation runner's sweep.
+_Sweep = WorktreeSweep
+_pid_list = pid_list
 
 
 def _is_target_checkout(ctx: ImplementContext) -> bool:
@@ -1539,7 +1840,7 @@ def _reclaim_worktree(ctx: ImplementContext) -> _Sweep:
             pids = procutil.pids_in_dir_strict(wt)
     if pids is None:
         logger.warning("the process scan of %s could not be completed after the "
-                       "agent was terminated — the worktree cannot be proven "
+                       "call was terminated — the worktree cannot be proven "
                        "quiet", wt)
         return _Sweep(busy="the process scan of the worktree could not be "
                            "completed, so it cannot be proven quiet")
@@ -1548,7 +1849,7 @@ def _reclaim_worktree(ctx: ImplementContext) -> _Sweep:
     if not may_signal:
         why_not = ("kill_worktree_procs is off" if not kill_on else
                    "it is the target repo itself, which is never signalled")
-        logger.warning("%d process(es) still running in %s after the agent was "
+        logger.warning("%d process(es) still running in %s after the call was "
                        "terminated (%s) — not signalled: %s",
                        len(pids), wt, pids, why_not)
         return _Sweep(busy=f"{len(pids)} process(es) are still running in the "
@@ -1566,9 +1867,11 @@ def _reclaim_worktree(ctx: ImplementContext) -> _Sweep:
                            f"termination in the worktree (pids "
                            f"{_pid_list(term.survivors)})")
     if term.signalled:
-        logger.warning("terminated %d process(es) the agent's tools left running "
-                       "in %s after the CLI exited (%s) — kill_worktree_procs is "
-                       "on", len(term.signalled), wt, term.signalled)
+        # Neutral on purpose: the sweep also runs after an interrupted validation
+        # run, whose leftovers are the suite's, not the agent's tools'.
+        logger.warning("terminated %d process(es) left running in %s after the "
+                       "call it was sweeping for ended (%s) — kill_worktree_procs "
+                       "is on", len(term.signalled), wt, term.signalled)
     return _Sweep(reclaimed=tuple(term.signalled))
 
 
@@ -1783,6 +2086,46 @@ def _error_text(stdout: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+#: The typed ``api_error`` kinds newer CLIs put in the result envelope when a
+#: usage limit ended the turn.
+_CLI_USAGE_LIMIT_ERRORS = frozenset({"usage_limit_reached", "model_requires_usage_credits"})
+
+
+def _cli_limit_text(stdout: str) -> str:
+    """The CLI's own usage-limit refusal out of its JSON envelope, or ``""``.
+
+    Narrower than :func:`_error_text` on purpose, because what it returns picks
+    a failure regime by itself (:func:`~harness.pipeline.looptools.cli_usage_limit_kind`):
+    the ``result`` counts only when the CLI marked the envelope as a turn that
+    an API error ended — ``is_error`` true with ``subtype`` ``success`` — and
+    either the typed ``api_error`` is a usage-limit kind (newer CLIs type it)
+    or, where the CLI types no error, ``api_error_status`` is 429. That
+    ``result`` is text the CLI synthesised, never the model's; an envelope that
+    is not marked — the agent's own report, quoted as ``agent report:`` — never
+    gets this far, so prose quoting the CLI's wording cannot pick a regime.
+    Unknown is never a proof: any other shape, a typed kind that is not a usage
+    limit, or another status yields ``""`` and the ordinary classifier decides.
+    """
+    if not stdout:
+        return ""
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict) or data.get("is_error") is not True:
+        return ""
+    if data.get("subtype") != "success":
+        return ""
+    kind = data.get("api_error")
+    if kind is not None:
+        if not isinstance(kind, str) or kind not in _CLI_USAGE_LIMIT_ERRORS:
+            return ""
+    elif data.get("api_error_status") != 429:
+        return ""
+    result = data.get("result")
+    return result.strip() if isinstance(result, str) else ""
 
 
 def _tail_elided(text: str, limit: int) -> str:

@@ -62,13 +62,21 @@ class GateResult:
         return {f: r for f, r in self.reports.items() if not r.ok}
 
     def feedback(self, *, max_findings: int = 20) -> str:
-        """A compact, agent-readable description of what failed — for the next prompt."""
+        """A compact, agent-readable description of what failed — for the next prompt.
+
+        File names are spelled as git prints them
+        (:func:`~harness.pipeline.gitutil.display_path`): the feedback reaches
+        the next prompt, the run notes, the review's feedback and — for the
+        ide-handoff backend — the tracked ``TASK.md`` (strict UTF-8), and a
+        changed file whose name is not UTF-8 is surrogate-escaped here: raw,
+        it crashed ``harness pipeline complete`` with UnicodeEncodeError.
+        """
         if self.ok:
             return ""
         lines = ["Grounding gate found references to symbols that do not exist:"]
         shown = 0
         for fname, report in self.failing.items():
-            lines.append(f"\n  In {fname}:")
+            lines.append(f"\n  In {gitutil.display_path(fname)}:")
             for v in report.verdicts:
                 if v.status in ("ungrounded", "contradicted") and shown < max_findings:
                     tip = f"  (did you mean: {', '.join(v.suggestions)}?)" if v.suggestions else ""
@@ -224,7 +232,8 @@ class GroundingGate:
             fpath = self.root / rel
             if not fpath.is_file():
                 logger.debug("grounding oracle: changed file %s no longer exists "
-                             "(deleted/renamed) — nothing to ground", rel)
+                             "(deleted/renamed) — nothing to ground",
+                             gitutil.display_path(rel))
                 continue  # deleted file
             try:
                 code = fpath.read_text(encoding="utf-8")
@@ -233,7 +242,7 @@ class GroundingGate:
                 # symbol in it would reach review undetected.
                 logger.warning("grounding oracle: cannot read changed file %s: %s: %s "
                                "— file skipped, its changes go unverified",
-                               rel, type(exc).__name__, exc)
+                               gitutil.display_path(rel), type(exc).__name__, exc)
                 continue
             lang = detect_language(rel)
             pf = pf_cache.get(lang)
@@ -246,12 +255,15 @@ class GroundingGate:
                                    require_z3=self.require_z3)
                 pf_cache[lang] = pf
             reports[rel] = pf.check(code)
-            logger.debug("grounding oracle: %s [%s]: ok=%s", rel, lang, reports[rel].ok)
+            logger.debug("grounding oracle: %s [%s]: ok=%s", gitutil.display_path(rel),
+                         lang, reports[rel].ok)
 
         ok = all(r.ok for r in reports.values())
         summary = _summary(reports)
         logger.info("grounding oracle verdict: ok=%s, %d file(s) checked (%s) — %s",
-                    ok, len(reports), trunc(", ".join(reports), 200), summary)
+                    ok, len(reports),
+                    trunc(", ".join(gitutil.display_path(r) for r in reports), 200),
+                    summary)
         return GateResult(ok=ok, files_checked=len(reports), reports=reports,
                           summary=summary)
 

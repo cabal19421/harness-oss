@@ -22,4 +22,5 @@ to load this file automatically.)
   untrusted-designs suppression, worktree teardown refusals, and recovery's
   "unknown is never acted on" rule must not be weakened to make a test pass.
 - The agent-cli backend probes the driven CLI's `--help` and passes optional
-  flags only when advertised; never add an unprobed optional flag.
+  flags only when advertised (a pinned `--model` is the one exception); never
+  add another unprobed optional flag.

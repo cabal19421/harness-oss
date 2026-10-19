@@ -16,13 +16,20 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.log import get_logger, redact, step, trunc
 
-from . import gitutil
-from .backends.base import ImplementContext, OracleResult, ValidationReport
+from . import gitutil, shutdown
+from .backends.base import (
+    ImplementContext,
+    OracleResult,
+    ValidationReport,
+    interrupted_oracle,
+)
+from .looptools import quota_budget_covers, quota_reset_seconds
 from .pr import PrResult, attestation_trailer, get_pr_creator, head_bound_to_review
 from .spec import RiskLevel, Task
 from .trace import Tracer
@@ -155,6 +162,30 @@ class ReviewResult:
     # feedback round appends to the tracked TASK.md) must consult this and skip
     # — the refusal's promise is only worth what the next step honours.
     protected_path_refusal: bool = False
+    # NO verdict: a shutdown was requested while this review ran, so a
+    # validation or mutation run it rests on was cut short (the rule: a
+    # validation run the signal cut short has no verdict). ``passed`` is False
+    # only so nothing reads it as a pass; it is not a FAIL either. Nothing was
+    # published, and the caller must leave the task's status, notes and
+    # feedback exactly as they were — not demote it to `failed`, not write a
+    # review-fail note, not append a feedback round.
+    # Also set, with the same contract, when the backend's usage limit refused
+    # the verifier (``VerifierReport.no_verdict``) and no shutdown was asked for
+    # — except that the orchestrator records that refusal on the task's notes.
+    interrupted: bool = False
+    # Set beside ``interrupted`` when that usage limit is why — the same names
+    # as on VerifierReport and OneshotResult: ``usage_limit`` is the refusal's
+    # own text (never empty for such a stop), ``usage_limit_kind`` the regime
+    # the backend gave it (``quota-window``: the window reopens on its own;
+    # ``permanent``: only an operator lifts it; ``""``: it could not tell), and
+    # ``usage_limit_reset_at`` the epoch the window reopens at, when the text
+    # states it (a ``quota-window`` only; parsed at the refusal, in the zone
+    # the CLI names). The orchestrator charges no cycle of max_task_attempts
+    # for such a review, records the three on the task's notes, and decides
+    # from them whether to wait the window out before the review runs again.
+    usage_limit: str = ""
+    usage_limit_kind: str = ""
+    usage_limit_reset_at: float | None = None
 
     def failure_notes_detail(self) -> str:
         """The actionable slice of a FAIL, for the task's run notes.
@@ -184,6 +215,91 @@ class ReviewResult:
             # hand-built results and future gate reorderings.)
             lines.extend(f"  - {r[:600]}" for r in self.verifier_reasons[:5])
         return "\n".join(lines)
+
+
+def stale_submodule_lines(worktree) -> list[str]:
+    """One visible line per submodule checkout KNOWN to be left behind.
+
+    ``⚠ submodule <path> checkout stale: at <stale7>, expected <target7> —
+    checkout could not be moved to the recorded commit; validation ran against
+    the stale checkout``. The commit carries the target; the worktree the
+    oracle ran in holds the stale commit
+    (:func:`~harness.pipeline.gitutil.known_stale_gitlinks`). Neutral about
+    WHY it could not be moved — the commit absent from the clone offline, a
+    hold, an uninitialised checkout — because the record does not say.
+
+    A checkout that also holds tracked edits gets ``, which holds uncommitted
+    edits this commit does not carry`` appended: unlike a clean one it stays
+    in the listed change, with git's ``-dirty`` marker
+    (:func:`~harness.pipeline.gitutil.known_stale_unedited`).
+    """
+    known = gitutil.known_stale_gitlinks(worktree)
+    unedited = gitutil.known_stale_unedited(worktree) if known else set()
+    return [f"⚠ submodule {gitutil.display_path(path)} checkout stale: at "
+            f"{stale[:7]}, expected {target[:7]} — checkout could not be moved "
+            "to the recorded commit; validation ran against the stale checkout"
+            + ("" if path in unedited
+               else ", which holds uncommitted edits this commit does not carry")
+            for path, (target, stale) in sorted(known.items())]
+
+
+def _md_code(text: str) -> str:
+    """*text* as ONE Markdown code span, whatever backticks it holds.
+
+    The fence is one backtick longer than the longest run inside, padded with
+    a space when the text starts or ends with a backtick or a space (CommonMark
+    strips exactly one from each side of a padded span). A fixed single
+    backtick ended the span at a name's first backtick, and the rest of the
+    name — the agent's to choose — rendered as Markdown in the PR body.
+    """
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * (longest + 1)
+    pad = " " if text[:1] in ("`", " ") or text[-1:] in ("`", " ") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _usage_limit_outcome(report: VerifierReport, config, *,
+                         now: float) -> tuple[float | None, str]:
+    """``(reset_at, what it means)`` for a review the usage limit refused.
+
+    *reset_at* is the epoch the window reopens at: the reset the refusal states
+    (:func:`~harness.pipeline.looptools.quota_reset_seconds`, in the zone the
+    CLI names), and only when the backend calls it a window that reopens on its
+    own (``quota-window``) — ``None`` otherwise. The sentence names the quota-wait
+    policy's case and promises nothing a caller may not do (``pipeline
+    complete`` and ``pipeline run`` both end here): a reset inside the
+    quota-wait budget (quota_wait_cap_seconds × max_quota_waits, :func:`~harness.
+    pipeline.looptools.quota_budget_covers`) is waited out before the review
+    runs again, one past it is not, a window with no reset gets the bounded
+    default wait, and a cap only an operator lifts — or a backend that could
+    not tell, since unknown is never a proof that it reopens — waits for one.
+    """
+    kind = report.usage_limit_kind
+    if kind == "permanent":
+        return None, ("only an operator can lift this limit (raise the cap, add "
+                      "credits, or grant the seat or model): every review is "
+                      "refused the same way until one does")
+    if kind != "quota-window":
+        return None, ("the backend did not say whether the limit reopens on its "
+                      "own, so it is treated as one only an operator lifts")
+    reset = quota_reset_seconds(report.usage_limit, now=now)
+    if reset is None:
+        return None, ("it states no reset, so the bounded default quota wait "
+                      "applies before the change is reviewed again")
+    cap, waits = config.quota_wait_cap_seconds, config.max_quota_waits
+    when = (f"in ~{reset / 3600:.1f}h" if reset >= 3600 else
+            f"in ~{reset / 60:.0f}m" if reset >= 60 else "now")
+    if quota_budget_covers(report.usage_limit, cap=cap, waits=waits, now=now):
+        return now + reset, (f"the window reopens {when}, within the quota-wait "
+                             f"budget (quota_wait_cap_seconds × max_quota_waits), so "
+                             f"it is waited out before the change is reviewed again")
+    return now + reset, (f"the window reopens {when}, beyond the quota-wait budget "
+                         f"(quota_wait_cap_seconds × max_quota_waits = "
+                         f"{max(0.0, cap * waits) / 3600:.1f}h), so no review runs "
+                         f"until it is within that budget")
 
 
 class ReviewGate:
@@ -216,6 +332,16 @@ class ReviewGate:
         logger.debug("[%s] review gate start: pr_mode=%s open_pr=%s oracle=%s",
                      task.id, self.pr_mode, open_pr,
                      "precomputed by caller" if oracle is not None else "will run now")
+        # A run that died mid-mutation (a second Ctrl-C's hard exit, a SIGKILL)
+        # can have left a mutant on disk, and the freeze below commits what is
+        # on disk — so the original goes back first, from the mutation gate's
+        # record, over the exact mutant only. Raises MutantRestoreError when the
+        # file holds anything else (somebody's edit), its exact mutant sits
+        # where the record cannot apply (HEAD moved, or a tree the record cannot
+        # prove its own), or the record or that file cannot be read or even
+        # looked up: nothing is committed, and the task is left as it was.
+        from .mutation import record_path, restore_pending
+        restore_pending(record_path(ctx.config.state_dir, task.id), ctx.worktree)
         # Bind the verdict to a COMMIT before anything is judged: the risk level
         # this gate stamps on a PR is only meaningful if the pushed tree is the
         # tree that earned it. Leftover work is committed here rather than inside
@@ -231,17 +357,39 @@ class ReviewGate:
             # possibly publishing) a tree the pipeline was told not to touch.
             return self._protected_path_fail(ctx, exc)
         oracle = oracle or self._oracle(ctx)
+        if oracle.validation_interrupted or shutdown.requested():
+            # The rule: a validation run the shutdown handler cut short has no
+            # verdict. Judging on it would FAIL the task over the operator's own
+            # Ctrl-C (or pass a suite that never finished).
+            return self._interrupted_result(ctx, reviewed_sha, stage="oracle")
         # Review the task's OWN delta (post-seed), not the seeded dependency code —
         # so risk/sensitive-path detection doesn't re-fire on every dependant.
         changed = gitutil.changed_files(ctx.worktree, base=ctx.diff_base)
+        # Names reach every printed, logged, traced or published surface below
+        # through gitutil.display_path only: `changed` holds REAL names, and a
+        # name that is not UTF-8 (surrogate-escaped) crashed every strict
+        # encoder downstream — the CLI's report, the trace span, gh's stdin.
         logger.debug("[%s] task delta vs base %r: %d changed file(s): %s",
                      task.id, ctx.diff_base, len(changed),
-                     trunc(", ".join(changed)) if changed else "(none)")
+                     trunc(", ".join(gitutil.display_path(p) for p in changed))
+                     if changed else "(none)")
 
         risk, reasons = self._assess_risk(
             task, oracle, changed,
             no_operator_oracle=ctx.untrusted_without_operator_oracle,
             untrusted_design=bool(ctx.config.untrusted_designs))
+        # A submodule checkout KNOWN to be left behind (its target commit is
+        # not in its clone and nothing may fetch it): not dirt and not part of
+        # the change — the listers above leave it out — but the review is
+        # TOLD, because validation ran against the stale checkout, not the
+        # commit this PR records.
+        stale_notes = stale_submodule_lines(ctx.worktree)
+        if stale_notes:
+            ctx.trace.span("stale_submodules", count=len(stale_notes),
+                           detail="; ".join(stale_notes)[:300])
+            if risk == "low":
+                risk = "medium"
+            reasons.extend(stale_notes)
         passed = oracle.passed
         extra_feedback: list[str] = []
         mutation_survivors: list[str] = []
@@ -252,21 +400,22 @@ class ReviewGate:
         # touching them fails review outright, regardless of a green oracle.
         frozen_touched = sorted(set(changed) & set(task.acceptance_paths))
         if frozen_touched:
+            frozen_shown = [gitutil.display_path(p) for p in frozen_touched]
             logger.warning("[%s] frozen acceptance test(s) modified: %s — review "
                            "forced to FAIL and risk forced to high (these files "
                            "ARE the requirement; the implementer graded its own "
-                           "homework)", task.id, ", ".join(frozen_touched))
+                           "homework)", task.id, ", ".join(frozen_shown))
             passed = False
             risk = "high"
             reasons.append("modified frozen acceptance test(s): "
-                           + ", ".join(frozen_touched[:4]))
+                           + ", ".join(frozen_shown[:4]))
             extra_feedback.append(
                 "You modified frozen acceptance tests: "
-                + ", ".join(frozen_touched)
+                + ", ".join(frozen_shown)
                 + ". These files ARE the requirement and are read-only for this "
                   "task — restore them exactly (git checkout <ref> -- <file>) and "
                   "change the implementation until they pass as written.")
-            ctx.trace.span("freeze", ok=False, files=", ".join(frozen_touched))
+            ctx.trace.span("freeze", ok=False, files=", ".join(frozen_shown))
 
         # Mutation scoring: a green suite that kills few mutants is theater.
         threshold = (task.mutation_min if task.mutation_min is not None
@@ -277,6 +426,12 @@ class ReviewGate:
                          "task-level (mutation:)" if task.mutation_min is not None
                          else "config mutation_min_score")
             mut = self._mutation_gate(ctx, task, changed)
+            if shutdown.requested():
+                # The mutants' suite runs were cut short, and an interrupted run
+                # is not green — so it scores as a KILLED mutant, and the score
+                # is noise in whichever direction: no verdict.
+                return self._interrupted_result(ctx, reviewed_sha,
+                                                stage="mutation gate")
             if mut is not None and mut.total > 0 and (mut.score or 0.0) < threshold:
                 logger.warning("[%s] mutation gate FAILED: %s < required %.0f%% — "
                                "review forced to FAIL (survivors mean the suite "
@@ -331,7 +486,32 @@ class ReviewGate:
         verify_on = task.verify if task.verify is not None else ctx.config.verify
         can_verify = self._ask is not None or self._ask_structured is not None
         if verify_on and passed and can_verify:
-            vr = self._verifier_gate(ctx, task, oracle, changed)
+            vr = self._verifier_gate(ctx, task, oracle, changed,
+                                     stale_notes=stale_notes)
+            if vr.no_verdict:
+                # The backend's usage limit refused the verifier: no verdict —
+                # not a skip (the change was never judged), and not an abstain
+                # (that would publish it while the limit is in force). The same
+                # handling as a review a shutdown cut short: nothing published,
+                # nothing recorded as a failure. The verifier never waits
+                # mid-call; the orchestrator records the refusal on the task's
+                # notes and applies the quota-wait policy before the review
+                # runs again.
+                now = time.time()
+                reset_at, then = _usage_limit_outcome(vr, ctx.config, now=now)
+                detail = (f"review stopped at the verifier gate — {vr.no_verdict}. "
+                          f"Nothing was published and nothing recorded as a "
+                          f"failure; {then}")
+                logger.warning("[%s] %s", task.id, detail)
+                return ReviewResult(
+                    task_id=task.id, passed=False, risk=task.risk,
+                    grounding_ok=False,
+                    summary=f"[{task.id}] NO VERDICT  usage limit\n  {detail}",
+                    reasons=[detail], reviewed_sha=reviewed_sha, interrupted=True,
+                    usage_limit=vr.usage_limit or vr.no_verdict,
+                    usage_limit_kind=vr.usage_limit_kind,
+                    usage_limit_reset_at=reset_at,
+                )
             if vr.blocking:
                 logger.warning("[%s] verifier gate FAILED: %s — review forced to "
                                "FAIL", task.id, vr.summary())
@@ -353,17 +533,27 @@ class ReviewGate:
             logger.debug("[%s] verifier enabled but backend has no one-shot path "
                          "— skipped (fail-open)", task.id)
 
+        if shutdown.requested():
+            # Last check before the verdict is acted on: a verifier call the
+            # handler terminated reads as "skipped" and fails OPEN, so a request
+            # that landed after the checks above would otherwise still mark the
+            # task done and open its PR for a run the operator stopped.
+            return self._interrupted_result(ctx, reviewed_sha, stage="review gates")
+
         logger.info("[%s] review verdict: %s  risk=%s  (validation=%s, "
                     "grounding=%s, files=%d) — reasons: %s",
                     task.id, "PASS" if passed else "FAIL", risk,
-                    "green" if oracle.validation_ok else "red",
+                    # A suite with no commands is green only vacuously.
+                    "not run" if oracle.validation_vacuous
+                    else "green" if oracle.validation_ok else "red",
                     "ok" if oracle.grounding_ok else "FAILED",
                     len(changed), "; ".join(reasons))
 
         pr_result: PrResult | None = None
         if open_pr and passed:
             pr_result = self._open_pr(ctx, task, risk, oracle, changed,
-                                      reviewed_sha=reviewed_sha)
+                                      reviewed_sha=reviewed_sha,
+                                      stale_notes=stale_notes)
         elif open_pr and not passed:
             logger.info("[%s] PR withheld: review not green", task.id)
             reasons.append("oracle not green — PR withheld")
@@ -398,19 +588,44 @@ class ReviewGate:
         and a committed tree is what survives ``Supervisor.recover``'s
         ``git reset --hard`` — but it does mean "branch has a commit" no longer
         implies "the review passed".
+
+        Edits hidden behind index flags are exposed first, whether or not this
+        review commits (:func:`~harness.pipeline.gitutil.expose_hidden_edits`).
+        That writes no file and stages nothing, and without it the dirty gate
+        below, the frozen-acceptance guard and the verifier's diff would all
+        judge a tree whose edits git was told not to look at — while the
+        oracle, run in the worktree, tests them. Flags that cannot be cleared
+        raise :class:`~harness.pipeline.gitutil.HiddenIndexError`, a
+        ``ProtectedPathError``, which :meth:`review` turns into a FAIL.
         """
         from .sanitize import sanitize_publication
 
         task = ctx.task
-        if commit and gitutil.working_tree_dirty(ctx.worktree):
-            logger.debug("[%s] worktree %s dirty at review time — committing it "
-                         "now so the oracle, the risk level and the push all "
-                         "refer to one commit", task.id, ctx.worktree)
+        # Raises before anything is staged or committed; deliberately not caught
+        # here, for the same reason as the protected-path refusal below.
+        cleared = gitutil.expose_hidden_edits(ctx.worktree)
+        if cleared:
+            logger.warning("[%s] index flags hid edits to %d tracked path(s) in "
+                           "%s from review — cleared, so the commit and every "
+                           "gate below see them", task.id, len(cleared),
+                           ctx.worktree)
+            ctx.trace.span("hidden_index", ok=True, cleared=len(cleared),
+                           files=", ".join(gitutil.display_path(p)
+                                           for p in cleared[:10])[:200])
+        # A `git status` that fails (None) is not a clean tree: the sweep runs,
+        # and a stage git cannot complete raises StageFailedError into the
+        # FAIL below — never "nothing to commit" for a tree the oracle and the
+        # verifier were shown with the work still uncommitted in it.
+        if commit and gitutil.working_tree_dirty(ctx.worktree) is not False:
+            logger.debug("[%s] worktree %s dirty (or unreadable) at review time — "
+                         "committing it now so the oracle, the risk level and "
+                         "the push all refer to one commit", task.id, ctx.worktree)
             # This is the sweep the protected-path guard exists for: whatever the
             # agent left in the worktree is about to become one reviewed commit
-            # and then a push. Raises ProtectedPathError, which review() turns
-            # into a FAIL — deliberately not caught here, where the only options
-            # would be to stage anyway or to invent a verdict.
+            # and then a push. Raises ProtectedPathError (a failed stage's
+            # StageFailedError included), which review() turns into a FAIL —
+            # deliberately not caught here, where the only options would be to
+            # stage anyway or to invent a verdict.
             gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
             # Decide the commit from the INDEX, not from `git status` — the same
             # rule as both agent loops' `_ensure_committed`. Status can report
@@ -443,40 +658,125 @@ class ReviewGate:
                              exc: gitutil.ProtectedPathError) -> ReviewResult:
         """FAIL the review on a protected-path refusal, worktree untouched.
 
-        Nothing was staged, nothing was committed and nothing was reset: the
-        contract is that the operator finds the tree exactly as the agent left
-        it, so the offending file can be inspected before anyone decides what to
-        do with it. The reason rides in ``reasons`` because that is what
+        Nothing was committed and nothing was reset: the contract is that the
+        operator finds the tree as the agent left it, so the offending file can
+        be inspected before anyone decides what to do with it. For a protected
+        path nothing was staged either; an
+        :class:`~harness.pipeline.gitutil.UnregisteredGitlinkError` comes after
+        the stage, and only the offending gitlink was unstaged — the summary
+        and the feedback say which happened, and the feedback's advice differs
+        (delete the leftover or `git submodule add` it, versus remove or ignore
+        a protected file). The reason rides in ``reasons`` because that is what
         ``_summary`` puts into the task's notes — the morning-after surface, and
         the only place this refusal would otherwise be visible.
+
+        A :class:`~harness.pipeline.gitutil.HiddenIndexError` — index flags
+        hiding edits that could not be cleared, or an index that could not be
+        read to rule them out — is not a protected file either: its feedback
+        names the hidden files and how to unhide them
+        (:data:`~harness.pipeline.gitutil.UNHIDE_ADVICE`), and its
+        ``protected_path`` span names no rule, since no ``protected_paths``
+        rule matched anything.
+
+        Nor is a :class:`~harness.pipeline.gitutil.StageFailedError` — ``git
+        add -A`` itself failed (a nested ``git init`` with no commit, a stale
+        ``index.lock``, a ``.git`` that points nowhere): its summary says
+        "stage-failure refusal", and its feedback points at git's own error
+        rather than at operator configuration.
         """
         task = ctx.task
         reason = str(exc)
+        hidden = isinstance(exc, gitutil.HiddenIndexError)
+        gitlink = isinstance(exc, gitutil.UnregisteredGitlinkError)
+        staged = isinstance(exc, gitutil.StageFailedError)
         logger.error("[%s] review FAILED before the oracle ran: %s", task.id, reason)
         ctx.trace.span("protected_path", ok=False, task=task.id,
-                       path=exc.path, rule=exc.rule, detail=reason[:200])
+                       path=gitutil.display_path(exc.path),
+                       rule="" if hidden else exc.rule, detail=reason[:200])
         reasons = [reason]
         summary = "\n".join([
             f"[{task.id}] FAIL  risk=high  files=0",
-            "  protected-path refusal — index and worktree preserved, nothing committed",
+            ("  unregistered-gitlink refusal — only the offending gitlink(s) were "
+             "unstaged, the worktree is untouched, nothing committed" if gitlink
+             else "  hidden-index refusal — index flags that hide edits from `git "
+                  "status` could not be cleared or ruled out, nothing staged or "
+                  "committed"
+             if hidden
+             else "  stage-failure refusal — `git add -A` failed, nothing staged "
+                  "or committed, the worktree is untouched"
+             if staged
+             else "  protected-path refusal — index and worktree preserved, "
+                  "nothing committed"),
             "  reasons: " + "; ".join(reasons),
         ])
+        if isinstance(exc, gitutil.HiddenIndexError):
+            paths = exc.paths
+            shown = ", ".join(gitutil.display_path(p) for p in paths[:5]) + (
+                f" (+{len(paths) - 5} more)" if len(paths) > 5 else "")
+            advice = ("" if gitutil.UNHIDE_ADVICE in reason
+                      else f" To make them visible, {gitutil.UNHIDE_ADVICE}.")
+            feedback = (
+                f"The pipeline refused to commit this worktree: {reason}. "
+                + (f"Index flags hide your edits to {shown} from `git status` "
+                   f"and `git add -A`, so they could be neither reviewed nor "
+                   f"committed.{advice} "
+                   if paths else
+                   "The index could not be read to rule out flags that hide "
+                   "edits from `git status` and `git add -A`. ")
+                + "Nothing was staged or committed — your work is intact.")
+        elif gitlink:
+            feedback = (
+                f"The pipeline refused to commit this worktree: {reason}. "
+                "Only that gitlink was unstaged — the directory and the rest of "
+                "your work are as you left them. If nothing in the directory is "
+                "needed, delete it, or keep its files as plain files of this "
+                "repository; register it as a submodule (`git submodule add "
+                "<url> <path>`) only with a URL every other clone can fetch.")
+        elif staged:
+            feedback = (
+                f"The pipeline could not commit this worktree: {reason} "
+                "Nothing was staged, committed or reset — your work is intact. "
+                "Fix what git reports, and the work can then be committed.")
+        else:
+            feedback = (
+                f"The pipeline refused to commit this worktree: {reason}. "
+                "Nothing was staged or reset — your work is intact. Remove that "
+                "file from the worktree (or add it to .gitignore) and leave the "
+                "task's own changes in place; it is protected by operator "
+                "configuration, not by anything you can override.")
         return ReviewResult(
             task_id=task.id, passed=False, risk="high",
             # Not "grounding failed" — grounding never ran. False is the honest
             # value for a gate that produced no proof (unknown is never a pass).
             grounding_ok=False, summary=summary, reasons=reasons,
-            protected_path_refusal=True,
-            feedback=(
-                f"The pipeline refused to commit this worktree: {reason}. "
-                "Nothing was staged or reset — your work is intact. Remove that "
-                "file from the worktree (or add it to .gitignore) and leave the "
-                "task's own changes in place; it is protected by operator "
-                "configuration, not by anything you can override."),
+            protected_path_refusal=True, feedback=feedback,
+        )
+
+    def _interrupted_result(self, ctx: ImplementContext, reviewed_sha: str, *,
+                            stage: str) -> ReviewResult:
+        """No verdict: a shutdown was requested while the review ran.
+
+        Not a FAIL — a validation or mutant run the handler terminated says
+        nothing about the change — and not a PASS, so nothing is published and
+        no risk is assessed. The caller leaves the task exactly as it was
+        (:attr:`ReviewResult.interrupted`), and the next run reviews it again.
+        """
+        task = ctx.task
+        sig = shutdown.signame() or "a shutdown request"
+        detail = (f"review interrupted by {sig} during the {stage} — no verdict; "
+                  f"nothing was published and nothing is recorded as a failure")
+        logger.warning("[%s] %s", task.id, detail)
+        return ReviewResult(
+            task_id=task.id, passed=False, risk=task.risk,
+            # No proof was produced; unknown is never reported as a pass.
+            grounding_ok=False,
+            summary=f"[{task.id}] INTERRUPTED  no verdict\n  {detail}",
+            reasons=[detail], reviewed_sha=reviewed_sha, interrupted=True,
         )
 
     def _verifier_gate(self, ctx: ImplementContext, task: Task,
-                       oracle: OracleResult, changed: list[str]) -> VerifierReport:
+                       oracle: OracleResult, changed: list[str], *,
+                       stale_notes: list[str] | None = None) -> VerifierReport:
         """Ask fresh-context models whether *changed* actually implements the task.
 
         Runs >= 2 independent adversarial verifiers (``verify_change`` floors the
@@ -506,8 +806,15 @@ class ReviewGate:
                   samples=samples):
             report = verify_change(
                 ask=self._ask, task_title=sanitize_design(task.title), task_intent=intent,
-                diff=diff, grounding_summary=oracle.grounding.summary,
-                validation_ok=oracle.validation_ok, samples=samples,
+                diff=diff,
+                # Rendered as its own bullet under "Signals already collected".
+                grounding_summary="\n- ".join([oracle.grounding.summary,
+                                               *(stale_notes or [])]),
+                # An oracle with no commands passed only vacuously; telling the
+                # judge "passed" would hand it corroboration that does not exist.
+                validation_ok=(None if oracle.validation_vacuous
+                               else oracle.validation_ok),
+                samples=samples,
                 ask_structured=self._ask_structured,
                 file_manifest=manifest,
             )
@@ -522,6 +829,12 @@ class ReviewGate:
                        # blocks instead of failing open — distinguishable in the
                        # trace from a verifier that judged the diff wrong.
                        error=report.error[:200],
+                       # Non-empty only when the backend's usage limit stopped the
+                       # gate: NO verdict, whatever `verdict` says (its abstain is
+                       # only the fallback for a reader that ignores this) — never
+                       # an abstain a human was asked to review.
+                       no_verdict=report.no_verdict[:200],
+                       usage_limit_kind=report.usage_limit_kind,
                        reasons="; ".join(report.reasons[:4]))
         return report
 
@@ -534,7 +847,7 @@ class ReviewGate:
         helper's entire pre-existing under-tested logic in its denominator. An
         empty ``target_paths`` keeps the historical behaviour exactly.
         """
-        from .mutation import mutation_score
+        from .mutation import mutation_score, record_path
 
         targets = [
             p for p in changed
@@ -562,7 +875,7 @@ class ReviewGate:
                     "nothing it owns can be graded; widen `paths:` or check that "
                     "the task edited what it declared",
                     task.id, trunc(", ".join(declared), 200), len(targets),
-                    trunc(", ".join(targets), 200))
+                    trunc(", ".join(gitutil.display_path(p) for p in targets), 200))
                 ctx.trace.span("mutation", total=0, killed=0, score=None,
                                survivors=0,
                                skipped="declared target_paths matched no changed "
@@ -575,21 +888,28 @@ class ReviewGate:
                     "declared): %s — these stay covered by grounding, validation, "
                     "the verifier diff and the acceptance freeze",
                     task.id, len(owned), len(targets),
-                    trunc(", ".join(sorted(set(targets) - set(owned))), 300))
+                    trunc(", ".join(gitutil.display_path(p) for p in
+                                    sorted(set(targets) - set(owned))), 300))
             targets = owned
         logger.debug("[%s] mutation targets (%d of %d changed): %s",
                      task.id, len(targets), len(changed),
-                     trunc(", ".join(targets)))
+                     trunc(", ".join(gitutil.display_path(p) for p in targets)))
         report = mutation_score(
             Path(ctx.worktree), targets, ctx.validation,
             max_mutants=ctx.config.mutation_max_mutants,
             timeout=ctx.config.mutation_timeout,
+            record=record_path(ctx.config.state_dir, task.id),
         )
+        # A shutdown cut the mutants' suite runs short, and each interrupted run
+        # counted as a kill: the score is noise, so the span carries none and
+        # review() returns no verdict.
+        interrupted = shutdown.requested()
         ctx.trace.span("mutation", total=report.total, killed=report.killed,
-                       score=(None if report.score is None
+                       score=(None if report.score is None or interrupted
                               else round(report.score, 3)),
                        survivors=len(report.survivors),
-                       skipped=report.skipped_reason)
+                       skipped=("interrupted by a shutdown — no verdict"
+                                if interrupted else report.skipped_reason))
         return report
 
     # ── internals ─────────────────────────────────────────────────────────────
@@ -600,6 +920,21 @@ class ReviewGate:
         with step(logger, "oracle: validation suite", task=ctx.task.id,
                   commands=len(ctx.validation)):
             report = _run(ctx)
+        if shutdown.requested():
+            # Same rule as CodingBackend.run_oracle: a request that landed after
+            # the suite's last command still cut short the probe its verdict
+            # rests on. No verdict, and grounding is not started.
+            report.interrupted = True
+        # Or a command — branch code, run here AFTER the freeze — left a writer
+        # in the worktree that the sweep after it could not reclaim (a clean
+        # exit is not a finished tree): judged now, its next write would land
+        # on top of the reviewed commit and be published with it. No verdict
+        # either; review() stops on `validation_interrupted`, which
+        # interrupted_oracle sets.
+        if report.interrupted or report.left_running:
+            _trace_validation(ctx.trace, report, len(ctx.validation),
+                              ctx.trace.duration(t0))
+            return interrupted_oracle(ctx, report)
         validation_ok, output = report.ok, report.output
         if not validation_ok:
             logger.debug("[%s] validation FAILED (%d defect leg(s), %d could not "
@@ -622,6 +957,7 @@ class ReviewGate:
             passed=validation_ok and grounding.ok,
             validation_ok=validation_ok, grounding=grounding, output=output,
             validation_legs=report.legs, required=report.required,
+            validation_vacuous=report.vacuous,
         )
 
     def _assess_risk(self, task: Task, oracle: OracleResult,
@@ -657,10 +993,14 @@ class ReviewGate:
             return "high", reasons
         hot = _sensitive_paths(changed)
         if hot:
+            # display_path: this reason lands in the summary, the run notes, the
+            # review span and the CLI's report, and a surrogate-escaped name
+            # crashed `pipeline run` / `pipeline complete` printing it.
+            hot_shown = ", ".join(gitutil.display_path(p) for p in hot[:4])
             logger.debug("[%s] risk escalator hit: %d sensitive path(s) matched "
                          "the human-review token set (%s) → high",
-                         task.id, len(hot), ", ".join(hot[:4]))
-            reasons.append(f"touches sensitive paths: {', '.join(hot[:4])}")
+                         task.id, len(hot), hot_shown)
+            reasons.append(f"touches sensitive paths: {hot_shown}")
             return "high", reasons
         if task.risk == "high":
             logger.debug("[%s] risk escalator hit: design tags this task high "
@@ -678,11 +1018,13 @@ class ReviewGate:
             declared = [] if untrusted_design else list(task.target_paths or [])
             undeclared = [p for p in agent_cfg if not _named_explicitly(p, declared)]
             if undeclared:
+                undeclared_shown = ", ".join(gitutil.display_path(p)
+                                             for p in undeclared[:4])
                 logger.warning("[%s] risk escalator hit: %d changed path(s) are "
                                "agent memory/config that every future agent "
                                "session in this repo loads (%s), and %s → high "
                                "(advisory: a human must look)", task.id,
-                               len(undeclared), ", ".join(undeclared[:4]),
+                               len(undeclared), undeclared_shown,
                                "under --untrusted the design's own paths: "
                                "exempts nothing" if untrusted_design else
                                "the task's paths: does not name them")
@@ -690,11 +1032,12 @@ class ReviewGate:
                         if len(undeclared) > 4 else "")
                 reasons.append("edits agent memory/config that loads into every "
                                "future agent session: "
-                               + ", ".join(undeclared[:4]) + more)
+                               + undeclared_shown + more)
                 return "high", reasons
             logger.debug("[%s] agent memory/config path(s) %s are named "
                          "explicitly by the task's paths: — no escalation",
-                         task.id, ", ".join(agent_cfg[:4]))
+                         task.id, ", ".join(gitutil.display_path(p)
+                                            for p in agent_cfg[:4]))
         if no_operator_oracle:
             # Last of the hard escalators, so it never displaces a more specific
             # reason — but it is a hard one: no amount of green, and no size of
@@ -714,6 +1057,25 @@ class ReviewGate:
             logger.debug("[%s] risk: oracle not green → medium (never auto-merge "
                          "a red diff)", task.id)
             reasons.append("validation not green")
+            return "medium", reasons
+
+        # A green with NO validation commands is not "fully covered by
+        # validation" — spec.py's definition of low — it is no coverage at all.
+        # Advisory, like the empty-diff rule below: the gate itself stays
+        # fail-open on an unconfigured oracle (an infrastructure gap the agent
+        # cannot fix), so this floors the risk rather than refusing. Under
+        # --untrusted the same gap already returned high above.
+        if oracle.validation_vacuous:
+            logger.debug("[%s] risk: green oracle but NO validation commands ran "
+                         "— nothing was tested → medium", task.id)
+            reasons.append("no validation commands ran — green attests grounding only")
+            if not changed:
+                # The empty-diff hint below must survive this floor: both are
+                # medium, and returning first hid the one that says the diff
+                # base may be missing. Not "green oracle" here — none ran.
+                logger.debug("[%s] risk: ...and the diff is EMPTY — likely a missing "
+                             "diff base or no work done", task.id)
+                reasons.append("no changed files detected — verify the diff")
             return "medium", reasons
 
         # An empty diff is NOT "small and mechanical" — it usually means the
@@ -739,7 +1101,8 @@ class ReviewGate:
 
     def _open_pr(self, ctx: ImplementContext, task: Task, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str], *,
-                 reviewed_sha: str = "") -> PrResult:
+                 reviewed_sha: str = "",
+                 stale_notes: list[str] | None = None) -> PrResult:
         from .sanitize import sanitize_publication
 
         creator = get_pr_creator(self.pr_mode)
@@ -751,7 +1114,7 @@ class ReviewGate:
                              validation=ctx.validation,
                              rejected=ctx.rejected_validation,
                              no_operator_oracle=ctx.untrusted_without_operator_oracle,
-                             reviewed_sha=reviewed_sha)
+                             reviewed_sha=reviewed_sha, stale_notes=stale_notes)
         branch = task.branch or gitutil.current_branch(ctx.worktree)
         # The push/commit is the only repo-level git mutation → serialise it.
         with step(logger, "open PR (includes wait on repo git lock)",
@@ -781,7 +1144,8 @@ class ReviewGate:
                  changed: list[str], *, validation: list[str] | None = None,
                  rejected: list[str] | None = None,
                  no_operator_oracle: bool = False,
-                 reviewed_sha: str = "") -> str:
+                 reviewed_sha: str = "",
+                 stale_notes: list[str] | None = None) -> str:
         """Render the PR body. *validation* is the oracle that actually **ran**.
 
         It defaults to ``task.validation`` — the list the design declared — but a
@@ -805,11 +1169,40 @@ class ReviewGate:
 
         *reviewed_sha* is the commit the verdict is about; the trailer names it,
         so a body that outlives a later push visibly attests an earlier head.
+
+        An oracle that ran NO validation command (``oracle.validation_vacuous``,
+        or a leg-less result over an empty *validation*) is published as "no
+        validation ran",
+        never as "✅ all green": the gate passes it — an unconfigured oracle is
+        an infrastructure gap — but a pass over nothing is not a test result.
+
+        The body is a fixed point of gh's read path, which is how an adopted PR
+        is read back and checked against its trailer's digest: control
+        characters are neutralized by the scrub, and each literal backslash-u
+        escape gh would also rewrite is respelled after it
+        (:func:`~harness.pipeline.sanitize.neutralize_gh_escapes`). A body
+        either pass changed says so in a visible note above the trailer, since
+        a command listed in it may then differ from the one that ran.
         """
-        from .sanitize import sanitize_publication
+        from .sanitize import (
+            neutralize_controls,
+            neutralize_gh_escapes,
+            sanitize_publication,
+        )
 
         commands = task.validation if validation is None else validation
-        files = "\n".join(f"- `{p}`" for p in changed) or "- (no tracked changes detected)"
+        # The oracle's own flag, or — for a result that carries no legs, e.g.
+        # one built by hand — the list this body attests being empty: a green
+        # over that list attests nothing. A result WITH legs did run them,
+        # whatever list a caller without the context passed.
+        ran_nothing = oracle.validation_vacuous or (
+            not commands and not oracle.validation_legs)
+        # display_path: every name is listed the way git prints it — one line
+        # of printable ASCII; raw, a non-UTF-8 name could not even reach gh's
+        # stdin, and a newline in one forged list entries. _md_code: a
+        # backtick in a name no longer ends its code span early.
+        files = ("\n".join(f"- {_md_code(gitutil.display_path(p))}" for p in changed)
+                 or "- (no tracked changes detected)")
         validation_md = "\n".join(f"- `{c}`" for c in commands) or "- (none)"
         if rejected:
             # Not "declared by the design": the same list can carry an operator
@@ -826,6 +1219,16 @@ class ReviewGate:
                 "command above was chosen by the design under review, not by the "
                 "operator, so a green result attests only what that design chose to "
                 "check. Risk is forced to `high` for human review.")
+        if stale_notes:
+            validation_md += "\n\n" + "\n".join(f"> {note}" for note in stale_notes)
+        if ran_nothing:
+            validation_md += (
+                "\n\n> ⚪ **No validation ran.** This task's oracle had no "
+                "validation command to run, so no test, type check or lint judged "
+                "this change — the result below rests on symbol grounding alone.")
+            result = "⚪ no validation ran" if oracle.passed else "❌ not green (no validation ran)"
+        else:
+            result = "✅ all green" if oracle.passed else "❌ not green"
         body = f"""## {task.title}
 
 Implements task `{task.id}` from design `{task.design_doc}`.
@@ -837,7 +1240,7 @@ Implements task `{task.id}` from design `{task.design_doc}`.
 ### Validation (oracle)
 {validation_md}
 
-Result: {'✅ all green' if oracle.passed else '❌ not green'} — {oracle.grounding.summary}
+Result: {result} — {oracle.grounding.summary}
 
 ### Changed files
 {files}
@@ -859,13 +1262,34 @@ Result: {'✅ all green' if oracle.passed else '❌ not green'} — {oracle.grou
         # also carries the digest of exactly this scrubbed text, which is how an
         # adopted PR edited by hand since is told apart from harness's own.
         published = sanitize_publication(body)
-        return f"{published}{attestation_trailer(task.id, risk, reviewed_sha, published)}"
+        # An adopted PR is read back through gh, whose read path rewrites the
+        # control characters the scrub just neutralized AND the literal
+        # backslash-u escapes for them (`\u001b` reads back as `\^[`): a body
+        # carrying either never matched its own digest again, and the refresh
+        # was refused forever as "edited after harness published it". Respelled
+        # here, for the body only, and before the digest — never inside the
+        # scrub, which also renders the ide-handoff packet's oracle commands.
+        readable = neutralize_gh_escapes(published)
+        if readable != published or neutralize_controls(body) != body:
+            readable += (
+                "\n> ⚠️ **Control characters were neutralized for publication.** "
+                "gh rewrites them when it reads a PR back, so escape sequences in "
+                "the text above were dropped, other control characters are shown "
+                "as `\ufffd`, and each literal backslash-`u00XX` escape is written "
+                "with braces (`\\u{00XX}`) — a command listed above may differ "
+                "from the one that ran.\n")
+        return f"{readable}{attestation_trailer(task.id, risk, reviewed_sha, readable)}"
 
     def _summary(self, task: Task, passed: bool, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str],
                  pr: PrResult | None, *, reasons: list[str] | None = None) -> str:
         head = f"[{task.id}] {'PASS' if passed else 'FAIL'}  risk={risk}  files={len(changed)}"
         lines = [head, f"  {oracle.grounding.summary}"]
+        if oracle.validation_vacuous:
+            # Otherwise a PASS here reads as a tested change on the surface a
+            # human checks the morning after.
+            lines.append("  validation=not run (no validation commands — nothing "
+                         "was tested)")
         # The summary lands in the task's notes — the morning-after surface —
         # so a failing review must say WHY it failed, not just that it did.
         if not passed and reasons:

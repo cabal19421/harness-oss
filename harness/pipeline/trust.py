@@ -31,11 +31,21 @@ also choose what runs: the first argument of a multiplexer (``go run`` is not
 pytest`` is arbitrary code execution wearing an allowlisted executable's name).
 All three are filtered — see ``_ALLOWED_SUBCOMMANDS``, ``_DENIED_FLAGS`` and
 ``_ALLOWED_ENV_VARS``.
+
+All of it is decided on the argv the validation runner will actually exec,
+not on a whitespace split of the command line: the runner unquotes with
+``shlex.split`` (POSIX rules), so a quote is one more way to make the text that
+was checked differ from the program that runs. ``CI="1 pytest 2" ./evil.sh``
+read as an env assignment in front of an allowlisted ``pytest`` while
+``./evil.sh`` ran, and ``pytest "--pastebin=all"`` slipped a denied flag past
+the denylist. A command ``shlex`` cannot split is refused, because the runner
+would hand it to a shell. See :func:`_tokens`.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 
 from harness.log import get_logger, redact, trunc
 
@@ -63,10 +73,21 @@ _ALLOWED_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # executes or *where* output goes" — such a flag subverts an allowlisted runner
 # without ever looking like a different command. For pytest: `--pastebin=all`
 # uploads the entire session to a public paste service, `-p mod` imports an
-# arbitrary plugin module, and `-c` / `--rootdir` / `--basetemp` repoint config
-# discovery and output at attacker-chosen paths.
+# arbitrary plugin module, `-c` / `--config-file` and `--rootdir` / `--basetemp`
+# repoint config discovery and output at attacker-chosen paths, `--junitxml` /
+# `--junit-xml` and `--debug` write a file at an attacker-chosen path, and
+# `-o` / `--override-ini` sets any ini value from the command line — `addopts`
+# included, which re-introduces every flag denied here (`-o addopts=-pmod` loads
+# a plugin). `-o` is refused outright rather than parsed: no override is one an
+# untrusted design needs, and reading the override's value would be a denylist
+# inside a denylist. pytest is the only runner with a denylist today; the
+# matcher below is general. Long and short spellings, `=`-joined or spaced, are
+# all caught, and a denied short option is caught anywhere in a combined cluster
+# (`-qoaddopts`) — see :func:`_denied_flag`.
 _DENIED_FLAGS: dict[str, frozenset[str]] = {
-    "pytest": frozenset({"--pastebin", "-p", "-c", "--rootdir", "--basetemp"}),
+    "pytest": frozenset({"--pastebin", "-p", "-c", "--config-file", "--rootdir",
+                         "--basetemp", "--junitxml", "--junit-xml", "--debug",
+                         "-o", "--override-ini"}),
 }
 # Environment assignments allowed to precede the runner. A leading `NAME=value`
 # is part of the command line and the shell applies it to the very process the
@@ -108,6 +129,22 @@ def has_shell_metachars(command: str) -> bool:
     return bool(_SHELL_METACHARS.search(command))
 
 
+def _tokens(command: str) -> list[str] | None:
+    """*command* as the argv the validation runner would exec; ``None`` if it cannot be split.
+
+    ``backends.base._run_one_validation`` runs a command that has no shell
+    metacharacters as ``shlex.split(command)`` with ``shell=False``. POSIX
+    rules apply, so quotes are removed and can join or split words. It hands a
+    command ``shlex`` cannot split (an unbalanced quote) to a shell instead.
+    Every decision in this module is made on that same argv, because a
+    whitespace split reads a different command from the one that runs.
+    """
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
+
+
 def _env_prefix(toks: list[str]) -> tuple[list[str], list[str]]:
     """Split leading ``NAME=value`` assignments off *toks* → ``(env, rest)``.
 
@@ -123,8 +160,17 @@ def _env_prefix(toks: list[str]) -> tuple[list[str], list[str]]:
 
 
 def _split_command(command: str) -> tuple[str, list[str]]:
-    """``(runner, args)`` for *command*, seeing through env-var / ``-m`` prefixes."""
-    toks = command.split()
+    """``(runner, args)`` for *command*, seeing through env-var / ``-m`` prefixes.
+
+    Tokenised the way the validation runner execs it (:func:`_tokens`). A
+    command that cannot be split that way falls back to whitespace;
+    :func:`_reject_reason` refuses such a command before it gets here, so the
+    fallback only ever names the tool of a trusted command, which runs under a
+    shell, for :func:`leading_runner`.
+    """
+    toks = _tokens(command)
+    if toks is None:
+        toks = command.split()
     if not toks:
         return "", []
     # Skip an env-var prefix like `CI=1 pytest` (inspected in _reject_reason).
@@ -139,34 +185,136 @@ def _split_command(command: str) -> tuple[str, list[str]]:
     return head, toks[i + 1:]
 
 
+#: An interpreter whose ``-m MODULE`` is the real runner: ``python``,
+#: ``python3``, ``python3.12``, and Windows' ``python.exe`` once ``.exe`` is cut.
+_PYTHON = re.compile(r"python3?(\.\d+)?", re.IGNORECASE)
+#: Interpreter options that take no argument and may stand before ``-m``
+#: (``python -I -m pytest``). ``-X`` and ``-W`` take one. Anything else ends the
+#: scan, because a script, ``-c`` code or stdin is not a module run.
+_PY_FLAGS = frozenset("bBdEiIOPqRsSuvx")
+
+
+def _python_module(args: list[str]) -> str:
+    """The ``-m MODULE`` an interpreter is given in *args*; ``""`` when it runs anything else.
+
+    Options are read the way CPython reads them. Several can share one token
+    (``-Im pytest``, ``-Bm pytest``), and an option that takes a value (``-m``,
+    ``-X``, ``-W``) takes the rest of its token, or the next token when nothing
+    is left (``-mpytest``, ``-Wdefault``, ``-W error``). A long option, ``-c``
+    code, a script or stdin ends the scan: not a module run, or not modelled.
+    """
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if len(tok) < 2 or tok[0] != "-" or tok[1] == "-":
+            return ""
+        for k in range(1, len(tok)):
+            option = tok[k]
+            if option in _PY_FLAGS:
+                continue
+            if option not in "mXW":
+                return ""
+            value = tok[k + 1:]
+            if option == "m":
+                return value or (args[i + 1] if i + 1 < len(args) else "")
+            if not value:
+                i += 1                                   # `-X dev`, `-W error`
+            break
+        i += 1
+    return ""
+
+
+def _program_name(head: str) -> str:
+    """*head* without its directory (``/`` or ``\\``) and without a Windows ``.exe``."""
+    name = re.split(r"[\\/]", head)[-1]
+    return name[:-4] if name[-4:].lower() == ".exe" else name
+
+
 def leading_runner(command: str) -> str:
     """The tool *command* actually invokes (``python -m pytest -q`` → ``pytest``).
 
     Public because the validation runner keys its "could this tool even run?"
-    tables on the same notion of "which tool is this" that the allowlist uses —
-    two different answers there would mean a command could be allowlisted as one
-    tool and classified as another.
+    tables on the same notion of "which tool is this" that the allowlist uses.
+    For every command the allowlist ADMITS the two answers are the same by
+    construction: an admitted runner is a bare allowlisted name, which the
+    steps below leave alone. Two different answers there would mean a command
+    could be allowlisted as one tool and classified as another.
+
+    Beyond that it sees through three things the allowlist deliberately does
+    not:
+
+    * a path-qualified program, named by its last path component with any
+      ``.exe`` cut (``.venv/bin/pytest``, ``./node_modules/.bin/jest``);
+    * a path-qualified interpreter's ``-m`` module, interpreter options
+      included, combined ones too (``.venv/bin/python -m pytest``,
+      ``python3 -I -m pytest``, ``python -Im pytest``, a quoted
+      ``"C:\\proj\\.venv\\Scripts\\python.exe" -m pytest``);
+    * the ``env`` utility with ``NAME=value`` operands
+      (``env CI=1 .venv/bin/python -m pytest``).
+
+    The allowlist must not see through these: an untrusted design controls the
+    worktree, so ``./x/python`` may be anything. The operator's own
+    ``.venv/bin/python -m pytest`` is pytest, though. Classified as an unknown
+    tool, pytest's could-not-run exits (3, 4) were read as test failures and
+    blamed on the agent. Named as pytest, such an exit is an excuse that only
+    the diff-base probe can revoke, and a worktree-local interpreter (the
+    worktree's own git-ignored ``.venv``) never launches in the probe's
+    checkout of the base. The probe counts that as no evidence, so the leg is
+    still counted against the diff (``backends.base._unexcuse_diff_broken_legs``).
+
+    A wrapper runner is named as itself, not as what it runs: ``uv run
+    pytest`` is ``uv``, ``poetry run pytest`` is ``poetry``, and ``python -m
+    coverage run -m pytest`` is ``coverage``. Their exit codes are not
+    pytest's to vouch for, so a 3 or 4 from them stays a failure on the diff,
+    as it was before any of this.
+
+    The command is read the way the runner execs it (:func:`_tokens`). An
+    unquoted Windows path loses its backslashes there, in the runner's own
+    ``shlex.split``, so it cannot launch and its tool never decides a verdict.
     """
-    return _split_command(command)[0]
+    head, args = _split_command(command)
+    name = _program_name(head)
+    while name == "env":
+        _assignments, rest = _env_prefix(args)
+        if not rest or rest[0].startswith("-"):
+            return name                 # `env` options are not modelled: unknown
+        head, args = rest[0], rest[1:]
+        name = _program_name(head)
+    if _PYTHON.fullmatch(name):
+        return _python_module(args) or name
+    return name
 
 
 _leading_runner = leading_runner        # back-compat alias for in-module callers
 
 
 def _denied_flag(runner: str, args: list[str]) -> str:
-    """The first denylisted flag *runner* was given, or ``""`` if there is none."""
+    """The first denylisted flag *runner* was given, or ``""`` if there is none.
+
+    Reads a flag the way the tool will: a long option with its value either
+    spaced (`--rootdir x`) or `=`-joined (`--rootdir=x`), and a short option
+    standalone (`-p mod`), with its value attached (`-pmod`), or combined with
+    other short options into one cluster (`-qp mod`, `-qoaddopts=…`). A denied
+    short option found anywhere in a cluster is a hit, whatever precedes it: it
+    still reaches the tool, and over-refusing a cluster that merely carries the
+    letter as another option's value is the fail-closed direction for an
+    untrusted design.
+    """
     denied = _DENIED_FLAGS.get(runner)
     if not denied:
         return ""
+    short_denied = {d[1] for d in denied if len(d) == 2 and d[0] == "-"}
     for tok in args:
         if not tok.startswith("-"):
             continue
         name = tok.split("=", 1)[0]          # `--pastebin=all` → `--pastebin`
         if name in denied:
             return name
-        # A short option with its value attached: `-pevil`, `-cfoo.ini`.
-        if not name.startswith("--") and len(name) > 2 and name[:2] in denied:
-            return name[:2]
+        if name.startswith("--"):
+            continue
+        hit = next((c for c in name[1:] if c in short_denied), "")
+        if hit:
+            return f"-{hit}"
     return ""
 
 
@@ -197,13 +345,28 @@ def _denied_env(assignments: list[str], runner: str) -> str:
 
 def _reject_reason(command: str) -> str:
     """Why *command* is unsafe for an untrusted design — ``""`` when it is safe."""
-    command = command.strip()
-    if not command:
+    stripped = command.strip()
+    if not stripped:
         return "empty command"
+    # The runner shlex.splits the ORIGINAL command; `str.strip()` (used here and
+    # for the dedup key) also removes \v, \f and other Unicode whitespace that
+    # shlex keeps, so a leading \x0b would be dropped from every check below
+    # while staying part of the first token at exec. Refuse it rather than vet a
+    # different string from the one that runs.
+    if command.strip(" \t\r\n") != stripped:
+        return ("leading or trailing whitespace the validation runner does not "
+                "strip (shlex.split splits only on space, tab, CR and LF) — it "
+                "would stay part of a token at exec")
+    command = stripped
     if has_shell_metachars(command):
         return ("shell metacharacters present — compound/piped shell from "
                 "an untrusted design is never executed")
-    env, _rest = _env_prefix(command.split())
+    toks = _tokens(command)
+    if toks is None:
+        return ("unbalanced quoting — the validation runner hands a command it "
+                "cannot split to a shell, and shell from an untrusted design is "
+                "never executed")
+    env, _rest = _env_prefix(toks)
     runner, args = _split_command(command)
     env_reason = _denied_env(env, runner)
     if env_reason:

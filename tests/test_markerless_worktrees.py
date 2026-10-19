@@ -6,16 +6,16 @@ submodule target that is the superproject, because the default
 ``worktree_root`` (``<parent>/.harness-wt/<name>``) sits inside its work tree.
 Each scenario is driven through harness's real functions in that layout:
 
-* A1 — recovery stashed and hard-reset the SUPERPROJECT;
-* A2 — ``ensure(reset_on_reuse=True)`` hard-reset it, with no stash;
-* A3 — the loop's catch-all commit landed on the superproject's ``main``;
-* C2 — ``remove()`` refused as ``"dirty"`` on the superproject's dirt;
-* D2 — with no recorded ``start_ref`` the diff base was the superproject's
-  HEAD, and the default per-iteration rollback hard-reset it;
-* F  — with nothing enclosing the worktree, ``remove()`` raised ``GitError``
-  under every opt-in while its branch stayed pinned; and once a sibling
-  removal pruned the registration, ``remove()`` reported a success that left
-  the directory on disk;
+* recovery stashed and hard-reset the SUPERPROJECT;
+* ``ensure(reset_on_reuse=True)`` hard-reset it, with no stash;
+* the loop's catch-all commit landed on the superproject's ``main``;
+* ``remove()`` refused as ``"dirty"`` on the superproject's dirt;
+* with no recorded ``start_ref`` the diff base was the superproject's HEAD,
+  and the default per-iteration rollback hard-reset it;
+* with nothing enclosing the worktree, ``remove()`` raised ``GitError`` under
+  every opt-in while its branch stayed pinned; and once a sibling removal
+  pruned the registration, ``remove()`` reported a success that left the
+  directory on disk;
 
 plus the invariant all of them share: a registration whose ``.git`` file is
 missing is never reused.
@@ -113,9 +113,9 @@ def _submodule_layout(tmp_path: Path, *, operator_wip: bool = True) -> _Layout:
 
 
 def _standalone_layout(tmp_path: Path) -> _Layout:
-    """Nothing encloses the worktree root (scenario F)."""
+    """Nothing encloses the worktree root."""
     if _git(["rev-parse", "--show-toplevel"], tmp_path, check=False).returncode == 0:
-        pytest.skip("the temp dir sits inside a git repository — scenario F needs none")
+        pytest.skip("the temp dir sits inside a git repository — this layout needs none")
     repo = _init(tmp_path / "repo", "a.txt", "a\n")
     cfg = PipelineConfig(repo=repo, designs_dir="designs",
                          worktree_root=tmp_path / "wtroot")
@@ -280,7 +280,7 @@ def test_prune_orphans_recreates_the_worktree_on_its_own_branch(tmp_path):
     assert _outer_state(lay.outer) == outer
 
 
-# ── A1: recovery ────────────────────────────────────────────────────────────────
+# ── recovery ────────────────────────────────────────────────────────────────────
 
 
 def _dead_pid() -> int:
@@ -339,7 +339,7 @@ def test_a1_a_recovery_pass_rearms_the_task_and_says_nothing_was_reset(tmp_path)
     assert "on the stash" not in note
 
 
-# ── A2: warm reuse ──────────────────────────────────────────────────────────────
+# ── warm reuse ──────────────────────────────────────────────────────────────────
 
 
 def test_a2_reset_on_reuse_never_hard_resets_the_enclosing_repository(tmp_path):
@@ -366,7 +366,7 @@ def test_a2_reset_clean_refuses_a_tree_it_cannot_prove(tmp_path):
     assert refused is not None and refused.reason == "unverified"
 
 
-# ── A3: the loop's catch-all commit ─────────────────────────────────────────────
+# ── the loop's catch-all commit ─────────────────────────────────────────────────
 
 
 def test_a3_the_catch_all_commit_never_lands_on_the_enclosing_repository(tmp_path):
@@ -391,7 +391,7 @@ def test_a3_the_catch_all_commit_never_lands_on_the_enclosing_repository(tmp_pat
     assert _refusal(lambda: lay.wm.ensure("t1")) is not None
 
 
-# ── C2: teardown misattribution ─────────────────────────────────────────────────
+# ── teardown misattribution ─────────────────────────────────────────────────────
 
 
 def test_c2_remove_never_reports_the_enclosing_repositorys_dirt(tmp_path):
@@ -412,7 +412,7 @@ def test_c2_remove_never_reports_the_enclosing_repositorys_dirt(tmp_path):
     assert "agent/t1" not in lay.wm._checked_out_branches()  # its branch is unpinned
 
 
-# ── D2: the default per-iteration rollback ──────────────────────────────────────
+# ── the default per-iteration rollback ──────────────────────────────────────────
 
 
 class _RollbackProbe(CodingBackend):
@@ -484,7 +484,7 @@ def test_the_ceiling_alone_keeps_a_destructive_command_inside_the_tree(tmp_path,
     assert results == [None, False, False, False, False]
 
 
-# ── F: nothing encloses the worktree ────────────────────────────────────────────
+# ── nothing encloses the worktree ───────────────────────────────────────────────
 
 
 def test_f_remove_refuses_as_unverified_under_every_opt_in_and_unpins_the_branch(tmp_path):
@@ -695,6 +695,16 @@ def test_the_agent_cli_cannot_discover_the_enclosing_repository(tmp_path, monkey
 
     monkeypatch.setattr(ac.shutil, "which", lambda _n: "/usr/bin/gemini")
     monkeypatch.setattr(ac, "_CLI_HELP_CACHE", {"gemini": "--tools <tools...>\n"})
+    # Pin the version too: under a pinned hard floor, availability fails CLOSED
+    # on a CLI whose version cannot be verified (own probe cache, so this host's
+    # CLI decides nothing).
+    import functools
+
+    from harness import config
+    monkeypatch.setattr(config, "tool_version",
+                        functools.cache(config.tool_version.__wrapped__))
+    monkeypatch.setattr(config, "_probe_version_text",
+                        lambda _name, _cli: config.TOOL_MIN_VERSIONS.get("agent", "1.0.0"))
     monkeypatch.setattr(ac, "subprocess", types.SimpleNamespace(
         Popen=popen, PIPE=subprocess.PIPE, run=subprocess.run,
         TimeoutExpired=subprocess.TimeoutExpired,

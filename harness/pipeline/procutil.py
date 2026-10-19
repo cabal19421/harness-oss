@@ -4,14 +4,20 @@ Reclaiming a worktree means killing the processes whose working directory is
 inside it (a dev server, a watch task, a stuck test runner) before deleting
 the directory — otherwise the removal races a live writer or leaks a daemon. The
 harness used to just ``git worktree remove --force`` and hope nothing was
-running. This closes that gap, best-effort and cross-platform-degrading:
+running. This closes that gap, cross-platform-degrading:
 
 * with :mod:`psutil` (optional — recommended for non-Linux), enumerate processes by cwd;
 * without it, fall back to a ``/proc`` scan on Linux;
-* anywhere else, no-op (the caller still removes the worktree).
+* with neither, there is nothing to enumerate with, and a scan proves nothing:
+  :func:`pids_in_dir_strict` and :func:`pids_in_dir_refuse_only` return
+  ``None`` (unprovable) and :func:`terminate_in_dir` reports ``unverified``,
+  so a removal or a reset fails closed (``unverified-scan``) rather than
+  reading the silence as a quiet worktree. Only the relaunch gate, which
+  consults :func:`scan_available` first, launches there — once-warned.
 
-It never raises — process reclamation is best-effort cleanup, and a failure to
-kill a stray process must not abort teardown.
+It never raises — a failure to scan or to kill a stray process is reported
+(``None``, ``unverified``, ``survivors``) for the caller to fail closed on,
+never thrown through teardown.
 
 Two safety rules protect the caller:
 
@@ -23,7 +29,9 @@ Two safety rules protect the caller:
 * **Fail closed.** If that ancestor walk can't be completed (a parent lookup
   fails, ``/proc`` is unreadable), we cannot prove a candidate is *not* an
   ancestor — so we terminate NOTHING rather than fall back to killing
-  everything.
+  everything. A scan that only reports and never signals (the relaunch
+  gate's :func:`pids_in_dir_refuse_only`) needs no such proof: it excludes
+  the ancestors the walk can resolve and scans on.
 
 And one protecting innocent bystanders:
 
@@ -33,14 +41,25 @@ And one protecting innocent bystanders:
   to the signal together with proof of *which* process it was (psutil's
   ``(pid, create_time)`` pair, or ``/proc/<pid>/stat``'s start time in the
   fallback), and the proof is re-checked before the delayed SIGKILL.
+
+One limit, by design: a process whose cwd this user may not read is skipped
+as another user's (counted at debug level), and that also hides a SAME-user
+process the kernel will not let us inspect — a non-dumpable one (a setuid or
+setgid exec, ``prctl(PR_SET_DUMPABLE, 0)``) or one an LSM shields. Such a
+process cwd'd inside a tree is invisible to every scan here. Counting it as
+unprovable instead would make every scan unprovable on any ordinary desktop:
+``ssh-agent``, ``gpg-agent``, ``scdaemon`` and the ``systemd --user``
+instance all run as the user with an unreadable cwd.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISDIR
 from typing import Any
 
 from harness.log import get_logger
@@ -51,8 +70,10 @@ try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - psutil is optional; degrade gracefully
     psutil = None  # no [assignment] ignore needed: the guarded import above types psutil as Any
-    logger.debug("psutil not installed — process reclaim degrades to a /proc "
-                 "scan on Linux, or a no-op elsewhere ('pip install -e \".[proc]\"')")
+    logger.debug("psutil not installed — process scans fall back to /proc on "
+                 "Linux; with no /proc either, every scan is unprovable (fail "
+                 "closed) and only the relaunch gate launches, once-warned "
+                 "('pip install -e \".[proc]\"')")
 
 
 def _is_inside(child: Path, parent: Path) -> bool:
@@ -121,6 +142,78 @@ def protected_pids() -> set[int]:
     return seen
 
 
+def _ancestors_best_effort() -> set[int]:
+    """This process and every ancestor the walk can resolve. Never raises.
+
+    The protection set for a scan nothing will be signalled on
+    (:func:`pids_in_dir_refuse_only`). :func:`protected_pids` must complete
+    because it guards a KILL; here a walk that stops early — ``/proc`` mounted
+    ``hidepid=2`` or ``invisible`` (systemd ``ProtectProc=invisible``) hides
+    PID 1 and every other user's process, so the walk ends at the first
+    root-owned ancestor, with psutil too — only leaves the ancestors above that
+    point unexcluded. One of those whose cwd is in the directory is then
+    reported, which can only make a refusal more likely, never a signal.
+    """
+    pid = os.getpid()
+    seen: set[int] = set()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            parent = _ppid(pid)
+        except Exception as exc:  # noqa: BLE001 - best effort: stop, keep what we have
+            logger.debug("ancestor walk stopped at pid %d (%s: %s) — %d pid(s) "
+                         "excluded from a scan that signals nothing",
+                         pid, type(exc).__name__, exc, len(seen))
+            break
+        if parent <= 0 or parent in seen:
+            break
+        pid = parent
+    return seen
+
+
+#: :func:`scan_available`'s answer, probed once per process (key ``"scan"``). A
+#: test that needs a fresh probe swaps in an empty dict for its own duration.
+_CAPABILITY: dict[str, bool] = {}
+_CAPABILITY_LOCK = threading.Lock()
+#: The probe's ``/proc`` witness: a process can always read its own cwd link
+#: where ``/proc`` is mounted, ``hidepid=2`` included.
+_PROC_SELF_CWD = "/proc/self/cwd"
+
+
+def scan_available() -> bool:
+    """Can this platform enumerate processes by cwd at all?
+
+    A capability, not a scan result: psutil importable, or a readable
+    ``/proc/self/cwd`` (the Linux fallback). Probed ONCE per process — it is a
+    property of the platform and its installed extras, and re-deriving it per
+    call let one transient failure read as "this platform cannot scan" while
+    the next call refused. It never walks the ancestor chain: that walk protects
+    this process's ancestors from a KILL, and a ``/proc`` mounted ``hidepid=2``
+    makes it fail on every host where it is set, psutil or not, while
+    enumeration still works. ``False`` — macOS or Windows without the
+    ``[proc]`` extra — is for callers that must not turn "this platform cannot
+    look" into "something is running here" forever; a scan that fails where
+    this is ``True`` is an unprovable scan, and stays fail-closed. Never raises.
+    """
+    with _CAPABILITY_LOCK:
+        if "scan" not in _CAPABILITY:
+            _CAPABILITY["scan"] = _probe_scan_capability()
+        return _CAPABILITY["scan"]
+
+
+def _probe_scan_capability() -> bool:
+    if psutil is not None:
+        return True
+    try:
+        os.readlink(_PROC_SELF_CWD)
+    except (OSError, AttributeError, ValueError) as exc:
+        logger.debug("no process scan on this platform: psutil is not installed "
+                     "and %s is unreadable (%s: %s)", _PROC_SELF_CWD,
+                     type(exc).__name__, exc)
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class _Target:
     """One process the sweep may signal, plus proof of *which* process it was.
@@ -179,6 +272,7 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
     if cache_clear is not None:
         cache_clear()
     targets: list[_Target] = []
+    unreadable = 0
     # No `attrs=` — `proc.pid` is a plain attribute, while passing attrs forces
     # a full as_dict() round-trip for every process on the machine.
     for proc in psutil.process_iter():
@@ -187,8 +281,11 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
             continue
         try:
             cwd = proc.cwd()
+        except (psutil.AccessDenied, PermissionError):
+            unreadable += 1             # another user's process: not ours to read
+            continue
         except (psutil.Error, OSError):
-            continue                    # exited mid-scan, or not ours to read
+            continue                    # exited mid-scan
         except Exception as exc:        # noqa: BLE001 - contain it to THIS process
             # Before this catch existed, one process raising anything unexpected
             # aborted the entire scan (the outer handler returned []), and the
@@ -198,15 +295,29 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
             continue
         if cwd and _is_inside(Path(cwd), root):
             targets.append(_Target(pid=pid, proc=proc))
+    _log_unreadable(root, unreadable)
     return targets
 
 
+def _log_unreadable(root: Path, unreadable: int) -> None:
+    if unreadable:
+        logger.debug("scan of %s: skipped %d process(es) whose cwd this user may "
+                     "not read — another user's, or a non-dumpable one of this "
+                     "user's (see the module docstring) — none counted as this "
+                     "run's writer", root, unreadable)
+
+
 def _targets_proc(root: Path, protected: set[int]) -> list[_Target]:
-    """Linux fallback: read ``/proc/<pid>/cwd`` symlinks."""
+    """Linux fallback: read ``/proc/<pid>/cwd`` symlinks.
+
+    Raises when there is no ``/proc`` to read: that is a scan that could not
+    look, never a directory found quiet.
+    """
     targets: list[_Target] = []
+    unreadable = 0
     proc_dir = Path("/proc")
     if not proc_dir.is_dir():
-        return targets
+        raise FileNotFoundError("no /proc to scan, and psutil is not installed")
     for entry in proc_dir.iterdir():
         if not entry.name.isdigit():
             continue
@@ -215,8 +326,11 @@ def _targets_proc(root: Path, protected: set[int]) -> list[_Target]:
             continue
         try:
             cwd = os.readlink(entry / "cwd")
-        except OSError:
+        except PermissionError:
+            unreadable += 1             # another user's process: not ours to read
             continue
+        except OSError:
+            continue                    # exited mid-scan
         except Exception as exc:        # noqa: BLE001 - contain it to THIS process
             logger.debug("skipping pid %d during the scan of %s (%s: %s)",
                          pid, root, type(exc).__name__, exc)
@@ -230,6 +344,7 @@ def _targets_proc(root: Path, protected: set[int]) -> list[_Target]:
         cwd = cwd.removesuffix(" (deleted)")
         if cwd and _is_inside(Path(cwd), root):
             targets.append(_Target(pid=pid, starttime=_proc_starttime(pid)))
+    _log_unreadable(root, unreadable)
     return targets
 
 
@@ -242,27 +357,60 @@ def _targets_in_dir_strict(root: Path | str) -> list[_Target] | None:
     destroy must treat ``None`` as "in use until proven otherwise" — an empty
     list here is a *positive* finding, never a shrug.
     """
+    return _scan_targets(root, refuse_only=False)
+
+
+def _scan_targets(root: Path | str, *, refuse_only: bool) -> list[_Target] | None:
+    """The one scan behind both views; ``None`` when it proves nothing.
+
+    *refuse_only* is for a caller that will never signal what it finds: it
+    excludes the ancestors the walk can resolve instead of requiring the whole
+    chain (:func:`_ancestors_best_effort`), so a walk that cannot complete is
+    not an unprovable scan there. Enumeration itself failing still is.
+
+    Empty without a scan only where nothing CAN be cwd'd: a root a lookup
+    reports missing (no such file, or no such directory on its path), or one
+    that is not a directory. ``Path.is_dir()`` also answered ``False`` for a
+    root it could not look at — on Python 3.14 an EACCES or I/O error on a
+    directory above it — while a process can keep its cwd inside such a tree;
+    any other failure to look is an unprovable scan, ``None``.
+    """
     root = Path(root).resolve()
-    if not root.is_dir():
-        logger.debug("pids_in_dir: %s is not a directory — no processes to "
-                     "reclaim", root)
-        return []                   # provably quiet: nothing can be cwd'd here
     try:
-        protected = protected_pids()
-    except AncestorLookupError as exc:
-        logger.warning("pids_in_dir: could not resolve this process's ancestor "
-                       "chain (%s) — the scan of %s is UNPROVABLE; nothing will "
-                       "be signalled (a mis-scan could SIGKILL the shell that "
-                       "asked for the cleanup)", exc, root)
+        st = os.stat(root)
+    except (FileNotFoundError, NotADirectoryError):
+        logger.debug("pids_in_dir: %s does not exist — no processes in it", root)
+        return []                   # provably quiet: nothing can be cwd'd here
+    except (OSError, ValueError) as exc:
+        logger.warning("pids_in_dir: cannot look at %s (%s: %s) — the scan is "
+                       "UNPROVABLE; nothing will be signalled, and no caller may "
+                       "read this as a quiet directory",
+                       root, type(exc).__name__, exc)
         return None
+    if not S_ISDIR(st.st_mode):
+        logger.debug("pids_in_dir: %s is not a directory — no processes in it",
+                     root)
+        return []                   # provably quiet: nothing can be cwd'd here
+    if refuse_only:
+        protected = _ancestors_best_effort()
+    else:
+        try:
+            protected = protected_pids()
+        except AncestorLookupError as exc:
+            logger.warning("pids_in_dir: could not resolve this process's ancestor "
+                           "chain (%s) — the strict scan of %s is UNPROVABLE; "
+                           "nothing will be signalled (a mis-scan could SIGKILL "
+                           "this process's own ancestor, the shell that started "
+                           "it)", exc, root)
+            return None
     try:
         if psutil is not None:
             return _targets_psutil(root, protected)
         return _targets_proc(root, protected)
-    except Exception as exc:  # noqa: BLE001 - best-effort; never let scanning crash teardown
+    except Exception as exc:  # noqa: BLE001 - best-effort; never let scanning crash a caller
         logger.warning("process scan under %s failed (%s: %s) — the scan is "
-                       "UNPROVABLE; nothing will be signalled, and destruction "
-                       "callers must not read this as a quiet directory",
+                       "UNPROVABLE; nothing will be signalled, and no caller may "
+                       "read this as a quiet directory",
                        root, type(exc).__name__, exc)
         return None
 
@@ -300,6 +448,26 @@ def pids_in_dir_strict(root: Path | str) -> list[int] | None:
     a quiet worktree. Never raises.
     """
     targets = _targets_in_dir_strict(root)
+    if targets is None:
+        return None
+    return [t.pid for t in targets]
+
+
+def pids_in_dir_refuse_only(root: Path | str) -> list[int] | None:
+    """:func:`pids_in_dir_strict` for a caller that only REFUSES on what it finds.
+
+    The relaunch gate's view (``WorktreeManager._reclaim_processes`` with
+    ``action="launch"``): a scan whose result is reported and never signalled
+    does not need this process's whole ancestor chain — that walk exists to
+    keep a KILL off the caller's own shell — so it excludes whatever ancestors
+    the walk can resolve and scans on when the walk stops early (``/proc``
+    mounted ``hidepid=2``/``invisible`` stops it at the first root-owned
+    ancestor, with psutil too). A process whose cwd this user may not read is
+    another user's, not this run's writer, and is skipped (logged at debug).
+    ``None`` still means enumeration itself failed — or there is nothing to
+    enumerate with — and the caller must refuse on it. Never raises.
+    """
+    targets = _scan_targets(root, refuse_only=True)
     if targets is None:
         return None
     return [t.pid for t in targets]
@@ -372,8 +540,8 @@ def terminate_in_dir(root: Path | str, *, grace: float = 2.0) -> Termination:
                          "reused by an unrelated process)", target.pid)
             continue
         logger.warning("pid %d survived SIGTERM after %.1fs grace — "
-                       "sending SIGKILL so worktree removal cannot race a "
-                       "live writer", target.pid, grace)
+                       "sending SIGKILL so whatever the caller does to the "
+                       "directory next cannot race a live writer", target.pid, grace)
         _signal(target, term=False)   # SIGKILL the stubborn ones
         killed.append(target)
 
@@ -392,13 +560,14 @@ def terminate_in_dir(root: Path | str, *, grace: float = 2.0) -> Termination:
     if rescan is None:
         logger.warning("terminate_in_dir: the post-kill rescan of %s could not "
                        "be completed — the directory cannot be proven quiet "
-                       "(unverified); callers must not destroy it", root)
+                       "(unverified); the caller must not reset, remove or "
+                       "reuse it", root)
         return Termination(signalled=pids, unverified=True)
     survivors = [t.pid for t in rescan]
     if survivors:
         logger.warning("terminate_in_dir: %d process(es) still running inside %s "
-                       "after SIGKILL: %s — the caller must NOT remove this "
-                       "directory (it would race a live writer)",
+                       "after SIGKILL: %s — the caller must NOT reset, remove or "
+                       "reuse this directory (it would race a live writer)",
                        len(survivors), root, survivors)
     return Termination(signalled=pids, survivors=survivors)
 
@@ -481,7 +650,7 @@ def _signal(target: _Target, *, term: bool) -> None:
         os.kill(target.pid, signal.SIGTERM if term else signal.SIGKILL)
     except (OSError, AttributeError, ValueError) as exc:
         logger.debug("could not signal pid %d (%s: %s) — it likely already "
-                     "exited, or is not ours to kill; teardown continues",
+                     "exited, or is not ours to kill; the sweep continues",
                      target.pid, type(exc).__name__, exc)
 
 

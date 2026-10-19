@@ -40,8 +40,9 @@ class WorktreeInUse(GitError):
     """Refused to act on a worktree that is dirty or still has live processes.
 
     A *refuse-and-report* outcome, not a failure: the worktree is deliberately
-    left on disk untouched. ``reason`` is one of ``"dirty"``, ``"processes"`` or
-    ``"survivors"`` (processes that outlived the SIGKILL sweep);
+    left on disk untouched. ``reason`` is one of ``"dirty"`` (uncommitted
+    changes — including edits index flags hide from ``git status``),
+    ``"processes"`` or ``"survivors"`` (processes that outlived the SIGKILL sweep);
     ``"unverified-scan"`` means the process scan itself could not be completed,
     so the worktree cannot be proven quiet; ``"unverified"`` marks a directory
     whose content cannot be proven to be this repository's worktree — an
@@ -62,6 +63,10 @@ class Worktree:
     path: Path
     branch: str
     base: str
+    #: :meth:`WorktreeManager.ensure` returned a tree that already existed. A tree
+    #: it just created has nothing running in it, so only a reused one needs the
+    #: orchestrator's relaunch gate.
+    reused: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,6 +163,8 @@ class WorktreeManager:
         build caches (``node_modules``, ``.venv``) warm. Live processes inside
         the reused tree are reclaimed first (``in_use``, as in :meth:`remove`):
         a hard reset under a live writer races it exactly like a removal would.
+        A reused tree whose index flags hide edits is refused (``"dirty"``)
+        instead of reset — see :meth:`reset_clean`.
 
         A stale *unregistered* directory squatting on the target path is
         recovered rather than blindly deleted:
@@ -244,7 +251,7 @@ class WorktreeManager:
                                         what=f"task {task_id}: warm reuse",
                                         action="reset")
                 self.reset_clean(task_id, to_ref="HEAD")
-            return Worktree(path=wt, branch=branch, base=self.base)
+            return Worktree(path=wt, branch=branch, base=self.base, reused=True)
 
         # Past the reuse return the CREATE path is live, so settle the fork
         # point here — before anything destructive. The orphan recovery below
@@ -295,7 +302,13 @@ class WorktreeManager:
                                    "worktree add` below will likely fail with "
                                    "'already exists'", task_id, wt)
 
-        args = ["worktree", "add", "-q"]
+        # gitutil.TREE_WRITE_PINS: under an agent-written core.ignoreStat=true
+        # (the SHARED config) the checkout `worktree add` runs marks every entry
+        # assume-unchanged, and every tree created after it then reads as hiding
+        # edits in all of them — its prune and its warm reuse refuse as dirty;
+        # and an agent-written core.fsmonitor hook was run by that checkout, and
+        # its token stored in the new tree's index (core.fsmonitor=false).
+        args = [*gitutil.TREE_WRITE_PINS, "worktree", "add", "-q"]
         if resuming:
             # Branch already exists (resuming): check it out without -b. The
             # SHORT name is required here — `worktree add <path> refs/heads/<b>`
@@ -340,9 +353,16 @@ class WorktreeManager:
         Two *unrelated* risks, two separate opt-ins — a single ``force`` flag
         would conflate them:
 
-        * ``allow_dirty`` — discard **uncommitted** work in the worktree. Off by
+        * ``allow_dirty`` — discard the tree's own **uncommitted** work. Off by
           default: a dirty tree is reported via :class:`WorktreeInUse` and left
-          alone rather than force-removed.
+          alone rather than force-removed. A tree holding submodules — which
+          git removes only with ``--force``, deleting every submodule checkout
+          and clone in it — is removed, with or without ``allow_dirty``, only
+          once harness has proved nothing in them would be lost
+          (:meth:`_refuse_submodule_hazards`): what only a submodule holds —
+          uncommitted or untracked work, a stash, a checked-out commit the
+          superproject's module store lacks, a commit no other copy has — is
+          reported as ``"dirty"``, and ``allow_dirty`` does not override it.
         * ``allow_unlanded`` — delete a branch whose work has not landed in
           ``self.base``. Off by default: removing the worktree alone never loses
           commits (they live in the object store), but deleting the unmerged
@@ -418,13 +438,18 @@ class WorktreeManager:
         # Refuse to discard uncommitted work unless told to. Checked BEFORE the
         # in-use sweep so we never kill an agent's processes for a removal we
         # then decline to perform.
-        if not allow_dirty and wt.is_dir() and gitutil.is_repo(wt) \
-                and gitutil.working_tree_dirty(wt):
+        on_disk = wt.is_dir() and gitutil.is_repo(wt)
+        check_dirty = not allow_dirty and on_disk
+        if check_dirty and gitutil.working_tree_dirty(wt):
+            # Dirt INSIDE a submodule is named as the forced removal names it,
+            # since allow_dirty does not override that refusal — offering it
+            # would be advice that cannot work either.
+            self._refuse_submodule_hazards(task_id, wt)
             # "Commit them" is impossible advice when the dirt is unstageable
-            # (a dirty submodule, most often) — `git add -A` stages nothing and
-            # `git commit` refuses, so an operator following it gets nowhere.
-            # Name what is actually there instead. The refusal itself is
-            # unchanged: fail-closed either way, allow_dirty is still the override.
+            # — `git add -A` stages nothing and `git commit` refuses, so an
+            # operator following it gets nowhere. Name what is actually there
+            # instead. The refusal itself is unchanged: fail-closed either way,
+            # allow_dirty is still the override for the tree's own dirt.
             unstageable = gitutil.unstageable_dirt_reason(wt)
             logger.warning("task %s: refusing to remove worktree %s — it has "
                            "uncommitted changes%s (allow_dirty=True overrides)",
@@ -437,14 +462,47 @@ class WorktreeManager:
                    "Commit them, or pass allow_dirty=True to discard them."),
                 reason="dirty", path=wt,
             )
+        if check_dirty:
+            # The status above cannot see an edit hidden by an index flag, and
+            # `git worktree remove` (no --force) deletes it as if the tree were
+            # clean. Same refusal, same override.
+            self._refuse_hidden_edits(
+                task_id, wt, action="remove",
+                consequence="`git worktree remove` would delete those edits as "
+                            "if the tree were clean",
+                remedy="commit them, or pass allow_dirty=True to discard them")
+        if on_disk:
+            # What --force would destroy inside the submodules (git removes a
+            # tree holding one only with --force) refuses here too, before the
+            # sweep — so no process is killed for a removal then declined —
+            # whatever allow_dirty says. Proven again after the sweep.
+            self._refuse_submodule_hazards(task_id, wt)
 
         self._reclaim_processes(wt, in_use=in_use, what=f"task {task_id}")
 
+        if allow_dirty and on_disk:
+            # allow_dirty waives the tree's OWN uncommitted work. --force also
+            # deletes every submodule checkout in it and every clone it keeps,
+            # and what only those hold is proven absent again — exactly as on
+            # the retry below — so whatever a process wrote before the sweep
+            # took it is seen.
+            self._refuse_submodule_hazards(task_id, wt)
         rm = ["worktree", "remove"]
         if allow_dirty:
             rm.append("--force")
         rm.append(str(wt))
-        res = gitutil.git(rm, cwd=self.repo)
+        # LC_ALL=C: git's refusals are matched by their (untranslated) words.
+        res = gitutil.git(rm, cwd=self.repo, env={"LC_ALL": "C"})
+        # The WHOLE of stderr, never a substring: a lock refusal quotes the
+        # lock's reason, which `git worktree lock --reason` lets anyone write
+        # — this very sentence included.
+        if (not res.ok and check_dirty and res.err == "fatal: working trees "
+                "containing submodules cannot be moved or removed"):
+            # git refuses EVERY tree holding a populated submodule unless forced
+            # — the one refusal --force is ever added for, and only once
+            # harness has proved, itself, that nothing would be lost.
+            rm = ["worktree", "remove", "--force", str(wt)]
+            res = self._remove_past_submodule_refusal(task_id, wt, rm)
         # git's "not a working tree" is about its REGISTRATION; only a directory
         # that is actually gone makes the removal idempotent.
         already_gone = ("is not a working tree" in res.err
@@ -459,6 +517,161 @@ class WorktreeManager:
         self._delete_branch_if_asked(task_id, branch, delete_branch=delete_branch,
                                      allow_unlanded=allow_unlanded)
         logger.info("task %s: worktree %s removed", task_id, wt)
+
+    def _refuse_hidden_edits(self, task_id: str, wt: Path, *, action: str,
+                             consequence: str, remedy: str) -> None:
+        """Raise :class:`WorktreeInUse` (``"dirty"``) if index flags hide edits in *wt*.
+
+        ``git status`` — so every dirty check — reads an edit behind
+        assume-unchanged or skip-worktree as clean
+        (:func:`~harness.pipeline.gitutil.hidden_index_entries`). Called only
+        once the tree is provably its own repository, and confined to it. An
+        index whose flags cannot be listed refuses too: unknown is never clean.
+        Nothing is cleared here — a refusal leaves the tree exactly as found.
+        """
+        hidden = gitutil.hidden_index_entries(wt, confine=True)
+        if hidden == []:
+            return
+        why = gitutil.hidden_index_reason(wt, hidden)
+        logger.warning("task %s: refusing to %s worktree %s — %s", task_id,
+                       action, wt, why)
+        raise WorktreeInUse(
+            f"refusing to {action} worktree '{wt}': {why}. {consequence} — "
+            f"{gitutil.UNHIDE_ADVICE}, then {remedy}.",
+            reason="dirty", path=wt,
+        )
+
+    def _remove_past_submodule_refusal(self, task_id: str, wt: Path,
+                                       rm: list[str]) -> gitutil.GitResult:
+        """Run *rm* (``worktree remove --force``) once nothing in *wt* would be lost.
+
+        git refuses to remove any tree holding a populated submodule unless
+        forced ("working trees containing submodules cannot be moved or
+        removed"), so pruning one always failed. ``--force`` also skips git's
+        own dirty check and deletes everything inside the submodules — their
+        clones too — so it is run only once each of these holds, every failure
+        refusing as ``"dirty"`` with the tree left in place:
+
+        * nothing any submodule holds would be lost
+          (:meth:`_refuse_submodule_hazards`) — a refusal ``allow_dirty`` does
+          not override either;
+        * the superproject's own index flags are read again
+          (:meth:`_refuse_hidden_edits`), and so is the tree, as
+          :func:`~harness.pipeline.gitutil.working_tree_dirty` reads it
+          (``--ignore-submodules=none``, and a checkout harness itself left
+          behind, KNOWN to be stale, is not dirt) — after the reclaim, so a
+          write that landed since the first read is seen — and a status git
+          cannot give refuses rather than reading as clean;
+        * no submodule directory that is NOT checked out holds anything
+          (:func:`~harness.pipeline.gitutil.unpopulated_gitlink_content`): a
+          gitlink directory with no ``.git`` — one ``git submodule deinit``
+          emptied — is no repository, so no status shows what is put in it,
+          git's own refusal kept it, and ``--force`` deleted it.
+
+        These last are the ordinary dirty refusal, which ``allow_dirty=True``
+        overrides.
+        """
+        def refuse(why: str, remedy: str) -> WorktreeInUse:
+            logger.warning("task %s: refusing to remove worktree %s — %s "
+                           "(git removes a tree holding submodules only with "
+                           "--force; allow_dirty=True overrides)", task_id, wt, why)
+            return WorktreeInUse(
+                f"refusing to remove worktree '{wt}': {why}. git removes a tree "
+                f"holding submodules only with --force, which would delete that "
+                f"work with the tree — {remedy}, or pass allow_dirty=True to "
+                f"discard it.",
+                reason="dirty", path=wt)
+
+        self._refuse_submodule_hazards(task_id, wt)
+        self._refuse_hidden_edits(
+            task_id, wt, action="remove",
+            consequence="`git worktree remove --force` would delete those edits "
+                        "as if the tree were clean",
+            remedy="commit them, or pass allow_dirty=True to discard them")
+        stray = gitutil.unpopulated_gitlink_content(wt)
+        if stray:
+            raise refuse("; ".join(why if where == "*" else
+                                   f"submodule {gitutil.display_path(where)} ({why})"
+                                   for where, why in sorted(stray.items())),
+                         "move what it holds out of the tree")
+        # working_tree_dirty's read, but with its rc and git's words: for a
+        # status git could not give (a submodule's gitfile pointing nowhere
+        # fails it, rc=128) that function answers None — "cannot tell", which
+        # the dirty gate at the top of remove() passes as falsy, leaving the
+        # checks after it (git's own included) to decide — and this --force
+        # path, which skips git's, must refuse it itself, with why.
+        status = gitutil.status_porcelain(wt, confine=True)
+        if not status.ok:
+            raise refuse(f"its status could not be read (rc={status.code}: "
+                         f"{' '.join(trunc(status.err, 160).split())})",
+                         "repair the tree")
+        if gitutil.drop_known_stale(wt, status.out):
+            raise refuse("it has uncommitted changes", "commit them")
+        logger.info("task %s: worktree %s holds submodules but nothing that would "
+                    "be lost — removing it with --force", task_id, wt)
+        return gitutil.git(rm, cwd=self.repo, env={"LC_ALL": "C"})
+
+    def _refuse_submodule_hazards(self, task_id: str, wt: Path) -> None:
+        """Raise :class:`WorktreeInUse` (``"dirty"``) unless ``--force`` destroys nothing in *wt*'s submodules.
+
+        ``git worktree remove --force`` — the only way git removes a tree
+        holding a submodule — deletes every submodule checkout in the tree and
+        every clone the tree keeps (absorbed into its git dir, or embedded in
+        the checkout). So for EVERY populated submodule, nested ones included,
+        all of this is proven first:
+
+        * index flags hiding edits inside it are cleared
+          (:func:`~harness.pipeline.gitutil.expose_submodule_hidden_edits`);
+          flags that cannot be cleared refuse;
+        * its own status, pinned, holds no untracked file, no modified content
+          and no staged change, and no flag hides anything
+          (:func:`~harness.pipeline.gitutil.submodule_dirt`);
+        * its checked-out commit already exists in the superproject's primary
+          module store for it — read locally, never fetched; a store that is
+          absent proves nothing — its stash list is empty, and no clone the
+          removal deletes holds a commit that neither a remote-tracking ref of
+          its own reaches nor that store holds
+          (:func:`~harness.pipeline.gitutil.submodule_clone_only_work`).
+
+        Run whatever ``allow_dirty`` says: that opt-in waives the tree's own
+        uncommitted work, never what git's submodule refusal used to keep.
+        Each failure names the submodule and what it holds; the tree is left
+        exactly where it is.
+        """
+        exposed = gitutil.expose_submodule_hidden_edits(wt)   # before any read
+        hazards: dict[str, list[str]] = {}
+        for found in (exposed, gitutil.submodule_dirt(wt),
+                      gitutil.submodule_clone_only_work(wt)):
+            for where, why in found.items():
+                hazards.setdefault(where, []).append(why)
+        if not hazards:
+            return
+        # "*" is the tree itself — which submodules it holds is unknown — and
+        # never a submodule to name as holding work.
+        unknown = "; ".join(dict.fromkeys(hazards.pop("*", [])))
+        listed = "; ".join(f"{gitutil.display_path(where)} "
+                           f"({'; '.join(dict.fromkeys(whys))})"
+                           for where, whys in sorted(hazards.items()))
+        what = " — and ".join(part for part in (
+            f"{len(hazards)} of its submodule(s) hold work that would be lost "
+            f"with them, or cannot be proven not to: {listed}" if hazards else "",
+            f"which submodules it holds, and what they hold, cannot be read "
+            f"({unknown})" if unknown else "") if part)
+        logger.warning("task %s: refusing to remove worktree %s — %s "
+                       "(`git worktree remove --force` would delete it with the "
+                       "tree; allow_dirty does not override this)", task_id, wt,
+                       what)
+        raise WorktreeInUse(
+            f"refusing to remove worktree '{wt}': git removes a tree holding "
+            f"submodules only with --force, which deletes every submodule "
+            f"checkout and clone in it — and {what}. "
+            + ("Keep that work first — commit it inside the submodule and push "
+               "it, or fetch it into the superproject's module store — or move "
+               "it out of the tree" if hazards else
+               "Repair the tree so git can list its submodules, or move its "
+               "work out of it")
+            + "; allow_dirty=True does not override this.",
+            reason="dirty", path=wt)
 
     def _delete_branch_if_asked(self, task_id: str, branch: str, *,
                                 delete_branch: bool, allow_unlanded: bool) -> None:
@@ -475,7 +688,15 @@ class WorktreeManager:
 
         "Destroyed" covers a hard reset as well as a removal — both throw away
         whatever a live writer is mid-writing; ``action`` names which one the
-        refusal messages report.
+        refusal messages report. ``action="launch"`` is the orchestrator's
+        relaunch gate (``PipelineOrchestrator._run_one_inner``): launching a
+        second writer into a reused tree races a live one just as a reset does.
+        That gate always passes ``"refuse"`` — it reports a live process, it
+        never takes one, whatever ``kill_worktree_procs`` says — and so scans
+        without requiring this process's whole ancestor chain
+        (:func:`~harness.pipeline.procutil.pids_in_dir_refuse_only`), which a
+        ``/proc`` mounted ``hidepid=2`` makes unresolvable on every pass. A
+        reset or a removal keeps the strict scan.
 
         Raises :class:`WorktreeInUse` when the directory must be left alone —
         because the policy is ``"refuse"`` and something is running inside,
@@ -495,7 +716,13 @@ class WorktreeManager:
         if not wt.is_dir():
             return
         if in_use == IN_USE_REFUSE:
-            pids = procutil.pids_in_dir_strict(wt)
+            # A launch only reports what it finds, so it needs no ancestor walk
+            # (that walk keeps a KILL off the caller's own shell). A reset or a
+            # removal precedes a destruction and keeps the strict scan, which
+            # refuses when the chain cannot be resolved.
+            launch = action == "launch"
+            pids = (procutil.pids_in_dir_refuse_only(wt) if launch
+                    else procutil.pids_in_dir_strict(wt))
             if pids is None:
                 # An unprovable scan is not a quiet worktree: the old
                 # pids_in_dir returned [] here and the destruction proceeded on
@@ -509,9 +736,14 @@ class WorktreeManager:
                     reason="unverified-scan", path=wt,
                 )
             if pids:
+                # The kill policy is no alternative for a launch: that gate
+                # refuses whatever kill_worktree_procs says.
+                hint = ("a launch never signals them: stop them, or wait for "
+                        "them to exit, and a later run checks again" if launch
+                        else "in_use='kill' terminates them instead")
                 logger.warning("%s: refusing %s of %s — %d process(es) still "
-                               "running inside it: %s (in_use='kill' terminates "
-                               "them instead)", what, action, wt, len(pids), pids)
+                               "running inside it: %s (%s)", what, action, wt,
+                               len(pids), pids, hint)
                 raise WorktreeInUse(
                     f"refusing {action} of worktree '{wt}': {len(pids)} process(es) "
                     f"still running inside it ({', '.join(str(p) for p in pids)})",
@@ -715,6 +947,14 @@ class WorktreeManager:
         (:func:`~harness.pipeline.gitutil.worktree_owner_proof`): in a tree
         that lost its ``.git`` marker the reset and clean would land on
         whatever repository encloses it.
+
+        Raises :class:`WorktreeInUse` (``"dirty"``), also before anything is
+        reset, when index flags hide edits in the tree
+        (:func:`~harness.pipeline.gitutil.hidden_index_entries`): ``reset
+        --hard`` destroys an assume-unchanged edit and leaves a skip-worktree
+        one in place, so the "clean" tree handed to the next run would either
+        have lost work nobody saw or still carry it. Checked first rather than
+        read back afterwards, because afterwards the first kind is already gone.
         """
         wt = self.path_for(task_id)
         proof = gitutil.worktree_owner_proof(wt)
@@ -726,11 +966,34 @@ class WorktreeManager:
                 f"reset or cleaned.",
                 reason="unverified", path=wt,
             )
+        self._refuse_hidden_edits(
+            task_id, wt, action="reset",
+            consequence="A hard reset would destroy the assume-unchanged edits "
+                        "and leave the skip-worktree ones in place; nothing was "
+                        "reset or cleaned",
+            remedy="commit or discard them yourself")
         ref = to_ref or self.base_rev
         logger.info("task %s: recycling worktree %s — hard reset to %s, clean "
                     "untracked (keep_ignored=%s preserves build caches)",
                     task_id, wt, ref, keep_ignored)
         gitutil.discard_changes(wt, ref, keep_ignored=keep_ignored)
+        # Read back what `git clean -fd` never removes: an untracked nested
+        # repository. Reuse preserves — it removes none (nothing here can tell
+        # whose it is) — but says so, since the next catch-all commit refuses
+        # an embedded repository .gitmodules does not register.
+        survivors = gitutil.untracked_nested_repos(wt)
+        if survivors is None:
+            logger.warning("task %s: could not read back the untracked nested "
+                           "repositories in %s after the reuse reset", task_id, wt)
+        elif survivors:
+            logger.warning("task %s: the reuse reset left %d untracked nested git "
+                           "repositor%s in %s: %s — `git clean -fd` never removes "
+                           "one and reuse never deletes one; the next catch-all "
+                           "commit refuses to record it (delete it, or keep its "
+                           "files as plain files)", task_id, len(survivors),
+                           "y" if len(survivors) == 1 else "ies", wt,
+                           ", ".join(gitutil.display_path(p)
+                                     for p in sorted(survivors)[:5]))
 
     def prune_merged(self, *, allow_unlanded: bool = False,
                      force: bool | None = None) -> dict[str, list[str]]:

@@ -64,6 +64,16 @@ refused the same way), or a verifier that ran with tools was terminated and left
 processes running in the worktree it judged. When no sample could vote for that
 reason the gate **abstains**, naming it, rather than reporting "no parseable
 verdict" as a skip.
+
+Nor on a sample the backend's usage limit refused (``OneshotResult.usage_limit``
+— for agent-cli, the CLI's own marked refusal). Every later sample would be
+refused the same way until the window reopens or an operator acts, so the gate
+STOPS there: no further sample is launched, no vote already cast is counted,
+and the report carries :attr:`VerifierReport.no_verdict` (naming the refusal's
+regime: a window that reopens on its own, or a limit only an operator lifts),
+on which the review ends with **no verdict** — nothing published, nothing
+recorded as a failure, the task left for a later run to judge. A consumer that
+does not read the field sees ``abstain`` (human review), never a skip.
 """
 
 from __future__ import annotations
@@ -74,9 +84,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from harness.log import get_logger
+from harness.log import get_logger, redact, trunc
 
-from . import gitutil
+from . import gitutil, shutdown
 from .gitutil import DIFF_TRUNCATED, MANIFEST_CLIPPED
 
 logger = get_logger(__name__)
@@ -142,6 +152,19 @@ class VerifierReport:
     # the change — but it still blocks, because failing open here would delete
     # the gate exactly when it stopped working.
     error: str = ""
+    # Set when the gate STOPPED without judging because the backend's usage
+    # limit refused a sample (why, naming the refusal and its regime). The
+    # caller must end the review with no verdict — publish nothing, record no
+    # failure, leave the task for a later run. ``verdict`` is ``abstain`` beside
+    # it, so a caller that ignores this field still routes the change to a
+    # human, never a pass.
+    no_verdict: str = ""
+    # Beside ``no_verdict``: the refusal's own text and the regime the backend
+    # gave it (``quota-window`` — the window reopens on its own — or
+    # ``permanent`` — only an operator lifts it; ``""`` when it could not tell),
+    # which the review reads to tell the two apart.
+    usage_limit: str = ""
+    usage_limit_kind: str = ""
 
     @property
     def ok(self) -> bool:
@@ -225,7 +248,9 @@ def verify_change(
     object, so no prose is parsed. ``ask`` remains the fallback (and the only
     path for backends with no schema knob). Never raises; fails open to ``skip``
     on infrastructure, but a schema-validated answer that does not conform is a
-    blocking error rather than a silent skip.
+    blocking error rather than a silent skip, and a sample the backend's usage
+    limit refused stops the gate with no verdict
+    (:attr:`VerifierReport.no_verdict`) rather than a skip.
     """
     if ask is None and ask_structured is None:
         logger.debug("verifier skipped: no ask callable (backend has no one-shot "
@@ -260,8 +285,23 @@ def verify_change(
     errors: list[str] = []          # contract breakages — these must NOT fail open
     refusals: list[str] = []        # calls refused outright — nor may these
     first_raw = ""
+    never_launched = 0              # samples a shutdown request kept from starting
     for k in range(n):
-        answer, structured, err, refused = _one_answer(ask, ask_structured, prompt, k, n)
+        if shutdown.requested():
+            # Nothing more is launched once a shutdown is requested: the call
+            # would only be terminated, and a terminated call reads as "did not
+            # complete" — a skip — not as a verdict.
+            never_launched = n - k
+            logger.warning("verifier: shutdown requested — %d of %d sample(s) not "
+                           "launched", never_launched, n)
+            break
+        answer, structured, err, refused, limit = _one_answer(ask, ask_structured,
+                                                              prompt, k, n)
+        if limit is not None:
+            # The backend's usage limit refused this sample, and it refuses
+            # every later one the same way: launch none, count nothing, and
+            # hand the review a no-verdict report instead of a skip.
+            return _usage_limit_no_verdict(limit, k + 1, n, cast=len(votes))
         if k == 0:
             first_raw = answer
         if refused:
@@ -289,6 +329,11 @@ def verify_change(
             confidences.append(conf)
         reasons.extend(rs)
 
+    if never_launched and not votes and not errors and not refusals:
+        return VerifierReport(
+            verdict="skip", raw=first_raw[:2000],
+            reasons=[(f"verifier interrupted by a shutdown — {never_launched} of {n} "
+                      f"sample(s) never launched, no verdict")])
     if not votes:
         if errors:
             # Every sample that ran broke the gate's own output contract. Failing
@@ -359,8 +404,10 @@ def dependency_blame_finding(changed: list[str]) -> str | None:
             if set(re.split(r"[/\\]", p.lower())) & _VENDOR_SEGMENTS]
     if not hits:
         return None
+    # display_path: the reason is printed, logged and fed back to the agent —
+    # a name that is not UTF-8 cannot reach a strict stream raw.
     return ("change edits vendored/installed third-party dependency code ("
-            + ", ".join(hits[:4])
+            + ", ".join(gitutil.display_path(p) for p in hits[:4])
             + ") — a mature, widely-used dependency being the culprit is a "
               "last-resort hypothesis; confirm the bug is not in first-party code "
               "(attach a minimal reproduction) before patching the dependency")
@@ -371,8 +418,10 @@ def dependency_blame_finding(changed: list[str]) -> str | None:
 
 def _build_prompt(title: str, intent: str, diff: str, grounding_summary: str,
                   validation_ok: bool | None, file_manifest: str = "") -> str:
-    # Tri-state: None = the caller never ran a validation suite (e.g. the
-    # standalone verify-diff command) — say so rather than claim it passed.
+    # Tri-state: None = no validation suite judged this change — the standalone
+    # verify-diff command never runs one, and the review gate passes None when
+    # the task's oracle had no commands (a vacuous green). Say so rather than
+    # claim it passed: "passed" is corroboration, and there was none.
     validation_line = ("not run" if validation_ok is None
                        else "passed" if validation_ok else "FAILED")
     # Truncation is detected from the diff itself rather than passed in, so the
@@ -503,6 +552,57 @@ def _refused_call_abstain(refusals: list[str], n: int) -> VerifierReport:
     )
 
 
+@dataclass(frozen=True)
+class _UsageLimit:
+    """A usage-limit refusal as the backend reported it (``OneshotResult``).
+
+    *text* is the refusal's own words (``usage_limit``); *kind* the regime the
+    backend gave it (``usage_limit_kind``): ``quota-window`` or ``permanent``,
+    ``""`` when it could not tell.
+    """
+
+    text: str
+    kind: str = ""
+
+
+#: What a no-verdict report says about each regime — and nothing about what
+#: happens next, which is the caller's to say (``harness pipeline verify-diff``
+#: has no "next run"; the review does).
+_LIMIT_REGIMES = {
+    "quota-window": "the limit's window reopens on its own, and the change can be "
+                    "judged once it has",
+    "permanent": "only an operator can lift this limit (raise the cap, add credits, "
+                 "or grant the seat or model), and nothing can judge the change "
+                 "until one does",
+}
+
+
+def _usage_limit_no_verdict(limit: _UsageLimit, k: int, n: int, *,
+                            cast: int) -> VerifierReport:
+    """The report when the backend's usage limit refused sample *k* of *n*.
+
+    NO verdict, which is neither of the gate's other two answers to a sample it
+    could not run: not a skip (a verifier that never judged the change would
+    read as a pass) and not a plain abstain (that publishes the change for a
+    human while the limit is still in force). The text names the refusal and
+    its regime (:data:`_LIMIT_REGIMES`). The review ends on ``no_verdict`` —
+    nothing published, nothing recorded as a failure — and a later run judges
+    the change again with the full ensemble, which is also why a vote cast
+    before the refusal is not counted. ``verdict`` stays ``abstain`` for any
+    caller that does not read ``no_verdict``.
+    """
+    refusal = trunc(redact(" ".join(limit.text.split())), 300)
+    regime = _LIMIT_REGIMES.get(limit.kind,
+                                "the change can be judged once the limit is lifted")
+    why = (f"the backend's usage limit refused verifier sample {k} of {n} "
+           f"({refusal}) — no further sample was launched"
+           + (f" and the {cast} vote(s) already cast are not counted" if cast else "")
+           + f"; no verdict: {regime}")
+    logger.warning("verifier: %s", why)
+    return VerifierReport(verdict="abstain", reasons=[why], no_verdict=why,
+                          usage_limit=limit.text, usage_limit_kind=limit.kind)
+
+
 def _manifest_paths(file_manifest: str) -> list[str]:
     """The paths of a ``<status> <path>`` manifest (:func:`gitutil.diff_manifest`).
 
@@ -546,8 +646,38 @@ def _strip_diff_prefix(token: str) -> str:
     return token[2:] if token[:2] in ("a/", "b/") else token
 
 
+def _real_name(token: str) -> str | None:
+    """One header path token as the REAL name — ``None`` if it cannot be read.
+
+    git C-quotes a token whose name holds a control character, ``"``, ``\\``
+    or a non-ASCII byte — the WHOLE token, diff prefix included
+    (``"a/caf\\351.py"``) — and every patch body gitutil renders is in that
+    spelling. It is undone with gitutil's own decoder, which yields the real
+    bytes (surrogate-escaped when they are not UTF-8): read as written, such a
+    file never matched its manifest entry and read as unshown though its hunk
+    was right there. A quoted token gitutil cannot decode names nothing.
+    """
+    if not token.startswith('"'):
+        return token
+    real = gitutil._unquote_path(token)
+    return None if real == token else real
+
+
+def _closing_quote(text: str) -> int:
+    """Index of the quote closing the C-quoted token *text* opens, else ``-1``."""
+    i = 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i
+        i += 1
+    return -1
+
+
 def _paired_paths(rest: str, sep: str) -> list[str]:
-    """The paths of an ``a/<old><sep>b/<new>`` pair — ``[]`` when ambiguous.
+    """The REAL names of an ``a/<old><sep>b/<new>`` pair — ``[]`` when ambiguous.
 
     A path may contain spaces, so this pair must NOT be split on whitespace:
     ``diff --git a/my file.py b/my file.py`` came apart into "my" and "file.py",
@@ -559,7 +689,31 @@ def _paired_paths(rest: str, sep: str) -> list[str]:
     parts) and name NOTHING rather than guess — the ``---``/``+++`` and
     ``rename to`` lines carry spaced names losslessly, and an unnamed file merely
     reads as unshown, which is the safe direction.
+
+    A C-quoted side (:func:`_real_name`) is delimited by its own quotes, so it
+    is never ambiguous: it is read to its closing quote. An unquoted name never
+    holds a ``"`` (git would have quoted it), which is what locates a quoted
+    second side after an unquoted first one.
     """
+    if '"' in rest:
+        if rest.startswith('"'):
+            end = _closing_quote(rest)
+            if end < 0 or rest[end + 1:end + 1 + len(sep)] != sep:
+                return []
+            first, second = rest[:end + 1], rest[end + 1 + len(sep):]
+        else:
+            start = rest.find('"')
+            if rest[max(0, start - len(sep)):start] != sep:
+                return []
+            first, second = rest[:start - len(sep)], rest[start:]
+        if second.startswith('"') and _closing_quote(second) != len(second) - 1:
+            return []
+        if not second.startswith('"') and '"' in second:
+            return []
+        old, new = _real_name(first), _real_name(second)
+        if old is None or new is None:
+            return []
+        return [_strip_diff_prefix(old), _strip_diff_prefix(new)]
     body = len(rest) - len("a/") - len(sep) - len("b/")
     if body > 0 and body % 2 == 0:
         candidate = rest[2:2 + body // 2]
@@ -578,9 +732,12 @@ def _header_path(value: str) -> str:
     so the tab — never whitespace — ends the name. Trimming instead renames a file
     whose name genuinely ends in a space (git renders ``trail2 `` as
     ``+++ b/trail2 \t``) into one that does not exist; that reads as unshown,
-    which is safe but spends the gate's teeth for nothing.
+    which is safe but spends the gate's teeth for nothing. A C-quoted label is
+    read through :func:`_real_name` (a quoted name never holds a raw tab);
+    ``""`` when it cannot be.
     """
-    return _strip_diff_prefix(value.split("\t", 1)[0])
+    real = _real_name(value.split("\t", 1)[0])
+    return "" if real is None else _strip_diff_prefix(real)
 
 
 def _paths_named_in_diff(diff: str) -> set[str]:
@@ -596,14 +753,26 @@ def _paths_named_in_diff(diff: str) -> set[str]:
     A binary file counts as named: its ``Binary files a/x and b/x differ`` header
     tells the judge the file is in the change, which is the question here. So
     does a chunk with no hunks at all (a mode change), via its ``diff --git``.
+
+    Returned in the manifest's own spelling — each header's REAL name (git's
+    C-quoting undone, :func:`_real_name`) through
+    :func:`~harness.pipeline.gitutil.display_path` — so a name compares equal
+    however git chose to quote it in the body. Lines are split at ``\\n``
+    only, which is all git ever ends a line with: ``str.splitlines`` also
+    breaks at ``\\r``, ``\\x1c``-``\\x1e``, ``\\x85`` and U+2028/U+2029, which
+    hunk CONTENT may carry — and the piece after such a break can read as a
+    forged ``diff --git`` header. That holds on real bodies because
+    :func:`~harness.pipeline.gitutil.git` hands git's output over exactly as
+    written: under ``subprocess``'s universal newlines a CR in content
+    arrived here as a ``\\n`` already.
     """
     named: set[str] = set()
 
     def _add(path: str) -> None:
         if path and path != "/dev/null":
-            named.add(path)
+            named.add(gitutil.display_path(path))
 
-    lines = diff.splitlines()
+    lines = diff.split("\n")
     in_header = False
     for i, line in enumerate(lines):
         if line.startswith(_DIFF_GIT_PREFIX):
@@ -614,7 +783,7 @@ def _paths_named_in_diff(diff: str) -> set[str]:
             in_header = False                   # a hunk, or content: names nothing
         elif line.startswith(("rename from ", "rename to ",
                               "copy from ", "copy to ")):
-            _add(line.split(" ", 2)[2])
+            _add(_real_name(line.split(" ", 2)[2]) or "")
         elif line.startswith(_BINARY_PREFIX) and line.endswith(_BINARY_SUFFIX):
             for path in _paired_paths(
                     line[len(_BINARY_PREFIX):-len(_BINARY_SUFFIX)], " and "):
@@ -629,13 +798,16 @@ def _paths_named_in_diff(diff: str) -> set[str]:
 def _unshown_manifest_paths(file_manifest: str, diff: str) -> list[str]:
     """Manifest entries the diff never names — the "unshown, not absent" set.
 
-    Conservative in one direction only: a body and a manifest that SPELL a name
-    differently (git still C-quotes a path containing ``"`` or a control byte in
-    the body, which the manifest un-quotes) reads as unshown and arms the abstain
-    rule — a little of the gate's teeth spent, never a file hidden. Spaces and
-    trailing spaces are NOT in that bucket: :func:`_paths_named_in_diff` parses
-    those losslessly, because over-arming on every change that carries such a
-    file is a cost with no payer.
+    Compared on ONE spelling: the manifest lists
+    :func:`~harness.pipeline.gitutil.display_path` names, and
+    :func:`_paths_named_in_diff` returns each header's real name in that same
+    spelling, so a name git C-quotes in the body (a control character, ``"``,
+    ``\\``, any non-ASCII byte — and a body holding one non-UTF-8 name is
+    quoted that way throughout) reads as shown when its hunk is there. Spaces
+    and trailing spaces are parsed losslessly too. Conservative in one
+    direction only: a header that cannot be parsed names nothing, so its file
+    reads as unshown and arms the abstain rule — a little of the gate's teeth
+    spent, never a file hidden.
 
     Empty when there is no manifest, and empty when the diff names no file at
     all: a body with no file headers is not a rendered unified diff (a caller's
@@ -679,18 +851,22 @@ def _name_list(paths: list[str], limit: int = 8) -> str:
     return shown if len(paths) <= limit else f"{shown} (+{len(paths) - limit} more)"
 
 
-def _one_answer(ask: Ask | None, ask_structured: AskStructured | None,
-                prompt: str, k: int, n: int) -> tuple[str, dict | None, str, str]:
-    """Run ONE verifier sample. Returns ``(text, structured, error, refused)``.
+def _one_answer(ask: Ask | None, ask_structured: AskStructured | None, prompt: str,
+                k: int, n: int) -> tuple[str, dict | None, str, str, _UsageLimit | None]:
+    """Run ONE verifier sample. Returns ``(text, structured, error, refused, limit)``.
 
     *error* is non-empty ONLY for the case the gate must not fail open on: the
     backend enforced :data:`VERDICT_SCHEMA` and the answer still did not conform.
     *refused* is non-empty when the call could not be made and the backend says
     that must not read as a skip either (``OneshotResult.abstain`` — an E2BIG
     launch refusal, or a verifier with tools that left processes running); it
-    carries the backend's detail. Infrastructure failures (backend unavailable,
-    launch failure, timeout, non-zero exit, an exception) return
-    ``("", None, "", "")`` — no vote, no error, gate skips, exactly as before.
+    carries the backend's detail. *limit* is set when the backend's usage limit
+    refused the call (``OneshotResult.usage_limit`` — the refusal's own text —
+    and ``usage_limit_kind``, its regime): the caller launches no further
+    sample and the review ends with no verdict. Infrastructure failures (backend
+    unavailable, launch failure, timeout, non-zero exit, an exception) return
+    ``("", None, "", "", None)`` — no vote, no error, gate skips, exactly as
+    before.
     """
     if ask_structured is not None:
         try:
@@ -698,34 +874,43 @@ def _one_answer(ask: Ask | None, ask_structured: AskStructured | None,
         except Exception as exc:  # noqa: BLE001 — the verifier must never crash review
             logger.warning("verifier sample %d/%d raised (%s: %s) — treated as no vote",
                            k + 1, n, type(exc).__name__, exc)
-            return "", None, "", ""
+            return "", None, "", "", None
+        limit = getattr(res, "usage_limit", "") if res is not None else ""
+        if isinstance(limit, str) and limit.strip() and not getattr(res, "ran", False):
+            logger.warning("verifier sample %d/%d: refused by the backend's usage "
+                           "limit (%s) — no verdict, and no further sample", k + 1, n,
+                           trunc(redact(limit), 200))
+            kind = getattr(res, "usage_limit_kind", "")
+            return "", None, "", "", _UsageLimit(
+                limit.strip(),
+                kind if isinstance(kind, str) and kind in _LIMIT_REGIMES else "")
         if res is not None and not getattr(res, "ran", False) \
                 and getattr(res, "abstain", False):
             refused = (getattr(res, "detail", "")
                        or "the one-shot call was refused")
             logger.warning("verifier sample %d/%d: the one-shot call was refused (%s) "
                            "— no vote, and not a skip", k + 1, n, refused)
-            return "", None, "", refused
+            return "", None, "", refused, None
         if res is None or not getattr(res, "ran", False):
             logger.debug("verifier sample %d/%d: the one-shot call did not complete "
                          "(%s) — no vote, gate fails open", k + 1, n,
                          getattr(res, "detail", "") or "backend unavailable")
-            return "", None, "", ""
+            return "", None, "", "", None
         text = getattr(res, "text", "") or ""
         data = getattr(res, "structured", None)
         if isinstance(data, dict):
-            return text, data, "", ""
+            return text, data, "", "", None
         if getattr(res, "schema_enforced", False):
             return text, None, (
                 "the verifier backend enforced harness's answer schema but returned no "
-                "conforming object — the gate's output contract has drifted"), ""
-        return text, None, "", ""   # no schema knob: fall back to the prose trailer
+                "conforming object — the gate's output contract has drifted"), "", None
+        return text, None, "", "", None   # no schema knob: fall back to the prose trailer
     try:
-        return (ask(prompt) if ask else "") or "", None, "", ""
+        return (ask(prompt) if ask else "") or "", None, "", "", None
     except Exception as exc:  # noqa: BLE001 — the verifier must never crash review
         logger.warning("verifier sample %d/%d raised (%s: %s) — treated as no vote",
                        k + 1, n, type(exc).__name__, exc)
-        return "", None, "", ""
+        return "", None, "", "", None
 
 
 def _parse_structured(data: dict) -> tuple[str | None, float | None, list[str]]:

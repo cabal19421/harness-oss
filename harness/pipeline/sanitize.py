@@ -41,13 +41,21 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # ``-----BEGIN PRIVATE KEY-----`` are all the same disclosure.
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
                r"-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+    # The separator between a keyword (or a Bearer/Basic prefix) and its value
+    # is a CHARACTER CLASS, not bare ``\s``: ``sanitize_publication`` runs
+    # ``neutralize_controls`` first, and that pass leaves U+FFFD where a control
+    # character was. Form feed, the C0 separators (FS/GS/RS/US) and NEL are all
+    # ``\s``, so ``password:<FF>secret`` — redacted on its own — reaches these
+    # patterns as ``password:<U+FFFD>secret`` after the control pass, which
+    # ``\s`` does not match. U+FFFD counts as a separator here for the same
+    # reason ``_HARNESS_MARKER_RE`` counts it, so the credential still masks.
     re.compile(
         r"(?i)(api[_-]?key|access[_-]?token|secret[_-]?(?:key|token)?|password|passwd|"
-        r"bearer|authorization)\s*[:=]\s*['\"]?(?:(?:bearer|basic|token)\s+)?"
+        r"bearer|authorization)[\s\ufffd]*[:=][\s\ufffd]*['\"]?(?:(?:bearer|basic|token)[\s\ufffd]+)?"
         r"([A-Za-z0-9_\-./+=]{12,})"
     ),
     # Header/CLI echoes without a colon: "Bearer sk_live_…", "Basic dXNlcjpw…".
-    re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(r"(?i)\b(?:bearer|basic)[\s\ufffd]+[A-Za-z0-9._~+/=-]{12,}"),
     # Hyphens inside the class, in step with log.py's list and for its reason:
     # a segmented key (`sk-proj-…`, and every other vendor prefix that puts an
     # account/version segment ahead of the random tail) never reaches 20 matched
@@ -172,7 +180,15 @@ _HARNESS_MARKER_DEFANGED = "<!- - harness:"
 # marker back out of a file this text is published into. An exact-literal
 # ``str.count``/``str.replace`` passed both variants through untouched.
 # Case-insensitive because HTML comments are, and forging costs one keystroke.
-_HARNESS_MARKER_RE = re.compile(r"<!--\s*harness\s*:", re.IGNORECASE)
+#
+# U+FFFD counts as a separator too: it is what :func:`neutralize_controls`
+# leaves in place of a control character, and the scrub runs that pass first.
+# Several of those characters are whitespace to ``\s`` (form feed, the C0
+# separators, NEL), so ``<!--`` + FF + ``harness:`` — defanged before the
+# control pass existed — would come out of it as ``<!--`` + U+FFFD +
+# ``harness:``: still an HTML comment, hidden from the reader, no longer
+# defanged.
+_HARNESS_MARKER_RE = re.compile(r"<!--[\s\ufffd]*harness[\s\ufffd]*:", re.IGNORECASE)
 
 
 def neutralize_markers(text: str) -> str:
@@ -195,6 +211,75 @@ def neutralize_markers(text: str) -> str:
     return out
 
 
+# What gh's read path rewrites. Every JSON response gh reads passes through its
+# ASCII sanitizer, which shows a C0 or C1 control character in caret notation
+# (``^[`` for ESC) — and does the same to the six-character TEXT ``\u001b``,
+# keeping its backslash. A PR body published with either never reads back as
+# published, so its trailer's digest could never match again: an adopted PR
+# was refused forever as "edited after harness published it". Raw, the same
+# bytes also reach a terminal verbatim from ``git log`` (a commit message) or
+# a ``curl | jq -r`` of the PR.
+#
+# An ANSI escape sequence: CSI (``ESC [`` … final byte), OSC (``ESC ]`` … BEL
+# or ST), or a two-byte escape. Dropped whole, so none of its bytes is left to
+# render as noise.
+#
+# None of them reaches past the line it starts on. The scrub runs once over
+# ASSEMBLED text — a PR body, whose own lines (the ``### Risk:`` heading, the
+# oracle it lists) sit between design-supplied fields — and an OSC payload that
+# could cross a line break made an ``ESC ]`` ending a design's description and
+# a BEL in a later validation command one "sequence": everything between them
+# was dropped, the real risk heading and the operator's commands included,
+# under a digest that still attested the body intact. Line-bounded, an OSC
+# left open at a line break loses only its two-byte opener (the last branch),
+# and the BEL is shown as U+FFFD like any other control character. CSI's byte
+# classes never included a line break.
+_ANSI_SEQUENCE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n\r]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+# The control characters gh rewrites: C0 except tab, line feed, vertical tab
+# and carriage return, and all of C1. DEL stays, as gh leaves it.
+_GH_CONTROL_RE = re.compile(r"[\x00-\x08\x0c\x0e-\x1f\x80-\x9f]")
+# The literal escapes gh rewrites: a LOWERCASE ``\u00`` and two hex digits, in
+# either case, naming one of those characters. ``\U001b`` stays, as gh leaves
+# it.
+_GH_ESCAPE_RE = re.compile(r"\\u00(0[0-8cCeEfF]|1[0-9a-fA-F]|[89][0-9a-fA-F])")
+
+
+def neutralize_controls(text: str) -> str:
+    """Drop ANSI escape sequences from *text*; replace other control characters with U+FFFD.
+
+    "Other" is exactly the set gh's read path rewrites (:data:`_GH_CONTROL_RE`):
+    tab, line feed, vertical tab, carriage return and DEL are kept. The first
+    pass of :func:`sanitize_publication`, so it covers every published surface
+    — the PR title and body, harness's commit messages, the ide-handoff packet.
+    A sequence is never matched across a line break, so dropping one removes
+    text only from the line it starts on: text scrubbed once, assembled, keeps
+    every line that sits between the fields it was assembled from.
+    """
+    out = _GH_CONTROL_RE.sub("\ufffd", _ANSI_SEQUENCE_RE.sub("", text))
+    if out != text:
+        logger.debug("neutralized control characters in %d chars of published "
+                     "text — escape sequences dropped, the rest shown as U+FFFD, "
+                     "so gh reads the text back exactly as it was written",
+                     len(text))
+    return out
+
+
+def neutralize_gh_escapes(text: str) -> str:
+    r"""Respell each literal ``\u00XX`` escape gh would rewrite as ``\u{00XX}``.
+
+    The half of gh's read-path rewriting that :func:`neutralize_controls` does
+    not cover: the six-character TEXT ``\u001b``, which gh shows as ``\^[``.
+    For the PR BODY only (``ReviewGate._pr_body``), the one published text
+    harness reads back through gh and verifies against a digest — applied
+    after :func:`sanitize_publication` and before the trailer is computed.
+    Never inside :func:`sanitize_publication`: that scrub also renders the
+    ide-handoff packet's oracle commands, and ``python3 -c
+    'print("\u001b[0mok")'`` respelled ``\u{001b}`` no longer runs.
+    """
+    return _GH_ESCAPE_RE.sub(lambda m: "\\u{00" + m.group(1) + "}", text)
+
+
 def sanitize_publication(text: str) -> str:
     """Scrub *text* for a surface harness PUBLISHES (a PR body, a packet).
 
@@ -204,12 +289,17 @@ def sanitize_publication(text: str) -> str:
     fields somebody remembered, and the next rendering path added to the body
     would arrive unprotected.
 
-    Order matters: markers first (an exact literal), then secrets (a design doc
-    that pasted a token is the case :func:`redact_secrets` already knows), then
-    home paths last, so a credential is masked whole rather than surviving as a
+    Order matters: control characters first (:func:`neutralize_controls`),
+    because dropping an escape sequence JOINS the text around it — run after
+    the other passes, ``<!-\\x1b[0m- harness:`` became a live marker, a
+    ``ghp_`` token split by one survived unredacted, and so did a home path.
+    Then markers (defanged by shape), then secrets (a design doc that pasted a
+    token is the case :func:`redact_secrets` already knows), then home paths
+    last, so a credential is masked whole rather than surviving as a
     ``~``-rewritten fragment.
     """
-    return redact_home_paths(redact_secrets(neutralize_markers(text)))
+    return redact_home_paths(redact_secrets(neutralize_markers(
+        neutralize_controls(text))))
 
 
 def wrap_untrusted(text: str, *, label: str = "SOURCE DESIGN DOCUMENT") -> str:

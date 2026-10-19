@@ -320,10 +320,23 @@ class PipelineConfig:
     # run that would have resumed on its own; the transient ladder, capped at
     # 30 minutes, burns max_consecutive_failures long before the window reopens.
     # So the loop SLEEPS until it reopens, bounded two ways: each wait is clamped
-    # to quota_wait_cap_seconds (0 disables the regime — quota windows fall back
-    # to the transient ladder), and a task waits at most max_quota_waits times so
-    # a misclassification cannot park a run forever. 5h matches the documented
-    # window width.
+    # to quota_wait_cap_seconds (0 disables waiting: a quota window then stops
+    # the loop at once as a permanent failure — it is NOT retried on the
+    # transient ladder), and a task waits at most max_quota_waits times so a
+    # misclassification cannot park a run forever. 5h matches the documented
+    # window width. The agent-cli backend also stops at once, as permanent,
+    # when the CLI's stated reset lies beyond what the remaining waits can cover
+    # (quota_wait_cap_seconds × the waits left). A review the usage limit
+    # refuses ends with no verdict — the verifier never waits mid-call — and is
+    # never a cycle of max_task_attempts; before it runs again the orchestrator
+    # applies this same policy, from the refusal it records on the task's notes
+    # (a record holds back only a review on the verifier it refused — the same
+    # backend, pinned to the same model — and only while its reset is ahead): a
+    # stated reset within the budget is waited out (one capped wait per
+    # refusal, as here), one past it is not reviewed until it is within it, and
+    # a limit only an operator lifts parks the task at awaiting-human once it
+    # refuses a review (its record states no reset, so it never holds a later
+    # run's review back: that run reviews, and is refused afresh if it stands).
     quota_wait_cap_seconds: float = 18000.0
     max_quota_waits: int = 4
     # Hold a host sleep inhibitor for the length of the run (systemd-inhibit on
@@ -433,10 +446,17 @@ class PipelineConfig:
     require_z3: bool = False
     # Baseline validation: run the SAME oracle commands against the task's diff
     # base *before* judging the agent's worktree, and don't blame the agent for a
-    # command that was already failing there. OFF by default and loudly logged
-    # when on, because it is a real change to what "the gate passed" means: it
-    # can mask a pre-existing failure a reviewer would want to see, and it costs
-    # a second full validation run (in a throwaway detached worktree) per task.
+    # command that was already failing there — while it fails the same way: the
+    # same exit code (a base run that timed out matches nothing) and, where the
+    # output names its failing tests (pytest's short summary, `go test`'s FAIL
+    # lines), no test the base did not also fail; a run that stops naming its
+    # failing tests where the base named them is not the same failure either.
+    # OFF by default and loudly logged when on, because it is a real
+    # change to what "the gate passed" means: it can mask a pre-existing failure
+    # a reviewer would want to see — and, for any other runner, a NEW failure
+    # inside a command that was already red, since the excuse then covers the
+    # whole command — and it costs a second full validation run (in a throwaway
+    # detached worktree) per task.
     # Turn it on when harness is pointed at a repo whose suite is not green at
     # HEAD, or one whose toolchain (mypy 2.x's default flips, a pytest config
     # precedence change) reds it independently of any diff — otherwise every

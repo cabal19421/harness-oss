@@ -42,12 +42,20 @@ SUPPORTED_LANGUAGES = ("python", "go")
 
 def detect_language(path: str | Path) -> str:
     """Best-effort language from a filename/extension (defaults to ``python``)."""
-    s = str(path).lower()
-    if s.endswith(".go"):
-        logger.debug("detected language 'go' for %s (.go extension)", path)
-        return "go"
-    logger.debug("detected language 'python' for %s (default: extension is not .go)", path)
-    return "python"
+    lang = "go" if str(path).lower().endswith(".go") else "python"
+    if logger.isEnabledFor(logging.DEBUG):
+        # display_path: the grounding gate passes a changed file's name, which
+        # may hold a byte that is not UTF-8 — and a strict UTF-8 log file
+        # (HARNESS_LOG_FILE) dropped such a record with a "--- Logging error
+        # ---" traceback. Imported here: harness.pipeline imports this package.
+        from harness.pipeline.gitutil import display_path
+        shown = display_path(str(path))
+        if lang == "go":
+            logger.debug("detected language 'go' for %s (.go extension)", shown)
+        else:
+            logger.debug("detected language 'python' for %s (default: extension "
+                         "is not .go)", shown)
+    return lang
 
 
 class Preflight:

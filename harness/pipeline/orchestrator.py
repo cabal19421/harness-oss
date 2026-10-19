@@ -19,33 +19,221 @@ worktree runs concurrently.
 
 from __future__ import annotations
 
+import math
+import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 from harness.grounding import Z3Unavailable
 from harness.log import get_logger, log_context, redact, step, trunc
 
-from . import gitutil, nosleep, shutdown, store, worktree
+from . import gitutil, nosleep, procutil, shutdown, store, worktree
 from .backends import get_backend
 from .backends.base import ImplementContext
 from .grounding_gate import GroundingGate
 from .ingest import plan_from_designs
+from .looptools import (
+    cli_reset_clause,
+    cli_reset_slack,
+    quota_reset_seconds,
+    wait_out_quota_window,
+)
+from .mutation import MutantRestoreError, record_path, restore_pending
 from .notes import RunLog, TaskClaim
 from .review import ReviewGate, ReviewResult
 from .spec import PipelineConfig, Plan, Task
-from .supervisor import VERIFIED_OUTCOMES, Supervisor
+from .supervisor import PARKED, VERIFIED_OUTCOMES, Supervisor
 from .trace import Tracer, new_run_id
 from .worktree import WorktreeInUse, WorktreeManager
 
 Logger = Callable[[str], None]
 
 logger = get_logger(__name__)
+
+#: :class:`WorktreeInUse` reasons that mean "something may still be writing this
+#: tree" — what the relaunch gate waits on instead of failing the task.
+_LIVE_WRITER_REASONS = frozenset({"processes", "survivors", "unverified-scan"})
+#: The same three in ``recovery_skipped``'s reason vocabulary: the
+#: ``launch_skipped`` span uses it, so the two spans name a busy tree alike.
+_LAUNCH_SKIP_REASON = {"processes": "worktree-busy", "survivors": "survivors",
+                       "unverified-scan": "unverified-scan"}
+#: ``recovery_skipped`` reasons that hold a task out of the run whose recovery
+#: pass deferred it: each is positive evidence of a live writer in the tree, or
+#: of a live owner — a resume would race it. Two deferrals are NOT held out,
+#: and resume in the same run through the relaunch gate instead (a process scan
+#: under the held claim that refuses on anything it finds, and on an
+#: enumeration that fails), their recovery reset still deferred — and so is
+#: ``reset_worktree_on_reuse``'s reset (see _run_one_inner):
+#:
+#: * ``recent-writes`` — after a crash the fresh mtimes are overwhelmingly the
+#:   dead run's own. What that leaves open is a writer whose cwd is outside the
+#:   tree and that is not the dead run — the one shape no gate here sees.
+#: * ``unverified-scan`` — recovery's scan may kill, so it needs this process's
+#:   whole ancestor chain, which a ``/proc`` mounted ``hidepid=2`` or
+#:   ``invisible`` (systemd ``ProtectProc=invisible``) never lets it resolve:
+#:   held out, every crashed task stayed out of every run, exit 0. The gate
+#:   reports and never signals, so it scans without that walk.
+#:
+#: (``unknown-liveness`` is never a deferral here: nothing would clear it.)
+_HOLD_OUT_DEFERRALS = frozenset({"worktree-busy", "survivors", "claim-held",
+                                 "unclaimable", "pid-alive-kill-off"})
+#: Hold-out reasons that are about the TREE (reported as ``worktree-busy``); the
+#: others are reported under their own name.
+_TREE_HOLDS = frozenset({"worktree-busy", "survivors"})
+
+_scan_warning_lock = threading.Lock()
+_scan_warned = threading.Event()
+
+
+def _warn_scan_unavailable(log: Logger) -> None:
+    """Say once per process that relaunches go unchecked on this platform."""
+    with _scan_warning_lock:
+        if _scan_warned.is_set():
+            return
+        _scan_warned.set()
+    msg = ("process scan unavailable: launching without the in-use check "
+           "(install harness[proc])")
+    logger.warning("%s", msg)
+    log(f"⚠️  {msg}")
+
+
+# ── a review the usage limit refused ─────────────────────────────────────────────
+#
+# Such a review has no verdict (``ReviewResult.usage_limit``). It is never a
+# cycle of max_task_attempts (_give_back_refused_review); the refusal is
+# recorded on the task's notes (_record_refused_review); and the implement
+# loop's quota-wait policy is applied to it at the launcher level, before the
+# review — and so the verifier — runs again (_await_review_window). The
+# verifier itself never waits mid-call.
+
+#: The head of the note such a review leaves on its task: the regime the
+#: backend gave the refusal (``unknown`` when it could not tell), when its
+#: window reopens (``unstated`` when the text names no time) and when it was
+#: seen, both UTC, and the verifier it refused — the backend, and the model
+#: that backend was pinned to (``default`` when none was). Harness writes it
+#: (:func:`_refusal_note`) and reads it back strictly (:func:`_recorded_refusal`):
+#: a note of any other shape is no record, and the review simply runs, as it
+#: always did.
+_REFUSAL_NOTE = re.compile(
+    r"usage limit refused the verifier \[(?P<kind>quota-window|permanent|unknown); "
+    r"reopens (?P<reset>unstated|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z); "
+    r"seen (?P<seen>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z); "
+    r"backend (?P<backend>[A-Za-z0-9._-]{1,64}); "
+    r"model (?P<model>[A-Za-z0-9._-]{1,64})\]")
+#: Where the limit's own words start in that note; they run to its end.
+_REFUSAL_TEXT = " The limit: "
+#: The implement loop's quota-wait constants (the defaults of
+#: ``looptools.quota_wait_seconds``): the bounded wait for a named window that
+#: states no reset, and the grace a stated reset is waited out with, so the
+#: review lands just after the window reopens rather than on the boundary.
+_QUOTA_DEFAULT_WAIT = 900.0
+_QUOTA_GRACE = 30.0
+#: How far ahead a recorded reset may lie (ten years): far past any wait
+#: budget, and still a date the note can name.
+_REFUSAL_HORIZON = 10 * 366 * 86400.0
+#: How far past now a recorded refusal's ``seen`` stamp may lie and still be
+#: read as a refusal this machine saw: a clock set back by more than this since
+#: makes the record no proof of anything, and the review simply runs.
+_REFUSAL_CLOCK_SKEW = 60.0
+#: The PipelineConfig field that pins each built-in backend's model — which its
+#: verifier one-shot runs on too. A backend not named here has no pin harness
+#: knows of, so its refusals record the model ``default``.
+_MODEL_FIELDS = {"agent-cli": "agent_model", "openai": "openai_model",
+                 "gemini": "gemini_model"}
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """A review the usage limit refused, as its task's notes record it."""
+
+    kind: str                  # quota-window | permanent | unknown
+    reset_at: float | None     # epoch its window reopens at; None: no time named
+    seen_at: float             # epoch it was seen
+    text: str                  # the limit's own words (redacted, one line, bounded)
+    backend: str               # the backend whose verifier it refused (_note_backend)
+    model: str                 # the model that verifier ran on (_verifier_model)
+
+
+@dataclass
+class _ReviewWaits:
+    """One run's quota waits for one task's review — at most max_quota_waits."""
+
+    spent: int = 0
+    #: The reset clause the last wait read as a window that had just reopened.
+    reopened_clause: str = ""
+
+
+def _utc_stamp(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_stamp(stamp: str) -> float:
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc).timestamp()
+
+
+def _limit_kind(kind: str) -> str:
+    """The backend's regime for a refusal, as a note names it."""
+    return kind if kind in ("quota-window", "permanent") else "unknown"
+
+
+def _note_backend(name: object) -> str:
+    """A backend's or a model's name as a note writes it: ``[A-Za-z0-9._-]``, at most 64."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", str(name or ""))[:64] or "unknown"
+
+
+def _verifier_model(cfg: PipelineConfig) -> str:
+    """The model *cfg*'s verifier runs on, as a refusal note writes it.
+
+    The model its backend is pinned to (:data:`_MODEL_FIELDS`) — or
+    ``default`` when none is, the CLI's or the provider's own choice.
+    """
+    name = _MODEL_FIELDS.get(str(cfg.backend), "")
+    model = getattr(cfg, name, None) if name else None
+    return _note_backend(model) if model else "default"
+
+
+def _refusal_note(ref: _Refusal, then: str) -> str:
+    """The task note for *ref*: its head, what harness does (*then*), the limit."""
+    reset = "unstated" if ref.reset_at is None else _utc_stamp(math.ceil(ref.reset_at))
+    return (f"usage limit refused the verifier [{ref.kind}; reopens {reset}; seen "
+            f"{_utc_stamp(ref.seen_at)}; backend {_note_backend(ref.backend)}; model "
+            f"{_note_backend(ref.model)}] — no verdict: nothing was published, nothing "
+            f"recorded as a failure, and no cycle of max_task_attempts charged; "
+            f"{then}.{_REFUSAL_TEXT}{ref.text}")
+
+
+def _recorded_refusal(note: str) -> _Refusal | None:
+    """The refusal *note* records (:func:`_refusal_note`), or ``None``.
+
+    Strict — anchored at the note's start, harness's own shape only — so no
+    other note (a PR failure's, a review summary) reads as one. Never raises.
+    """
+    match = _REFUSAL_NOTE.match(note) if isinstance(note, str) else None
+    if match is None:
+        return None
+    try:
+        reset_at = None if match["reset"] == "unstated" else _parse_stamp(match["reset"])
+        seen_at = _parse_stamp(match["seen"])
+    except (ValueError, OverflowError, OSError):
+        return None
+    _, sep, text = note.rpartition(_REFUSAL_TEXT)
+    return _Refusal(match["kind"], reset_at, seen_at, text if sep else "",
+                    match["backend"], match["model"])
+
+
+def _hours(seconds: float) -> str:
+    """``~2.4h`` / ``~37m`` / ``30s`` — a wait or a time to a reset, for a note."""
+    if seconds >= 3600:
+        return f"~{seconds / 3600:.1f}h"
+    return f"~{seconds / 60:.0f}m" if seconds >= 90 else f"{max(0.0, seconds):.0f}s"
 
 
 @dataclass
@@ -90,6 +278,9 @@ class PipelineOrchestrator:
         self._git_lock = threading.Lock()      # serialises repo-level git mutations
         self._state_lock = threading.Lock()    # guards Task mutation + plan snapshot
         self._owned: set[str] = set()          # task ids THIS run mutates (multi-proc merge)
+        # Every task this run's recovery pass deferred, with the reason — read by
+        # _run_one_inner, so a deferred task's tree is never reset on reuse.
+        self._recovery_deferred: dict[str, str] = {}
         if not config.base_branch:
             if gitutil.is_repo(config.repo):
                 config.base_branch = gitutil.base_ref(config.repo)
@@ -432,6 +623,19 @@ class PipelineOrchestrator:
                     self.log(f"⚠️  {len(withheld)} crashed task(s) re-armed WITHOUT a "
                              f"verified worktree reset: {detail} — the resumed run "
                              "may see the crashed iteration's edits")
+            # A deferral that is positive evidence of a live writer holds the
+            # task out of every wave of this run: a resume would be a second
+            # writer. See _HOLD_OUT_DEFERRALS for the two that do not. Recovery
+            # already logged and traced each deferral.
+            self._recovery_deferred = dict(sup.deferred)
+            held = {t: why for t, why in sup.deferred.items()
+                    if why in _HOLD_OUT_DEFERRALS}
+            if held:
+                names = ", ".join(f"{t} ({why})" for t, why in sorted(held.items()))
+                logger.warning("run start: %d task(s) recovery deferred this pass are "
+                               "held out of this run: %s", len(held), names)
+                self.log(f"⏸  {len(held)} task(s) held out of this run — recovery "
+                         f"deferred them: {names}")
 
             backend = get_backend(self.config.backend)
             ok, reason = backend.available()
@@ -464,6 +668,19 @@ class PipelineOrchestrator:
                 return report
 
             report = RunReport(plan_file=str(self.config.plan_file))
+            # A held task is part of this run's outcome, not an absence from it:
+            # listed with why (and the pids), so the report and `run_end` say
+            # what happened to it instead of "No tasks were run." plus a stall
+            # hint about dependencies. Only tasks this run would otherwise run.
+            for tid, why in sorted(held.items()):
+                held_task = plan.get(tid)
+                if held_task is None or (task_ids and tid not in task_ids):
+                    continue
+                report.add(TaskRun(
+                    tid, "worktree-busy" if why in _TREE_HOLDS else why,
+                    risk=held_task.risk,
+                    detail=(f"held out of this run — recovery deferred it this pass "
+                            f"({why}): {sup.deferred_detail.get(tid, '')}")))
             self.log(f"Backend '{backend.name}', pr={self.config.pr_mode}, "
                      f"parallel={self.config.parallel}")
             logger.info("run start: %d task(s) in plan, backend=%s, pr_mode=%s, "
@@ -481,8 +698,10 @@ class PipelineOrchestrator:
             # plan.ready() (which now sees the just-completed tasks as `done`).
             attempted: set[str] = set()
             wave = 0  # log-only counter
+            stopped_by = ""  # the signal that ended the loop early, if one did
             while True:
-                batch = [t for t in self._select_tasks(plan, task_ids) if t.id not in attempted]
+                batch = [t for t in self._select_tasks(plan, task_ids, held=held)
+                         if t.id not in attempted]
                 if not batch:
                     logger.debug("wave %d: no runnable tasks remain — dependency "
                                  "draining loop done", wave + 1)
@@ -497,11 +716,12 @@ class PipelineOrchestrator:
                 if shutdown.requested():
                     # A wave is the natural stopping point: every task in it has
                     # already been recorded, and the ones never started stay
-                    # `pending` for the next run.
+                    # `pending` for the next run. The operator's line waits
+                    # until `run_end` is traced below: a terminal that is gone
+                    # (EIO after a hangup) must not cost the trace its last span.
                     logger.warning("shutdown requested (%s) — not starting "
                                    "another wave", shutdown.signame())
-                    self.log(f"⏹ interrupted by {shutdown.signame()} — stopping "
-                             "after this wave; untouched tasks stay pending")
+                    stopped_by = shutdown.signame()
                     break
 
             if task_ids:
@@ -519,15 +739,20 @@ class PipelineOrchestrator:
                         logger.warning("requested task %s did not run — %s", tid, detail)
                         report.add(TaskRun(tid, "waiting-dependency", risk=t.risk,
                                            detail=detail))
-            if not report.runs:
-                self._report_stall(plan)
             self._save(plan)
+            # Records before chatter: `run_end` is written before any operator
+            # line below, so a failing terminal cannot cost the trace its end.
             self._tracer.span("run_end", ok=all(
                 r.status not in ("failed", "blocked", "error", "waiting-dependency",
                                  "interrupted")
                 for r in report.runs),
                 interrupted=shutdown.requested(),
                 outcomes={r.task_id: r.status for r in report.runs})
+            if not report.runs:
+                self._report_stall(plan)
+            if stopped_by:
+                self.log(f"⏹ interrupted by {stopped_by} — stopped after this "
+                         "wave; untouched tasks stay pending")
             counts = Counter(r.status for r in report.runs)
             logger.info("run end: %d task(s) attempted in %.1fs — %s",
                         len(report.runs), time.monotonic() - t0,
@@ -776,6 +1001,19 @@ class PipelineOrchestrator:
                              "review human-implemented work", ctx.worktree, task_id)
                 return TaskRun(task_id, "error",
                                detail=f"worktree {ctx.worktree} is missing — re-run `pipeline run --task {task_id}`")
+            # A run that cannot satisfy --require-z3 is refused before anything
+            # is written, as run() refuses it up front: the review's grounding
+            # oracle raises Z3Unavailable only after its freeze has committed the
+            # leftovers (PRs on) and its `review` heartbeat has replaced a
+            # parked one. Passed exactly as the per-task gate passes it
+            # (ImplementContext.gate).
+            try:
+                GroundingGate(self.config.repo, require_z3=self.config.require_z3)
+            except Z3Unavailable as exc:
+                logger.error("complete: grounding solver unavailable (%s) — task %s "
+                             "left as it was, nothing reviewed or committed",
+                             exc, task_id)
+                raise
 
             logger.info("complete: reviewing human-implemented task %s (was %r)",
                         task_id, task.status)
@@ -791,8 +1029,26 @@ class PipelineOrchestrator:
                                       "retry once it finishes")
             with self._state_lock:
                 self._owned.add(task_id)
+            was = task.status
             try:
+                # The mutation gate's record is settled before the review's
+                # heartbeat replaces a parked one: a refusal raised from inside
+                # the review left a `review` beat under this soon-dead pid, and
+                # the next recovery read a parked task as a crash. Raises
+                # MutantRestoreError with nothing written — no beat, no commit,
+                # no status — and the review's own check finds nothing left.
+                restore_pending(record_path(self.config.state_dir, task_id),
+                                ctx.worktree)
                 result = self._review_and_record(plan, task, ctx, open_pr)
+                if result.interrupted:
+                    # No verdict: the review this command asked for did not
+                    # happen, so the status it was called on stands — neither
+                    # demoted to `failed` nor left at `review`, which a plain
+                    # `pipeline run` would pick up on its own.
+                    with self._state_lock:
+                        task.touch(was)
+                    logger.info("complete: task %s left at %r — re-run `pipeline "
+                                "complete %s` to review it", task_id, was, task_id)
                 # Persist INSIDE the hold. Saving after `claim.release()` left a
                 # window where the task was done in memory, its claim free and
                 # nothing on disk yet — long enough for a concurrent recovery
@@ -871,14 +1127,74 @@ class PipelineOrchestrator:
         #    Seeding merges this task's completed dependency branches into the
         #    worktree so the agent builds ON its dependencies instead of
         #    re-creating their types — the fix for cross-branch divergence.
+        in_use = (worktree.IN_USE_KILL if self.config.kill_worktree_procs
+                  else worktree.IN_USE_REFUSE)
+        # A tree recovery deferred this pass (even only for `recent-writes`)
+        # keeps that deferral: reset_worktree_on_reuse must not reset what
+        # recovery just declined to.
+        reset_on_reuse = self.config.reset_worktree_on_reuse
+        deferred_why = self._recovery_deferred.get(task.id, "")
+        if reset_on_reuse and deferred_why:
+            logger.warning("task %s: recovery deferred it this pass (%s) — skipping "
+                           "reset_worktree_on_reuse, the reused tree is resumed as "
+                           "it is", task.id, deferred_why)
+            reset_on_reuse = False
+        busy: WorktreeInUse | None = None
+        stuck: MutantRestoreError | None = None
         with self._git_lock:
-            wt = self._wt.ensure(
-                task.id,
-                reset_on_reuse=self.config.reset_worktree_on_reuse,
-                in_use=(worktree.IN_USE_KILL if self.config.kill_worktree_procs
-                        else worktree.IN_USE_REFUSE),
-            )
-            seed_ref = self._seed_dependencies(task, wt, plan)
+            try:
+                wt = self._wt.ensure(task.id, reset_on_reuse=reset_on_reuse,
+                                     in_use=in_use)
+                # Relaunch gate — under the held claim, before anything writes
+                # into the tree (the seed below, the agent, the review's
+                # validation and PR) and before an attempt is charged. A reused
+                # tree is not reset by default, a dead heartbeat pid is no proof
+                # its children died (they are detached), and the claim check
+                # above sees only a live owner: a leftover writer would race the
+                # new one. Scan-and-refuse ALWAYS, whatever kill_worktree_procs
+                # says: what is found here may be an operator's shell or editor,
+                # and a launch never kills to make room (crashed tasks were
+                # already swept by recovery under the configured policy). Since
+                # it signals nothing, its scan needs no ancestor walk
+                # (procutil.pids_in_dir_refuse_only), so a /proc that hides other
+                # users' processes does not refuse every relaunch. A tree
+                # ensure() just created has nothing running in it, and a
+                # platform that cannot scan at all launches with a warning
+                # rather than refusing every task forever; a scan that FAILS on a
+                # platform that can scan still refuses.
+                if wt.reused and procutil.scan_available():
+                    self._wt._reclaim_processes(wt.path, in_use=worktree.IN_USE_REFUSE,
+                                                what=f"task {task.id}: relaunch",
+                                                action="launch")
+                elif wt.reused:
+                    _warn_scan_unavailable(self.log)
+            except WorktreeInUse as exc:
+                # Only a live writer is a reason to wait; a tree that is not
+                # provably this repo's, or hides edits it cannot clear, keeps
+                # failing exactly as before.
+                if exc.reason not in _LIVE_WRITER_REASONS:
+                    raise
+                busy = exc
+            if busy is None:
+                # Before anything below can commit the tree (the seed's merge, the
+                # agent loop, the review's freeze): a mutant a killed run left on
+                # disk goes back first — only the exact bytes the record names,
+                # in the tree and at the HEAD it was made in. A record that
+                # cannot be settled (the file was edited since, its exact
+                # mutant sits where the record cannot apply, or the record —
+                # or the file it names — cannot be read or even looked up)
+                # refuses the launch: nothing is seeded, launched or charged.
+                try:
+                    restore_pending(record_path(self.config.state_dir, task.id),
+                                    wt.path)
+                except MutantRestoreError as exc:
+                    stuck = exc
+                else:
+                    seed_ref = self._seed_dependencies(task, wt, plan)
+        if busy is not None:
+            return self._launch_refused(task, busy)
+        if stuck is not None:
+            return self._mutant_record_refused(task, stuck)
         logger.debug("task %s: worktree ready at %s (branch %s), diff base %s",
                      task.id, wt.path, wt.branch, seed_ref)
         with self._state_lock:
@@ -916,27 +1232,27 @@ class PipelineOrchestrator:
             # The review-only resume is cheap but not free (validation + mutation
             # + verifier + a PR attempt) — and a PR step that fails the same way
             # every night would otherwise retry FOREVER, because this path used
-            # to skip the attempt budget entirely.
+            # to skip the attempt budget entirely. A review the usage limit
+            # refused is the exception: never a cycle (_give_back_refused_review).
+            # Its recorded refusal gets the quota-wait policy FIRST — before the
+            # verifier is launched again, and before an attempt is charged — so
+            # a window is waited out (or, past the budget, not reviewed at all)
+            # instead of re-running validation, the mutation gate and a refused
+            # verifier on every relaunch. A spent budget is told without a wait.
+            waits = _ReviewWaits()
             with self._state_lock:
-                task.attempts += 1
                 cap = self.config.max_task_attempts
-                if cap and task.attempts > cap:
-                    logger.warning("task %s: attempt budget exhausted across review "
-                                   "retries (%d attempt(s), cap %d) — parking at "
-                                   "terminal 'blocked'", task.id, task.attempts, cap)
-                    task.touch("blocked",
-                               note=f"attempt budget exhausted ({cap} cycles, review/PR "
-                                    "kept failing) — fix the PR step, then "
-                                    "`pipeline requeue --reset-attempts`")
-                    self._tracer.for_task(task.id).span(
-                        "task_status", status="blocked",
-                        reason=f"attempt budget exhausted ({cap} cycles) in review resume")
-                    return TaskRun(task.id, "blocked", risk=task.risk,
-                                   detail=f"attempt budget exhausted after {cap} cycles "
-                                          "(review/PR kept failing)")
+                budget_spent = bool(cap and task.attempts >= cap)
+            if not budget_spent:
+                stop = self._await_review_window(plan, task, waits)
+                if stop is not None:
+                    return stop
+            blocked = self._charge_review_resume(task)
+            if blocked is not None:
+                return blocked
             self.log(f"  ↻ {task.id} is green-but-unrecorded — re-running review/PR only")
-            result = self._review_and_record(plan, task, self._context(task), open_pr)
-            return self._task_run(task, result)
+            return self._review_until_judged(plan, task, self._context(task), open_pr,
+                                             waits)
         # Stamp a heartbeat up front so a crash before the backend's first beat is
         # still detectable as a stale `implementing` task by the supervisor.
         RunLog(self.config.state_dir, task.id).beat("implementing")
@@ -1037,9 +1353,11 @@ class PipelineOrchestrator:
                 task.touch("failed", note=outcome.detail)
                 return TaskRun(task.id, "failed", risk=task.risk, detail=outcome.detail)
 
-        # 3. Review + PR.
-        result = self._review_and_record(plan, task, ctx, open_pr)
-        return self._task_run(task, result)
+        # 3. Review + PR. A review the usage limit refuses goes through the
+        # review-only resume's quota-wait policy in this same run: a window the
+        # budget covers is waited out and the review run again, rather than
+        # leaving the task (and its dependants) for a later run.
+        return self._review_until_judged(plan, task, ctx, open_pr, _ReviewWaits())
 
     def _seed_dependencies(self, task: Task, wt, plan: Plan) -> str:
         """Merge each completed dependency's branch into this task's worktree.
@@ -1057,7 +1375,11 @@ class PipelineOrchestrator:
         Returns the worktree HEAD after seeding — the point the task's own work is
         measured from (``ImplementContext.diff_base``). Best-effort: a dependency
         that will not merge cleanly is aborted and skipped with a warning rather
-        than failing the whole task.
+        than failing the whole task. The one exception is a merge whose abort
+        FAILED and left the tree mid-merge (:func:`gitutil.abort_failed_merge`):
+        seeding stops there and :class:`gitutil.GitError` is raised, so no agent
+        is ever launched into a MERGE_HEAD tree (the task fails with that
+        reason before an attempt is charged).
 
         Idempotent on ANCESTRY, not on the existence of a recorded base. Keying the
         skip on ``task.start_ref`` being set (as this used to) meant a design doc
@@ -1180,9 +1502,31 @@ class PipelineOrchestrator:
         seed = gitutil.seed_commit(repo, prior, [r for _, _, r in wanted],
                                    message=f"seed dependencies for {task.id}")
         if seed:
+            before = gitutil.head_sha(wt.path)
+            # pin_ignore_stat (gitutil.TREE_WRITE_PINS): an agent's `git config
+            # core.ignoreStat true` (the SHARED config) would otherwise mark
+            # every entry this merge writes assume-unchanged — read later as
+            # hidden edits, refusing the tree's prune and reuse — and a lying
+            # core.fsmonitor hook would let it overwrite an uncommitted edit to
+            # a file the dependency changes (see gitutil.merge).
             res = gitutil.merge(wt.path, seed,
-                                message=f"seed dependencies for {task.id}")
+                                message=f"seed dependencies for {task.id}",
+                                pin_ignore_stat=True)
             if res.ok:
+                # The merge moved any bumped submodule pointer in the index but
+                # not its checkout — see `_merge_deps_in_place`.
+                resync = (gitutil.resync_submodules(wt.path, before) if before
+                          else gitutil.SubmoduleResync())
+                if resync.stale:
+                    # display_path: a submodule path is a file name, and one
+                    # that is not UTF-8 cannot reach a strict stdout raw.
+                    shown = ", ".join(gitutil.display_path(p) for p in resync.stale)
+                    self.log(f"  ⚠️  {task.id}: submodule checkout(s) "
+                             f"{shown} could not follow the seed "
+                             f"merge — their pointers stay at the merged commit")
+                    self._tracer.for_task(task.id).span(
+                        "git", op="submodule-resync", ok=False,
+                        paths=shown[:200])
                 logger.info("task %s: seeded %d dependency branch(es) via seed commit "
                             "%s — start_ref %s -> %s (the task's own %d commit(s) stay "
                             "in the review diff)", task.id, len(missing), seed[:12],
@@ -1193,7 +1537,25 @@ class PipelineOrchestrator:
             # Guarded like the merge: a merge refused because the worktree is
             # not provably its own repository must not be followed by an abort
             # that resolves the enclosing one and aborts ITS merge in progress.
-            gitutil.merge_abort(wt.path)
+            # Read back, never assumed: an abort that FAILED leaves MERGE_HEAD,
+            # and the in-place merges below would each fail on it (logged as
+            # conflicts), and the agent would be launched mid-merge.
+            abort = gitutil.abort_failed_merge(wt.path, res, pin_ignore_stat=True)
+            if abort.stuck:
+                why = (f"dependency seeding stopped for task {task.id}: the seed "
+                       f"commit {seed[:12]} did not merge into {wt.path}, and "
+                       f"{abort.detail} — the worktree is left MID-MERGE and the "
+                       f"agent was NOT launched into it. Finish or abort that "
+                       f"merge by hand (`git -C {wt.path} -c submodule.recurse="
+                       f"false merge --abort`), then requeue the task.")
+                logger.error("task %s: %s", task.id, why)
+                self.log(f"  ⛔ {task.id}: the seed merge could not be aborted — "
+                         f"seeding stopped and the agent was not launched; the "
+                         f"worktree is left mid-merge")
+                self._tracer.for_task(task.id).span(
+                    "git", op="seed-merge", ok=False, stuck=True,
+                    detail=abort.detail[:200])
+                raise gitutil.GitError(why)
 
         # Fail SAFE and loudly: merge what we can in place and KEEP the old base.
         # The review diff is then a SUPERSET (it also contains the seeded
@@ -1227,30 +1589,81 @@ class PipelineOrchestrator:
         """Merge each ``(dep_id, branch, ref)`` into *wt*; return the ids that landed.
 
         Best-effort per dependency, as before: a conflict is aborted and skipped
-        with a warning rather than failing the whole task.
+        with a warning rather than failing the whole task — and a merge git
+        refused before it began is reported as such, never as "aborted". An
+        abort that fails and leaves MERGE_HEAD stops the seeding: raises
+        :class:`gitutil.GitError` (see :meth:`_seed_dependencies`).
+
+        Then the populated submodule checkouts these merges left behind are
+        moved to the commits they recorded (:func:`gitutil.resync_submodules`):
+        ``git merge`` moves a gitlink in the index and never the checkout, so a
+        dependency's submodule bump would otherwise be REVERTED by this task's
+        own catch-all commit. Offline, never ``--init``/``--force``; a checkout
+        that cannot follow has its pointer held at the merged commit instead.
         """
         merged: list[str] = []
+        before = gitutil.head_sha(wt.path)     # where these merges start
         for dep_id, branch, ref in deps:
             # Merge the fully-qualified REF, report the short branch: a tag named
             # like the branch outranks it in bare-name resolution, so a bare name
             # merges the TAG's tree and reports success under the branch's name.
             # Sign-safe merge: without _NO_SIGN a commit.gpgsign=true repo fails to
             # sign the seed merge commit and we'd silently skip dependency seeding.
-            res = gitutil.merge(wt.path, ref, message=f"seed dependency {branch}")
+            # pin_ignore_stat — see _seed_dependencies' seed-commit merge.
+            res = gitutil.merge(wt.path, ref, message=f"seed dependency {branch}",
+                                pin_ignore_stat=True)
             if not res.ok:
-                gitutil.merge_abort(wt.path)      # guarded — see _seed_dependencies
-                logger.warning("task %s: dependency %r (branch %r) did not merge "
-                               "cleanly — merge aborted; implementing WITHOUT its "
-                               "code seeded, so the branches may diverge",
-                               task.id, dep_id, branch)
-                self.log(f"  ⚠️  {task.id}: dependency '{dep_id}' did not merge cleanly "
-                         f"— implementing without its code seeded")
+                # guarded and read back — see _seed_dependencies. A merge git
+                # refused before it began leaves nothing to abort (the abort
+                # then fails, truthfully reported); one it could not abort
+                # leaves MERGE_HEAD, on which every later merge here would
+                # fail and be logged as a conflict — and the agent would be
+                # handed a mid-merge tree. That stops the seeding outright.
+                abort = gitutil.abort_failed_merge(wt.path, res, pin_ignore_stat=True)
+                if abort.stuck:
+                    why = (f"dependency seeding stopped for task {task.id}: "
+                           f"dependency {dep_id!r} (branch {branch!r}) did not "
+                           f"merge into {wt.path}, and {abort.detail} — the "
+                           f"worktree is left MID-MERGE, so no later dependency "
+                           f"could merge either, and the agent was NOT launched "
+                           f"into it. Finish or abort that merge by hand (`git -C "
+                           f"{wt.path} -c submodule.recurse=false merge --abort`), "
+                           f"then requeue the task.")
+                    logger.error("task %s: %s", task.id, why)
+                    self.log(f"  ⛔ {task.id}: dependency '{dep_id}' did not merge "
+                             f"and the merge could not be aborted — seeding "
+                             f"stopped and the agent was not launched")
+                    self._tracer.for_task(task.id).span(
+                        "git", op="seed-merge", ok=False, dep=dep_id, stuck=True,
+                        detail=abort.detail[:200])
+                    raise gitutil.GitError(why)
+                said = abort.reported()
+                logger.warning("task %s: dependency %r (branch %r) %s; "
+                               "implementing WITHOUT its code seeded, so the "
+                               "branches may diverge",
+                               task.id, dep_id, branch, said)
+                # The console says what the log says: "did not merge cleanly
+                # — merge aborted" only for a merge that ran and was aborted.
+                self.log(f"  ⚠️  {task.id}: dependency '{dep_id}' "
+                         f"{trunc(redact(said), 240)} — implementing without its "
+                         f"code seeded")
                 self._tracer.for_task(task.id).span(
-                    "git", op="seed-merge", ok=False, dep=dep_id)
+                    "git", op="seed-merge", ok=False, dep=dep_id,
+                    outcome=abort.outcome)
             else:
                 logger.debug("task %s: seeded dependency %s by merging branch %r",
                              task.id, dep_id, branch)
                 merged.append(dep_id)
+        if merged and before:
+            resync = gitutil.resync_submodules(wt.path, before)
+            if resync.stale:
+                shown = ", ".join(gitutil.display_path(p) for p in resync.stale)
+                self.log(f"  ⚠️  {task.id}: submodule checkout(s) "
+                         f"{shown} could not follow the seed "
+                         f"merge — their pointers stay at the merged commit")
+                self._tracer.for_task(task.id).span(
+                    "git", op="submodule-resync", ok=False,
+                    paths=shown[:200])
         return merged
 
     def _review_and_record(self, plan: Plan, task: Task, ctx: ImplementContext,
@@ -1269,6 +1682,38 @@ class PipelineOrchestrator:
         gate = ReviewGate(pr_mode=self.config.pr_mode, git_lock=self._git_lock,
                           ask=ask, ask_structured=ask_structured)
         result = gate.review(ctx, open_pr=open_pr)
+        if result.interrupted:
+            # No verdict: a shutdown cut a validation or mutant run short
+            # (the rule: a validation run the signal cut short has no
+            # verdict), or the backend's usage limit refused the verifier
+            # (``result.usage_limit``). Nothing below may run on it —
+            # no `failed`, no review-fail note for the next attempt's prompt, no
+            # feedback round, no grounding/risk update. The task stays at
+            # `review` (the resumable state for work the gate has yet to
+            # judge), and complete() restores the status it was called on. A
+            # usage-limit stop alone is recorded, on the task's notes — its
+            # regime, when the window reopens, the verifier it refused (backend
+            # and model), the limit's own words — for the quota-wait policy to
+            # read before the review runs again (_await_review_window).
+            limit = (self._record_refused_review(task, result) if result.usage_limit
+                     else None)
+            logger.warning("task %s: review interrupted — no verdict; nothing "
+                           "recorded against the task%s", task.id,
+                           "" if limit is None else
+                           f" but the usage limit ({limit.kind}) on its notes")
+            self._tracer.for_task(task.id).span(
+                "review", passed=None, interrupted=True, risk=result.risk,
+                files=0, head=result.reviewed_sha[:12],
+                reasons="; ".join(result.reasons),
+                **({} if limit is None else {
+                    "usage_limit_kind": limit.kind,
+                    "reopens": ("" if limit.reset_at is None
+                                else _utc_stamp(math.ceil(limit.reset_at)))}))
+            # Parked, not crashed: the last beat says this run left it cleanly,
+            # or recovery would read the dead pid as a crash, roll the tree back
+            # and journal a crash that never happened.
+            RunLog(self.config.state_dir, task.id).beat(PARKED)
+            return result
         # (The "review" span below mirrors the full reasons list into the debug log.)
         logger.info("task %s: review %s — risk=%s, grounding_ok=%s, %d changed file(s)",
                     task.id, "passed" if result.passed else "failed",
@@ -1304,6 +1749,9 @@ class PipelineOrchestrator:
                 else:
                     task.touch("review", note=f"green but PR not opened: "
                                f"{result.pr.detail if result.pr else 'n/a'}")
+                    # Parked cleanly too (see the interrupted branch above): the
+                    # next run resumes it review-only, it does not recover it.
+                    RunLog(self.config.state_dir, task.id).beat(PARKED)
             else:
                 task.touch("failed", note=result.summary)
                 # Blind-retry fix: the summary above is all a retry used to
@@ -1434,7 +1882,18 @@ class PipelineOrchestrator:
                      "stored description", task.id, path)
         return task.description
 
-    def _select_tasks(self, plan: Plan, task_ids: list[str] | None) -> list[Task]:
+    def _select_tasks(self, plan: Plan, task_ids: list[str] | None, *,
+                      held: Mapping[str, str] | None = None) -> list[Task]:
+        """The tasks this wave runs.
+
+        *held* maps the ids to keep out of this run to the reason recovery
+        deferred them this pass — the deferrals that are positive evidence of a
+        live writer or owner (:data:`_HOLD_OUT_DEFERRALS` over
+        :attr:`Supervisor.deferred`). Those are never selected, by either path:
+        a resumed task would be a second writer racing the first. Every other
+        relaunch still passes the process gate in :meth:`_run_one_inner`.
+        """
+        held = held or {}
         if task_ids:
             picked = [plan.get(tid) for tid in task_ids]
             missing = [tid for tid, t in zip(task_ids, picked, strict=True) if t is None]
@@ -1442,7 +1901,12 @@ class PipelineOrchestrator:
                 logger.warning("unknown task id(s) requested: %s — not in the plan, "
                                "they will not run", ", ".join(missing))
                 self.log(f"⚠️  unknown task id(s): {', '.join(missing)}")
-            runnable = [t for t in picked if t is not None and t.status != "done"]
+            for t in picked:
+                if t is not None and t.id in held:
+                    logger.debug("explicit task %s held out: recovery deferred it "
+                                 "this pass (%s)", t.id, held[t.id])
+            runnable = [t for t in picked
+                        if t is not None and t.status != "done" and t.id not in held]
             # Explicit selection previously bypassed dependency ordering
             # entirely — launching a task in parallel with (or before) its
             # unfinished dependency, unseeded. Hold dep-waiting tasks back;
@@ -1515,6 +1979,10 @@ class PipelineOrchestrator:
             if t.id in seen:
                 continue
             seen.add(t.id)
+            if t.id in held:
+                logger.debug("task %s held out: recovery deferred it this pass (%s)",
+                             t.id, held[t.id])
+                continue
             # Another live process may already be working this task (the tmux
             # cockpit runs one `pipeline run --task` per pane; overlapping cron
             # runs happen). Launching a second agent in the SAME worktree and
@@ -1531,8 +1999,433 @@ class PipelineOrchestrator:
             out.append(t)
         return out
 
+    def _launch_refused(self, task: Task, exc: WorktreeInUse) -> TaskRun:
+        """Leave *task* exactly as it was: its tree may still be written to.
+
+        Non-terminal, like a held claim: no attempt is charged and the status
+        is not touched. Marking it `failed` (what the generic error path in
+        :meth:`_run_one` does) would drop an `implementing` task out of
+        recovery's scan, so no later pass would ever roll it back. The next run
+        checks again.
+        """
+        reason = _LAUNCH_SKIP_REASON.get(exc.reason, exc.reason)
+        logger.warning("task %s: not launching into %s — %s; status %r and %d "
+                       "attempt(s) left as they were, a later run checks again",
+                       task.id, exc.path, exc, task.status, task.attempts)
+        self.log(f"⏸  {task.id}: not launched — {exc}")
+        self._tracer.for_task(task.id).span(
+            "launch_skipped", reason=reason, detail=str(exc)[:300],
+            pids=", ".join(str(p) for p in exc.pids[:20]), status=task.status)
+        return TaskRun(task.id, "worktree-busy", risk=task.risk, detail=str(exc))
+
+    def _mutant_record_refused(self, task: Task, exc: MutantRestoreError) -> TaskRun:
+        """Leave *task* exactly as it was: its tree may still hold a mutant.
+
+        The mutation gate's record cannot be settled (see
+        :func:`~harness.pipeline.mutation.restore_pending`): the file it names
+        holds neither the mutant it recorded nor the original (a human edited
+        it since), still holds that exact mutant where the record cannot apply
+        it (HEAD moved under it, or a tree the record cannot prove its own), or
+        the record, the file or the tree's HEAD cannot be read — a file that
+        cannot even be looked up (a directory on its path this user may not
+        search) included — so nothing may commit that tree until someone
+        looks. The message is one printable line.
+        Non-terminal like :meth:`_launch_refused`: status and attempts are not
+        touched, and a ``launch_skipped`` span (reason ``mutant-record``)
+        records it. Reported as ``error`` — exit status 1 — because no later
+        run clears it by itself; the message names the record and the remedy.
+        """
+        logger.warning("task %s: not launching — %s; status %r and %d attempt(s) "
+                       "left as they were", task.id, exc, task.status, task.attempts)
+        self.log(f"⛔ {task.id}: not launched — {exc}")
+        self._tracer.for_task(task.id).span(
+            "launch_skipped", reason="mutant-record", detail=str(exc)[:300],
+            pids="", status=task.status)
+        return TaskRun(task.id, "error", risk=task.risk, detail=str(exc))
+
+    def _review_until_judged(self, plan: Plan, task: Task, ctx: ImplementContext,
+                             open_pr: bool, waits: _ReviewWaits) -> TaskRun:
+        """Review and record *task*, through any usage-limit window that refuses it.
+
+        A review the usage limit refused gives its attempt back
+        (:meth:`_give_back_refused_review`) and goes through the quota-wait
+        policy (:meth:`_await_review_window`) with this run's *waits*: when that
+        says the window has reopened, the review runs again — charged as a
+        review-only resume is (:meth:`_charge_review_resume`) — and otherwise
+        the task ends this run as the policy says. Each refusal either spends
+        one of max_quota_waits or ends the run, so this always ends.
+        """
+        while True:
+            result = self._review_and_record(plan, task, ctx, open_pr)
+            if not (result.interrupted and result.usage_limit):
+                return self._task_run(task, result)
+            self._give_back_refused_review(task, result)
+            stop = self._await_review_window(plan, task, waits, refused=result)
+            if stop is not None:
+                return stop
+            blocked = self._charge_review_resume(task)
+            if blocked is not None:
+                return blocked
+            self.log(f"  ↻ {task.id}: the usage-limit window has reopened — "
+                     f"re-running its review")
+            ctx = self._context(task)
+
+    def _charge_review_resume(self, task: Task) -> TaskRun | None:
+        """Charge a review-only resume to max_task_attempts; the ``blocked`` run past it.
+
+        The review-only resume is cheap but not free, and a PR step that fails
+        the same way every night would otherwise retry it forever. A review the
+        usage limit refuses gives the charge back afterwards
+        (:meth:`_give_back_refused_review`), so what exhausts the budget here
+        is a resume that ended without a recorded verdict for another reason.
+        """
+        with self._state_lock:
+            task.attempts += 1
+            cap = self.config.max_task_attempts
+            if not (cap and task.attempts > cap):
+                return None
+            logger.warning("task %s: attempt budget exhausted across review "
+                           "retries (%d attempt(s), cap %d) — parking at "
+                           "terminal 'blocked'", task.id, task.attempts, cap)
+            # A failing PR step is not the only thing that ends a resume
+            # unrecorded — a run stopped mid-review does too — so the note must
+            # not guess which. (A usage limit refusing the verifier never gets
+            # here: that review is not a cycle.)
+            task.touch("blocked",
+                       note=f"attempt budget exhausted ({cap} cycles; its "
+                            "review-only resumes kept ending without a recorded "
+                            "verdict — a failing PR step or a run stopped "
+                            "mid-review; the task's last `review` and `pr` spans "
+                            "say which) — resolve that, then `pipeline requeue "
+                            "--reset-attempts`")
+            self._tracer.for_task(task.id).span(
+                "task_status", status="blocked",
+                reason=f"attempt budget exhausted ({cap} cycles) in review resume")
+            return TaskRun(task.id, "blocked", risk=task.risk,
+                           detail=f"attempt budget exhausted after {cap} cycles "
+                                  "(review-only resumes kept ending without a "
+                                  "recorded verdict)")
+
+    def _give_back_refused_review(self, task: Task, result: ReviewResult) -> None:
+        """Give back the attempt a review the usage limit refused ran under.
+
+        Such a review judged nothing, so it is never a cycle of
+        max_task_attempts — whatever the limit: a window that reopens on its
+        own, one past the quota-wait budget, a cap only an operator lifts, or a
+        refusal the backend could not classify. What bounds it instead is the
+        quota-wait policy (:meth:`_await_review_window`): a window is waited out
+        within quota_wait_cap_seconds × max_quota_waits per run, or not
+        reviewed again before it is within that budget, and a limit only an
+        operator lifts parks the task. The implement cycle a refused review
+        followed is charged again by the review that does judge it, so a task
+        pays one cycle for it however many runs the window refuses.
+        ``pipeline complete`` charges no attempt and never calls this.
+        """
+        if not (result.interrupted and result.usage_limit):
+            return
+        with self._state_lock:
+            task.attempts = max(0, task.attempts - 1)
+            attempts = task.attempts
+        logger.info("task %s: the usage limit refused its review — not a cycle of "
+                    "max_task_attempts (attempts back to %d; the review that judges "
+                    "it is charged instead)", task.id, attempts)
+
+    def _record_refused_review(self, task: Task, result: ReviewResult) -> _Refusal:
+        """Record on *task*'s notes the usage limit that refused its review.
+
+        The regime the backend gave the refusal, the reset it states
+        (``ReviewResult.usage_limit_reset_at``, a ``quota-window`` only, clamped
+        to :data:`_REFUSAL_HORIZON`), when it was seen and the limit's own
+        words, in the note's machine-readable head (:func:`_refusal_note`). The
+        status is not touched: ``pipeline complete`` restores its own.
+        """
+        seen = time.time()
+        kind = _limit_kind(result.usage_limit_kind)
+        reset_at = result.usage_limit_reset_at if kind == "quota-window" else None
+        if reset_at is not None:
+            reset_at = min(float(reset_at), seen + _REFUSAL_HORIZON)
+        ref = _Refusal(kind, reset_at, seen,
+                       trunc(redact(" ".join(result.usage_limit.split())), 300),
+                       _note_backend(self.config.backend), _verifier_model(self.config))
+        then = {"quota-window": "the window reopens on its own, and the review runs "
+                                "again once it has",
+                "permanent": "only an operator can lift this limit",
+                "unknown": "the backend did not say whether this limit reopens on "
+                           "its own"}[kind]
+        with self._state_lock:
+            task.touch(note=_refusal_note(ref, then))
+        return ref
+
+    def _await_review_window(self, plan: Plan, task: Task, waits: _ReviewWaits, *,
+                             refused: ReviewResult | None = None) -> TaskRun | None:
+        """The quota-wait policy for a review the usage limit refused, before it runs again.
+
+        Applied at the launcher level — the verifier never waits mid-call — to
+        *refused*, a review this run has just seen refused, or else to the
+        refusal *task*'s notes record from an earlier run
+        (:func:`_recorded_refusal`; with none, the review simply runs). A
+        record is applied only while it belongs to the review this run would
+        launch — one that consults the very verifier the limit refused (the
+        same backend, pinned to the same model) — and only while a reset is
+        still ahead of it: a window's stated reset, or the bounded default wait
+        from when a window that states none was seen.
+        A record that states no reset at all (a limit only an operator lifts,
+        or one the backend could not classify) is never applied: whether an
+        operator has lifted it since is unknown, so the review runs, and a
+        limit that still stands refuses it afresh (:meth:`_refusal_record_moot`).
+        The implement loop's policy, spending this run's *waits*:
+
+        * A window whose stated reset lies within the remaining budget
+          (``quota_wait_cap_seconds`` × the waits left of ``max_quota_waits``)
+          gets ONE wait — reset + grace, at most the cap — with a
+          ``quota-wait`` run note, a ``quota_wait`` span (``stage="review"``)
+          and the ``review`` heartbeat refreshed between its slices, after
+          which the review runs again: exactly as ``_run_with_retries`` waits
+          and relaunches its agent, so a reset past one cap is reached in
+          capped waits, each followed by a review that reads the refusal
+          afresh. A window that states no reset gets the bounded default wait,
+          counted from when it was seen. A just-refused review always waits at
+          least the grace; a reset the CLI printed as just passed gets that
+          grace wait, and the same clause back is read with the narrower
+          repeat slack (:func:`~harness.pipeline.looptools.cli_reset_slack`).
+          A recorded window that has already reopened is not waited for.
+        * Waiting disabled (``quota_wait_cap_seconds=0``) while the window is
+          shut, the waits spent, a reset past the remaining budget, or a wait a
+          shutdown cut short: no verdict this run (:meth:`_refusal_stop`) —
+          the review is not launched, and a later run applies the policy again.
+        * A limit only an operator lifts, or one the backend could not classify
+          (unknown is never a proof that it reopens), refusing a review this
+          run launched: the task is parked (:meth:`_park_refused_review`).
+
+        Returns ``None`` when the review may run now, else the :class:`TaskRun`
+        this run ends the task with. Nothing here charges max_task_attempts.
+        """
+        cfg = self.config
+        cap, most = float(cfg.quota_wait_cap_seconds), int(cfg.max_quota_waits)
+        clause, just_reopened = "", False
+        if refused is not None:
+            seen = time.time()
+            kind = _limit_kind(refused.usage_limit_kind)
+            reset_at = None
+            if kind == "quota-window":
+                # Read again here, with this run's repeat slack: the same
+                # time-only clause the last wait read as "just reopened", back
+                # after it, may still be seconds from reopening.
+                clause = cli_reset_clause(refused.usage_limit)
+                secs = quota_reset_seconds(
+                    refused.usage_limit, now=seen,
+                    cli_slack=cli_reset_slack(clause, waits.reopened_clause))
+                if secs is not None:
+                    reset_at = seen + min(secs, _REFUSAL_HORIZON)
+                    just_reopened = secs == 0.0
+            ref = _Refusal(kind, reset_at, seen,
+                           trunc(redact(" ".join(refused.usage_limit.split())), 300),
+                           _note_backend(cfg.backend), _verifier_model(cfg))
+        else:
+            with self._state_lock:
+                recorded = _recorded_refusal(task.notes)
+            if recorded is None:
+                return None
+            moot = self._refusal_record_moot(task, recorded)
+            if moot:
+                logger.info("task %s: the usage-limit refusal its notes record (%s, "
+                            "seen %s) does not hold this review back — %s; reviewing "
+                            "now", task.id, recorded.kind, _utc_stamp(recorded.seen_at),
+                            moot)
+                return None
+            ref = recorded
+        if ref.kind != "quota-window":
+            return self._park_refused_review(task, ref)
+        launched = refused is not None
+        now = time.time()
+        if ref.reset_at is None:
+            need = ref.seen_at + min(cap, _QUOTA_DEFAULT_WAIT) - now
+        else:
+            need = ref.reset_at + _QUOTA_GRACE - now
+        if not launched:
+            if need <= 0 or (ref.reset_at is not None and ref.reset_at <= now):
+                return None                       # it has reopened since: review now
+        else:
+            # A review this run has just seen refused never runs again without
+            # a wait — at least the grace, as the implement loop waits reset +
+            # grace — so each refusal spends one of max_quota_waits or ends
+            # the run, and a refusal can never loop the review.
+            need = max(need, _QUOTA_GRACE)
+        if cap <= 0:
+            return self._refusal_stop(
+                task, ref, "waiting is disabled (quota_wait_cap_seconds=0), so no run "
+                "waits for the window; the review runs again once it has reopened",
+                launched=launched)
+        left = most - waits.spent
+        if left <= 0:
+            return self._refusal_stop(
+                task, ref, f"no quota wait is left in this run ({waits.spent} of "
+                f"max_quota_waits={most} spent) and the window has not reopened — "
+                f"the next `pipeline run` applies the policy again", launched=launched)
+        if ref.reset_at is not None and ref.reset_at - now > cap * left:
+            return self._refusal_stop(
+                task, ref, f"the window reopens in {_hours(ref.reset_at - now)}, beyond "
+                f"the remaining quota-wait budget of {cap * left / 3600:.1f}h ({left} "
+                f"wait(s) of at most quota_wait_cap_seconds={cap:.0f}s), so no review "
+                f"runs until it is within that budget — each `pipeline run` checks "
+                f"again", launched=launched)
+        wait = min(cap, need)
+        waits.spent += 1
+        waits.reopened_clause = clause if just_reopened else ""
+        with self._state_lock:
+            task.touch(note=_refusal_note(
+                ref, f"waiting {_hours(wait)} for the window to reopen before the "
+                     f"review runs again (wait {waits.spent}/{most})"))
+        # On disk before the wait, so a run killed during it leaves the record —
+        # best-effort: the run saves again after its wave, and a plan file that
+        # cannot be written now must not turn a green task into an error.
+        try:
+            self._save(plan)
+        except OSError as exc:
+            logger.warning("task %s: could not persist the plan before the quota "
+                           "wait (%s) — waiting anyway", task.id, exc)
+        logger.warning("task %s: the usage limit refused its review — sleeping %.0fs "
+                       "until the window reopens (wait %d/%d); this charges no cycle "
+                       "of max_task_attempts: %s", task.id, wait, waits.spent, most,
+                       trunc(redact(ref.text), 300))
+        # As _run_with_retries does: a fresh beat, a run note and a quota_wait
+        # span per wait, and the beat refreshed between its slices — an
+        # hours-long wait must not read as a crashed review.
+        runlog = RunLog(cfg.state_dir, task.id)
+        runlog.beat("review", iteration=task.iterations)
+        runlog.append("quota-wait", f"waiting {wait:.0f}s for the quota window to "
+                      f"reopen before the review runs again", detail=ref.text,
+                      iteration=task.iterations)
+        self._tracer.for_task(task.id).span(
+            "quota_wait", backend=cfg.backend, stage="review",
+            iteration=task.iterations, wait_s=round(wait, 1),
+            wait_number=waits.spent, max_waits=most, detail=ref.text[:300])
+        self.log(f"    ⏸ {task.id}: the usage limit refused its review — waiting "
+                 f"{_hours(wait)} for the window to reopen")
+        if wait_out_quota_window(
+                wait, beat=lambda: runlog.beat("review", iteration=task.iterations)):
+            return self._refusal_stop(
+                task, ref, f"the wait was cut short by "
+                f"{shutdown.signame() or 'a shutdown request'} — the next `pipeline "
+                f"run` applies the policy again", launched=launched)
+        return None
+
+    def _refusal_record_moot(self, task: Task, ref: _Refusal) -> str:
+        """Why the refusal *task*'s notes record cannot hold this run's review back, or ``""``.
+
+        A record claims that the verifier this review would consult is refused,
+        and it holds the review back only while that can still be so. It cannot
+        when the review consults no verifier at all — verification off for the
+        run or for the task — or another verifier than the one the limit
+        refused: another backend's, or the same backend's pinned to another
+        model (a per-model window no longer touches it once the pin moves; a
+        limit on every model refuses the review afresh, and is recorded again),
+        or when the record was "seen" after now (a clock set back since: no
+        proof of anything), or when it states no reset at all: a
+        limit only an operator lifts (or one the backend could not classify)
+        may have been lifted since, and parking the task on the record alone
+        would leave a lifted limit waiting for ``pipeline complete``. A window
+        that has reopened since is the policy's own check
+        (:meth:`_await_review_window`). An unavailable backend is not a reason:
+        the run stops before any task when its backend is unavailable, and a
+        review the record holds back publishes nothing unverified. Unknown is
+        never a proof that a window is shut: a record that cannot hold is not
+        applied and the review simply runs — a verifier still refused ends it
+        with no verdict again, and that fresh refusal is the one the policy
+        reads (a limit that still stands parks the task then).
+        """
+        cfg = self.config
+        if not cfg.verify:
+            return "the verifier is off for this run (verify=False)"
+        if task.verify is False:
+            return "the verifier is off for this task (verify: off)"
+        backend, model = _note_backend(cfg.backend), _verifier_model(cfg)
+        if ref.backend != backend:
+            return (f"it refused the {ref.backend} backend's verifier, and this run's "
+                    f"verifier is {backend}'s")
+        if ref.model != model:
+            return (f"it refused the verifier on model {ref.model}, and this run's "
+                    f"verifier runs on {model}")
+        if ref.seen_at > time.time() + _REFUSAL_CLOCK_SKEW:
+            return (f"it was seen at {_utc_stamp(ref.seen_at)}, after now — the clock "
+                    f"has been set back since")
+        if ref.kind != "quota-window":
+            return ("it states no reset, and whether an operator has lifted the limit "
+                    "since is unknown — a limit that still stands refuses the review "
+                    "afresh")
+        return ""
+
+    def _refusal_stop(self, task: Task, ref: _Refusal, then: str, *,
+                      launched: bool) -> TaskRun:
+        """No verdict this run for a review the usage limit refused: parked at ``review``.
+
+        *then* says why the review is not (re)run and what happens next; it goes
+        on the task's notes beside the refusal's head. ``interrupted`` (exit 1),
+        like any no-verdict review, with the parked heartbeat a cleanly ended
+        review leaves. *launched* is False when this run never launched the
+        review at all (a recorded refusal it did not run again): a
+        ``launch_skipped`` span (reason ``usage-limit``) then says why.
+        """
+        with self._state_lock:
+            task.touch(note=_refusal_note(ref, then))
+        RunLog(self.config.state_dir, task.id).beat(PARKED)
+        logger.warning("task %s: no verdict this run — %s: %s", task.id, then,
+                       trunc(redact(ref.text), 300))
+        if not launched:
+            self._tracer.for_task(task.id).span(
+                "launch_skipped", reason="usage-limit", detail=then[:300], pids="",
+                status=task.status)
+        self.log(f"  ⏸ {task.id}: no verdict — {then}")
+        return TaskRun(task.id, "interrupted", risk=task.risk,
+                       detail=f"[{task.id}] NO VERDICT  usage limit — {then}. The "
+                              f"limit: {ref.text}")
+
+    def _park_refused_review(self, task: Task, ref: _Refusal) -> TaskRun:
+        """Park *task* at ``awaiting-human``: only an operator lifts what refused its review.
+
+        Permanent, as the implement loop's operator-action refusals are: nothing
+        reopens on its own, so no run re-selects the task only to be refused
+        again (``awaiting-human`` is an escalation, as an abstention is), and it
+        costs no cycle of max_task_attempts. Its green work stays committed in
+        its worktree, and ``pipeline complete <id>`` reviews it as it is once
+        the limit is lifted (``pipeline requeue <id>`` would implement it
+        again). The run's outcome is ``blocked`` — exit 1 — and the note names
+        the limit in its own words. A refusal the backend could not classify is
+        parked too: unknown is never a proof that a window reopens.
+        """
+        why = ("only an operator can lift this limit" if ref.kind == "permanent" else
+               "the backend did not say whether this limit reopens on its own, so "
+               "it is treated as one only an operator lifts")
+        where = gitutil.display_path(task.worktree) if task.worktree else "its worktree"
+        if task.branch:
+            where += f" (branch {gitutil.display_path(task.branch)})"
+        then = (f"{why} — parked at `awaiting-human` with its green work kept in "
+                f"{where}; once the limit is lifted, `pipeline complete {task.id}` "
+                f"reviews that work as it is")
+        with self._state_lock:
+            task.touch("awaiting-human", note=_refusal_note(ref, then))
+        RunLog(self.config.state_dir, task.id).beat("awaiting-human")
+        logger.error("task %s: the usage limit refused its review — %s: %s", task.id,
+                     then, trunc(redact(ref.text), 300))
+        self._tracer.for_task(task.id).span(
+            "task_status", status="awaiting-human",
+            reason=f"usage limit ({ref.kind}): {ref.text}"[:300])
+        self.log(f"  ⛔ {task.id}: the usage limit refused its review and only an "
+                 f"operator can lift it — parked at awaiting-human; `pipeline "
+                 f"complete {task.id}` once it is lifted")
+        return TaskRun(task.id, "blocked", risk=task.risk,
+                       detail=f"[{task.id}] NO VERDICT  usage limit — {then}. The "
+                              f"limit: {ref.text}")
+
     @staticmethod
     def _task_run(task: Task, result: ReviewResult) -> TaskRun:
+        if result.interrupted:
+            # No verdict — a shutdown cut the review short, or (reached from
+            # `pipeline complete`) the usage limit refused its verifier —
+            # `interrupted`, like a task the signal kept from starting, never the
+            # status the review would have set.
+            return TaskRun(task.id, "interrupted", risk=task.risk,
+                           detail=result.summary)
         pr_url = ""
         detail = result.summary
         if result.pr is not None:

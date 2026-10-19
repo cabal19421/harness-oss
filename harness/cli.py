@@ -111,12 +111,18 @@ def _cmd_status(args: argparse.Namespace) -> None:
         note = PY_EXTRAS.get(name) or TOOLS.get(name, "")
         line = f"  {icon} {_C.CYAN}{name}{_C.RESET} — {_info(note)}"
         info = versions.get(name)
-        if found and info is not None and info.detected:
+        # An installed CLI whose version cannot be established is shown too, with
+        # the reason: refused under a hard floor, a warning under a recommended one.
+        if found and info is not None and (info.detected or info.reason):
             if info.blocked:
-                line += "  " + _error(f"⛔ {info.summary()} — below the hard "
-                                      f"minimum {info.hard_minimum}, refused")
-            elif not info.ok:
-                line += "  " + _warn(f"⚠ {info.summary()}")
+                verdict = (f"below the hard minimum {info.hard_minimum}"
+                           if info.detected else
+                           f"{info.reason} — cannot verify the hard minimum "
+                           f"{info.hard_minimum}")
+                line += "  " + _error(f"⛔ {info.summary()} — {verdict}, refused")
+            elif not info.ok or not info.detected:
+                why = f" — {info.reason}" if info.reason else ""
+                line += "  " + _warn(f"⚠ {info.summary()}{why}")
             else:
                 line += "  " + _info(info.summary())
         print(line)
@@ -753,6 +759,26 @@ def _refuse_if_run_live(config, sub: str, *, lock_probe: bool = True) -> None:
         sys.exit(2)
 
 
+def _pipeline_log(message: str) -> None:
+    """Print one of the pipeline's operator lines — never the thing that aborts a run.
+
+    The orchestrator and the backends call this on paths that still have records
+    to write: the interruption note, the aborted beat, ``run_end``. A terminal
+    that went away — EIO from a hung-up tty after a closed window, SSH session
+    or ``tmux kill-session``; EPIPE from a reader that exited — made ``print``
+    raise there, and the raise unwound the run before its records: the task was
+    marked ``orchestrator error: [Errno 5]``, no ``run_end`` was traced and the
+    process exited 120. Such a line is dropped instead (nobody can read it) and
+    noted at DEBUG, which reaches ``HARNESS_LOG_FILE``.
+    """
+    try:
+        print(_info(message))
+    except OSError as exc:
+        from harness.log import get_logger
+        get_logger(__name__).debug("operator line not printed — stdout is gone "
+                                   "(%s: %s)", type(exc).__name__, exc)
+
+
 def _cmd_pipeline(args: argparse.Namespace) -> None:
     """Handle the ``pipeline`` subcommand group."""
     sub = getattr(args, "pipeline_command", None)
@@ -807,7 +833,7 @@ def _cmd_pipeline(args: argparse.Namespace) -> None:
         # run is the nested case. Running it alongside one is designed usage,
         # so the lock probe stays off.
         _refuse_if_run_live(config, sub, lock_probe=False)
-    orch = PipelineOrchestrator(config, log=lambda m: print(_info(m)))
+    orch = PipelineOrchestrator(config, log=_pipeline_log)
 
     try:
         _pipeline_dispatch(sub, args, config, orch)
@@ -844,7 +870,17 @@ def _pipeline_dispatch(sub: str, args: argparse.Namespace, config,
         print(report.render())
         # Exit status is the contract wrapper loops/cron depend on: 0 only when
         # every attempted task succeeded. `failed`/`blocked`/backend-unavailable
-        # must be visible to `set -e` scripts, not swallowed as success.
+        # must be visible to `set -e` scripts, not swallowed as success. A task
+        # this run left alone because something else holds it is not a failure
+        # of the run: `claimed` (another live process owns it), or held out
+        # because its worktree may still be written to (`worktree-busy`, or the
+        # recovery deferral's own reason). It exits 0, it is listed in the
+        # report, and a later run picks the task up. A launch refused because
+        # the mutation gate's record cannot be settled (the file it names was
+        # edited since, its exact mutant sits where the record cannot apply,
+        # or the record or that file cannot be read or even looked up —
+        # mutation.restore_pending) is `error` — exit 1: no later run clears
+        # that until someone looks.
         bad = [r for r in report.runs
                if r.status in ("failed", "blocked", "error", "unavailable",
                                "locked", "waiting-dependency", "interrupted")]
@@ -877,8 +913,30 @@ def _pipeline_dispatch(sub: str, args: argparse.Namespace, config,
         return
 
     if sub == "complete":
+        from harness.grounding import Z3Unavailable
+        from harness.pipeline.mutation import MutantRestoreError
+
         print(_header(f"Complete task {args.task_id}"))
-        run = orch.complete(args.task_id, open_pr=not args.no_pr)
+        try:
+            run = orch.complete(args.task_id, open_pr=not args.no_pr)
+        except (MutantRestoreError, Z3Unavailable) as exc:
+            # A refusal, not a crash: one line that says what to do, exit 1 (as
+            # `run` reports the same two). complete() checks both before its
+            # review writes anything — no heartbeat, no freeze commit, no status
+            # on disk. MutantRestoreError: the mutation gate's record names a
+            # file somebody must look at before anything commits the tree;
+            # Z3Unavailable: --require-z3 / HARNESS_REQUIRE_Z3 with no usable z3.
+            # (Only a z3 that passes that check and then fails inside the review
+            # lands here later: after the review's `review` heartbeat and its
+            # freeze, which with PRs on commits the leftovers. The status on
+            # disk is still kept.)
+            # The message renders its names printable already; whatever else
+            # this terminal cannot encode is escaped rather than fatal, so the
+            # refusal is never lost to a UnicodeEncodeError traceback.
+            text = _error(f"pipeline complete: {exc}")
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(encoding, "backslashreplace").decode(encoding))
+            sys.exit(1)
         line = f"  [{run.task_id}] {run.status}"
         if run.risk:
             line += f"  risk={run.risk}"
@@ -1003,10 +1061,18 @@ def _add_pipeline_parser(subparsers) -> None:
     sp_run.add_argument("--validation-baseline", action="store_true",
                         help="Run the oracle against the task's diff base FIRST and don't "
                              "blame the agent for a command that was already failing "
-                             "there. Costs a second validation run per task and can hide "
-                             "a pre-existing failure — use it on repos that are not green "
-                             "at HEAD, or whose toolchain reds them independently of any "
-                             "diff. Off by default (env: HARNESS_VALIDATION_BASELINE)")
+                             "there, while it fails the same way: the same exit code (a "
+                             "base run that timed out matches nothing) and, where the "
+                             "output names failing tests (pytest's short summary, go "
+                             "test's FAIL lines), no failing test the base did not also "
+                             "fail. A new failing test, or a run that stops naming its "
+                             "failures where the base named them, revokes the excuse; "
+                             "output with no per-test lines keeps it for the whole "
+                             "command. Costs a second validation run per task and can "
+                             "hide a pre-existing failure — use it on repos that are not "
+                             "green at HEAD, or whose toolchain reds them independently "
+                             "of any diff. Off by default (env: "
+                             "HARNESS_VALIDATION_BASELINE)")
     sp_run.add_argument("--no-pr", action="store_true", help="Implement + review but don't open PRs")
 
     sp_status = psub.add_parser("status", help="Show the current plan + task statuses")
@@ -1213,6 +1279,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     setup_logging(verbose=getattr(args, "verbose", 0) or 0,
                   quiet=bool(getattr(args, "quiet", False)),
                   log_file=getattr(args, "log_file", None))
+
+    # The process-wide choke point for inherited repository-location variables
+    # (gitutil.REPO_LOCATION_ENV). git exports GIT_DIR and GIT_INDEX_FILE to
+    # every hook, `!` alias, `rebase -x` and `bisect run` command, and one of
+    # them outranks every --repo and working directory below — in git, and in
+    # everything that runs git: gh, go, the agent, the oracle, tmux panes.
+    # harness addresses a repository by --repo / the working directory only,
+    # so an inherited GIT_DIR is ignored, never followed. Dropped once, here,
+    # before any child is spawned. The pipeline package is loaded for the list
+    # only when some GIT_* variable is set at all: `verify --hook` runs on
+    # every editor save and must not pay for it otherwise.
+    if any(key.startswith("GIT_") for key in os.environ):
+        from harness.log import get_logger
+        from harness.pipeline.gitutil import REPO_LOCATION_ENV
+
+        dropped = [key for key in REPO_LOCATION_ENV
+                   if os.environ.pop(key, None) is not None]
+        if dropped:
+            get_logger(__name__).info(
+                "ignoring inherited %s: harness addresses a repository by "
+                "--repo or the working directory, never by a location variable "
+                "its launcher exported", ", ".join(dropped))
 
     if args.command is None:
         parser.print_help()

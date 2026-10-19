@@ -90,7 +90,7 @@ Installing with `[dev]` extras adds:
 | `pytest-mock` | `>=3.10` | Mocking utilities |
 | `mypy` | `>=2.0,<3` | Static type checking (config in `mypy.ini`) |
 | `ruff` | `>=0.1` | Linting (config in `ruff.toml` — pinned families, same reproducibility rationale as `mypy.ini`) |
-| `pre-commit` | `>=3.0` | Git hook management |
+| `pre-commit` | `>=3.0` | Git hook framework — installed, but the repository ships no `.pre-commit-config.yaml` for it to run (see [Pre-commit Hooks](#pre-commit-hooks)) |
 
 Two of those floors are load-bearing rather than cosmetic, and both are about
 the **oracle** rather than about features:
@@ -116,13 +116,9 @@ never exercised locally and only the Linux `/proc` fallback runs.
 
 ### Pre-commit Hooks
 
-```bash
-# Install pre-commit hooks
-pre-commit install
-
-# Run manually on all files
-pre-commit run --all-files
-```
+The repository ships no `.pre-commit-config.yaml`, so there is nothing for the
+pre-commit framework to install or run here. The one hook worth having is a
+plain git hook:
 
 **Dogfood the grounding gate** — block a commit that references symbols that
 don't exist. The harness grounds cleanly against its own source: zero
@@ -131,10 +127,26 @@ installed (`pip install -e ".[z3,proc]"` — otherwise the `z3` and `psutil`
 imports are reported, correctly, as unresolved):
 
 ```bash
-# .git/hooks/pre-commit (or a pre-commit-hooks entry)
+# .git/hooks/pre-commit
 git diff --cached --name-only --diff-filter=ACM | grep -E '\.(py|go)$' \
   | xargs -r -I{} harness verify {} --project .
 ```
+
+Running the gates from a hook does not let the test fixtures write into the
+repository that launched them. git exports `GIT_DIR` and `GIT_INDEX_FILE` to
+every hook, `!` alias, `rebase -x` and `bisect run` command, and an inherited one
+outranks the `-C` / `cwd=` every fixture names, so `tests/conftest.py` drops
+git's repository-location variables (`gitutil.REPO_LOCATION_ENV`), plus
+`GIT_NAMESPACE`, when it is imported — before any fixture of any scope runs.
+The suite can then be run from a hook configured in the repository itself, a `!`
+alias, `rebase -x` or `bisect run` without its fixtures committing onto, staging
+into or registering worktrees in that repository. The `GIT_CONFIG_*` family is
+kept, as harness keeps it, so config given that way still reaches every fixture
+repository: a hook directory given on the command line (`git -c
+core.hooksPath=<dir> commit`, which git exports as `GIT_CONFIG_PARAMETERS`), or
+an absolute `core.hooksPath` in global config, is every fixture repository's
+hook directory too, and a gate-running hook set up that way runs again on every
+fixture commit — keep such a hook in the repository's own config.
 
 ---
 
@@ -196,7 +208,16 @@ harness/
 │   ├── test_run_entry_guards.py  test_untrusted_gates.py
 │   ├── test_verifier_manifest_guard.py  test_worktree_process_safety.py
 │   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
-│   └── test_pr_refresh.py
+│   ├── test_pr_refresh.py  test_cockpit_targets.py
+│   ├── test_config_version_probe.py  test_diff_integrity.py
+│   ├── test_hidden_index_entries.py  test_mutation_record.py
+│   ├── test_nested_repos.py  test_oracle_honesty.py
+│   ├── test_quota_cli_limits.py  test_relaunch_gate.py
+│   ├── test_repo_location_env.py  test_sanitize_gh_read_path.py
+│   ├── test_shutdown_sighup.py  test_submodule_pointers.py
+│   ├── test_success_exit_leftovers.py  test_trust_runner.py
+│   ├── test_unpopulated_submodules.py  test_validation_runner.py
+│   └── test_validation_shutdown.py  test_verifier_usage_limit.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
 ├── loopeng/                    # Shell-script loop the pipeline grew from
@@ -313,11 +334,11 @@ in `json/encoder.py`.
 ## Contributing to the Pipeline
 
 The pipeline (`harness/pipeline/`) turns `designs/*.md` into reviewed PRs. Its
-CLI surface is `harness pipeline {plan, run, status, tmux, complete, supervise,
-prune, trace, verify-diff, backends}`. Design docs are ingested deterministically
-(`ingest.py`) into a `Plan` of `Task`s (`spec.py`), each implemented in an
-isolated worktree by a **backend** (`ide-handoff`, `agent-cli`, `openai`,
-`gemini`).
+CLI surface is `harness pipeline {plan, run, status, tmux, complete, requeue,
+supervise, prune, trace, verify-diff, backends}`. Design docs are ingested
+deterministically (`ingest.py`) into a `Plan` of `Task`s (`spec.py`), each
+implemented in an isolated worktree by a **backend** (`ide-handoff`,
+`agent-cli`, `openai`, `gemini`).
 
 **`spec.py` is the single home of a default.** A knob added anywhere else — a
 literal in a backend, a fallback in the orchestrator — is a default nobody can
@@ -478,7 +499,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 1160 passing, 1 skipped at the time of writing
+# Run all tests — 2361 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -532,12 +553,12 @@ accept both keys today. What remains is that each is a **behaviour change to the
 oracle** rather than a configuration tidy-up, and neither has been measured — so
 they stay unset deliberately. `pytest.toml` carries the full reasoning.
 
-A `mypy.ini` sits alongside it. It states `python_version` and the mypy 2.0
-default flips (`local_partial_types`, `strict_bytes`, `allow_redefinition`)
-explicitly, so `mypy harness/` gives the same verdict on either side of the
-mypy 1.x/2.x boundary — and so `PipelineConfig._has_mypy_config()` sees harness
-as mypy-configured and gives harness's own dogfood run the type-check leg it
-used to skip.
+A `mypy.ini` sits alongside it. It states `python_version`, the mypy 2.0
+default flips (`local_partial_types`, `strict_bytes`, `allow_redefinition`) and
+the 2.4 one (`native_parser`, pinned back off) explicitly, so `mypy harness/`
+gives the same verdict on either side of the mypy 1.x/2.x boundary and of 2.4 —
+and so `PipelineConfig._has_mypy_config()` sees harness as mypy-configured and
+gives harness's own dogfood run the type-check leg it used to skip.
 
 **Shared Fixtures** (in `tests/conftest.py`):
 
@@ -622,8 +643,8 @@ Harness has two observability channels (full guide in **[LOGGING.md](LOGGING.md)
    | a `PipelineConfig` field or `HARNESS_*` var | [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference) (+ the README env table if it is one most runs touch) |
    | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) — and, when the *number* of types changes, the counts quoted in PIPELINE.md's span-traces intro, ARCHITECTURE.md (the `trace.py` module row **and** § Observability) and LOGGING.md (the channel table **and** the span-types rule in § Conventions) |
    | a CLI flag | ARCHITECTURE.md's subcommand tree + the run-book snippet that uses it |
-   | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md |
-   | the test count | the README badge and the counts in this file |
+   | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md, the README (the Prerequisites table **and** the `harness status` sample, which quotes the `TOOLS` rows word for word), PIPELINE.md where it names the floor (git ≥ 2.31, tmux ≥ 2.1) and, for a `[dev]` floor, this file's Development Dependencies table |
+   | the test count | the README (the badge, the *Tested* bullet **and** the `tests/` line in Project Structure), INSTALL.md § Verify and the count in this file |
 
    Numbers in docs are claims: quote the real `pytest -q` line, the real
    `harness status` output, the real defaults from `spec.py`. And keep the

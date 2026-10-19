@@ -139,7 +139,7 @@ def test_api_backend_needs_target_file(tmp_path):
     assert out.status == "failed" and "target file" in out.detail
 
 
-# ── model defaults: dated retirements (P7) ──────────────────────────────────────
+# ── model defaults: dated retirements ───────────────────────────────────────────
 
 
 def test_default_models_are_not_retired_ids(monkeypatch):
@@ -173,7 +173,7 @@ def test_default_models_are_pinned_not_floating():
         assert not model.endswith("-latest"), model
 
 
-# ── failure classification: the gaps (P8) and the third regime (A21) ────────────
+# ── failure classification: the gaps and the third regime ───────────────────────
 
 
 def test_permanent_classifier_covers_provider_error_codes():
@@ -340,7 +340,7 @@ def test_quota_waiting_can_be_disabled(tmp_path):
     assert be.calls == 1
 
 
-# ── Retry-After (P18) ───────────────────────────────────────────────────────────
+# ── Retry-After ─────────────────────────────────────────────────────────────────
 
 
 def test_retry_after_header_is_read_from_the_error():
@@ -373,7 +373,7 @@ def test_loop_honors_retry_after(tmp_path, monkeypatch):
     assert seen.get("server_hint") == 11
 
 
-# ── finish_reason / refusal (P9) ────────────────────────────────────────────────
+# ── finish_reason / refusal ─────────────────────────────────────────────────────
 
 
 def _openai_resp(monkeypatch, payload):
@@ -494,7 +494,7 @@ def test_verifier_oneshot_fails_open_on_an_unusable_response(monkeypatch, tmp_pa
     assert be.ask_oneshot(_ctx(tmp_path), "judge this") == ""
 
 
-# ── cost accounting (P10) ───────────────────────────────────────────────────────
+# ── cost accounting ─────────────────────────────────────────────────────────────
 
 
 def test_estimate_cost_usd_math_and_prefix_matching(monkeypatch):
@@ -580,7 +580,7 @@ def test_api_backend_cost_budget_now_engages(tmp_path):
     assert be.calls == 2                       # $3, then $6 ≥ $5 → stop
 
 
-# ── request shape (P20) ─────────────────────────────────────────────────────────
+# ── request shape ───────────────────────────────────────────────────────────────
 
 
 def test_openai_request_shape(monkeypatch, tmp_path):

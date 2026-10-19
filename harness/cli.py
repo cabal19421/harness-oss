@@ -231,11 +231,13 @@ _GROUNDED_SUFFIXES = (".py", ".go")
 # the findings would describe code the agent never wrote — and there exit 2
 # genuinely blocks the tool call, i.e. it would block the very edit that fixes
 # them.
-_POST_TOOL_EVENTS = {"posttooluse", "posttoolbatch"}
+# Gemini CLI's post-tool event is AfterTool.
+_POST_TOOL_EVENTS = {"posttooluse", "posttoolbatch", "aftertool"}
 # `file_path` is also Read's primary field, so under a `"*"` matcher a plain
 # Read of a .py file would otherwise be grounded and could exit 2 about a file
-# the agent never touched.
-_FILE_EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
+# the agent never touched. Gemini CLI's file-editing tools are write_file and
+# replace.
+_FILE_EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit", "write_file", "replace"}
 
 # Agent CLIs commonly cap hook output (10,000 characters is a typical ceiling),
 # replacing anything past it with a preview plus a file path — which turns
@@ -1231,7 +1233,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_verify.add_argument(
         "--hook", action="store_true",
-        help="Side-car mode: read a PostToolUse/PostToolBatch hook event (the JSON "
+        help="Side-car mode: read a PostToolUse/PostToolBatch (or Gemini CLI "
+             "AfterTool) hook event (the JSON "
              "shape agentic CLIs emit from an after-edit hook) on stdin, ground the "
              "edited .py/.go file(s), feed findings back (exit 2 on hallucinations; "
              "a batch event is additionally blocked on stdout)",

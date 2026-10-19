@@ -18,6 +18,9 @@ TYPE_CMD="${TYPE_CMD:-npm run -s typecheck}"
 LINT_CMD="${LINT_CMD:-npm run -s lint}"
 MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
 
+# Headless Gemini CLI exits 55 in an untrusted folder; a value you set wins.
+export GEMINI_CLI_TRUST_WORKSPACE="${GEMINI_CLI_TRUST_WORKSPACE-true}"
+
 # The prompt is the loop's steering wheel — refuse to run without it rather
 # than silently invoking the agent with an empty prompt all night.
 if [ ! -f PROMPT.md ]; then

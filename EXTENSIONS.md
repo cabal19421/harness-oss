@@ -106,8 +106,8 @@ the trigger to the action; `trigger` conventions: `cron:<expr>`, `on:push`,
 **Showcase — the grounding side-car** ([extensions/automations/edit-gate/](extensions/automations/edit-gate/)):
 a **PostToolUse-style** after-edit hook that runs `harness verify --hook` on every
 Edit/Write to a `.py`/`.go` file and puts hallucinated-symbol findings *in front
-of the agent* as the reason to fix them. For agent CLIs that support after-edit
-hooks, one paste into the CLI's project settings:
+of the agent* as the reason to fix them. For agent CLIs with PostToolUse hooks,
+one paste into the CLI's project settings:
 
 ```json
 { "hooks": { "PostToolUse": [ {
@@ -123,11 +123,10 @@ block, and the model may or may not act on it. Wire the same command to
 **PostToolBatch** (which harness also handles, emitting
 `{"decision": "block", …}`) when you want the loop halted. `asyncRewake` +
 `timeout` matter: a command hook's default timeout is commonly 600 seconds, and
-without them a cold repo stalls the edit loop. Gemini CLI currently has no
-after-edit hooks — drive the same primitive from a git `pre-commit` hook, an
-editor on-save task, or CI instead, as the
-[edit-gate README](extensions/automations/edit-gate/README.md) describes. That
-README also explains why each field above is there.
+without them a cold repo stalls the edit loop. Gemini CLI's equivalent is its
+**AfterTool** hook on `write_file|replace`; the
+[edit-gate README](extensions/automations/edit-gate/README.md) has that block
+too, and explains why each field above is there.
 
 The same `--hook` primitive drops into a git `pre-commit` hook, an editor on-save
 task, or CI — making the symbolic gate a verifier in *any* runtime's loop.

@@ -131,6 +131,9 @@ def gh(monkeypatch):
     monkeypatch.setattr(gitutil, "working_tree_dirty", lambda cwd: False)
     monkeypatch.setattr(gitutil, "commits_ahead", lambda repo, base, branch: 1)
     monkeypatch.setattr(gitutil, "head_sha", lambda repo, ref="HEAD": "0123456789abcdef")
+    # The publishers bind the branch they push, read apart from HEAD: with git
+    # faked, an unfaked tip reads as unreadable and the binding fails open.
+    monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "0123456789abcdef")
     monkeypatch.setattr(gitutil, "is_ancestor", lambda cwd, a, d: True)
     # The push's ownership gate needs a real repository; see
     # tests/test_markerless_worktrees.py.

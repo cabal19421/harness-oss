@@ -210,6 +210,7 @@ harness/
 │   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
 │   ├── test_pr_refresh.py  test_cockpit_targets.py
 │   ├── test_config_version_probe.py  test_diff_integrity.py
+│   ├── test_gemini_cli_envelope.py  test_gemini_cli_flags.py
 │   ├── test_hidden_index_entries.py  test_mutation_record.py
 │   ├── test_nested_repos.py  test_oracle_honesty.py
 │   ├── test_quota_cli_limits.py  test_relaunch_gate.py
@@ -235,8 +236,8 @@ harness/
 The grounding gate is the neuro-symbolic check (Datalog + z3 over `ast` /
 `importlib`) that every symbol a change references actually exists. It is
 surfaced through `harness verify FILE` and the editor side-car
-`harness verify --hook` (a PostToolUse-style hook event on stdin — the JSON
-shape agentic CLIs emit from an after-edit hook).
+`harness verify --hook` (a PostToolUse-style or Gemini CLI AfterTool hook event
+on stdin — the JSON shape agentic CLIs emit from an after-edit hook).
 
 The engine lives in `harness/grounding/` and reads as a pipeline:
 
@@ -364,8 +365,9 @@ the hardened ralph loop:
 - **`looptools.py`** — the unattended-safety layer: the three-regime failure
   classifier (permanent / quota-window / transient), jittered `Retry-After`-aware
   backoff, cost/token budget (`--max-cost` works on every backend — on
-  `agent-cli` USD is parsed best-effort from the CLI's JSON envelope, a
-  per-model estimate on `openai`/`gemini`, which report tokens only), and the
+  `agent-cli` USD is parsed best-effort from the CLI's JSON envelope, except
+  that Gemini CLI reports none, so there, as on `openai`/`gemini`, which report
+  tokens only, it is a per-model estimate), and the
   **no-progress / oscillation detector**.
 - **`review.py`** — the review gate plus **risk routing**. Risk (`low` / `medium`
   / `high`) is **advisory routing metadata only** — harness never auto-merges on
@@ -499,7 +501,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 2361 passing, 1 skipped at the time of writing
+# Run all tests — 2465 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output

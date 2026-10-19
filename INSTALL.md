@@ -72,7 +72,7 @@ is missing.
 | **git** | the pipeline itself (worktrees/branches) — *effectively required* | any recent; **2.31** for the submodule hold proof (not probed; see [Core install](#1-core-install-required)) | `apt/brew/pacman install git` |
 | **gh** | `harness pipeline run --pr github` (open real PRs) | **2.97.0** (warn) | https://cli.github.com — then `gh auth login` |
 | **tmux** | `harness pipeline tmux` cockpit (run several features at once) | **2.1** (exact `=` session targets; not probed) | `apt/brew/pacman install tmux` |
-| **gemini** (or another agent CLI, registered as an `AgentCliBackend(cli=...)` drop-in) | the `agent-cli` backend (unattended ralph loop) **and the review verifier** — the ≥ 2 fresh-context judges are one-shot agent-CLI calls | — (pin your own: see below) | https://github.com/google-gemini/gemini-cli — auth via `GEMINI_API_KEY` or Google OAuth login |
+| **gemini** (or another agent CLI, registered as an `AgentCliBackend(cli=...)` drop-in) | the `agent-cli` backend (unattended ralph loop) **and the review verifier** — the ≥ 2 fresh-context judges are one-shot agent-CLI calls | — (pin your own: see below) | https://github.com/google-gemini/gemini-cli — auth via `GEMINI_API_KEY` or Google OAuth login; harness launches it headless with `GEMINI_CLI_TRUST_WORKSPACE=true` unless you set that yourself ([Driving Gemini CLI](#driving-gemini-cli)) |
 | **go** | augments the Go grounding stdlib set via `go list std` (bundled set works without it) | **1.26.9** or **1.27.2** (warn) | https://go.dev/dl |
 | **npm** | JS/TS repos the pipeline validates via an autodetected `npm test --silent` oracle | — | https://nodejs.org |
 
@@ -176,6 +176,54 @@ it exits); under `pipeline run` the guard kills it. Go grounding's own `go list
 std` still runs the bare `go` the inherited `PATH` names, from the temp
 directory.
 
+### Driving Gemini CLI
+
+The `agent-cli` backend reads which flags to pass from `gemini --help` — Gemini
+CLI's `--approval-mode` / `--allowed-tools`, or, for a CLI that lists
+`--permission-mode` / `--allowedTools`, the legacy family. Before an unattended
+run on Gemini CLI:
+
+* **Auth.** A headless run needs auth it can use without a prompt —
+  `GEMINI_API_KEY`, or Vertex AI / Google sign-in settings already in place;
+  without it every launch exits 41 and the task stops at once.
+* **Folder trust.** harness sets `GEMINI_CLI_TRUST_WORKSPACE=true` for its own
+  launches unless you set it; set it to `false` and every launch exits 55, a
+  permanent stop. A trusted worktree loads its branch's `.gemini/settings.json`,
+  hooks included, which is why `--untrusted` refuses Gemini CLI.
+* **Build files.** Headless Gemini CLI denies `write_file`/`replace` on build
+  files — `setup.py`, `pyproject.toml`, `Makefile`, `package.json`, `go.mod`,
+  `Cargo.toml`, `Dockerfile` and similar — in every approval mode. A task that
+  must change one needs the agent to do it through an allowed shell command
+  (`sed -i …`, `python -c …`), or its oracle stays red.
+* **Shell redirection** (`>`, `2>&1`, here-docs) is denied for every command an
+  allow rule's prefix matches (`Bash(<cmd>:*)`; a command only a bare `Bash`
+  rule matches keeps it under `auto_edit`) unless a Gemini CLI policy sets
+  `allowRedirection`; the agent sees the denial and must rephrase.
+* **`--allowed-tools` is deprecated** in Gemini CLI (a warning on every run;
+  removal announced for 1.0). harness passes it while `--help` lists it.
+* **Network tools and subagents.** `auto_edit` approves `web_fetch`, and
+  `google_web_search` and subagents (`invoke_agent`, `codebase_investigator`,
+  `cli_help`) are allowed by default. To turn them off, add to a file in
+  `~/.gemini/policies/`: `[[rule]]`, `toolName = ["web_fetch",
+  "google_web_search"]` (plus the subagent names), `decision = "deny"`,
+  `priority = 900`.
+* **System policies.** harness denies Gemini CLI's plan-mode tools for its own
+  calls with `--admin-policy`, so the agent cannot switch itself to `yolo`.
+  Gemini CLI ignores that flag while `/etc/gemini-cli/policies` (macOS:
+  `/Library/Application Support/GeminiCli/policies`) holds policy files; if
+  yours does, add `[[rule]]`, `toolName = ["enter_plan_mode",
+  "exit_plan_mode"]`, `decision = "deny"`, `priority = 999` there.
+* **Git inside the agent.** Gemini CLI runs the agent's shell commands with your
+  global git config and your repository's hooks switched off: a commit the agent
+  makes itself skips your hooks and, without a repository-local identity, fails
+  or is authored as an auto-detected `user@host` — and that commit is what the
+  PR carries (harness commits the green tree with your config and hooks only
+  when the agent left it uncommitted). In a GitHub workflow also add
+  `GIT_CEILING_DIRECTORIES` to `security.environmentVariableRedaction.allowed`.
+
+The full list, with the exit codes and the quota path, is in
+[PIPELINE.md § Driving Gemini CLI](PIPELINE.md#driving-gemini-cli).
+
 ---
 
 ## 4. Verify
@@ -183,7 +231,7 @@ directory.
 ```bash
 harness status               # environment doctor: grounding solver, backends, deps, extensions
 harness pipeline backends    # which code-writing backends are usable here
-pytest -q                    # (after `.[dev]`) → 2361 passed, 1 skipped
+pytest -q                    # (after `.[dev]`) → 2465 passed, 1 skipped
 harness verify - --lang go <<<'package main
 import "fmtx"
 func main(){}'               # grounding smoke test (should FAIL on the bad import)

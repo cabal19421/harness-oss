@@ -60,10 +60,14 @@ only for the honest version: no diff and no manifest either.
 Nor on a call the backend reports it could not make for a reason that is not an
 outage (``OneshotResult.abstain``): the OS refused to exec the verifier because
 its argv is over the exec limit (E2BIG — deterministic, so every sample is
-refused the same way), or a verifier that ran with tools was terminated and left
-processes running in the worktree it judged. When no sample could vote for that
-reason the gate **abstains**, naming it, rather than reporting "no parseable
-verdict" as a skip.
+refused the same way), a verifier that ran with tools was terminated and left
+processes running in the worktree it judged, Gemini CLI's argument parser
+refused the verifier's argv (refused the same way on every sample), or agent-cli
+could not contain a Gemini CLI verifier (no ``--policy`` advertised, its
+deny-all policy file or its own directory unavailable, or a ``.env`` file Gemini
+CLI would load that is not the home directory's own). When no sample could vote
+for that reason the gate **abstains**, naming it, rather than reporting "no
+parseable verdict" as a skip.
 
 Nor on a sample the backend's usage limit refused (``OneshotResult.usage_limit``
 — for agent-cli, the CLI's own marked refusal). Every later sample would be
@@ -536,9 +540,13 @@ def _refused_call_abstain(refusals: list[str], n: int) -> VerifierReport:
 
     ABSTAIN, as in :func:`_unrendered_change_abstain`: the backend reported that
     the call could not be made for a reason that is not an outage — the OS would
-    not exec an argv this large (E2BIG, refused the same way on every sample), or
-    a verifier with tools left processes running in the worktree it judged. No
-    verifier judged the change, and ``skip`` would report that as a pass.
+    not exec an argv this large (E2BIG, refused the same way on every sample),
+    a verifier with tools left processes running in the worktree it judged,
+    Gemini CLI's argument parser refused the argv (the same way on every
+    sample), or a Gemini CLI verifier could not be contained (no ``--policy``
+    advertised, its deny-all policy file or its own directory unavailable, or a
+    ``.env`` file Gemini CLI would load that is not the home directory's own).
+    No verifier judged the change, and ``skip`` would report that as a pass.
     """
     reasons = _dedup(refusals)
     logger.warning("verifier ABSTAIN: %d of %d sample(s) could not be asked and "
@@ -859,9 +867,13 @@ def _one_answer(ask: Ask | None, ask_structured: AskStructured | None, prompt: s
     backend enforced :data:`VERDICT_SCHEMA` and the answer still did not conform.
     *refused* is non-empty when the call could not be made and the backend says
     that must not read as a skip either (``OneshotResult.abstain`` — an E2BIG
-    launch refusal, or a verifier with tools that left processes running); it
-    carries the backend's detail. *limit* is set when the backend's usage limit
-    refused the call (``OneshotResult.usage_limit`` — the refusal's own text —
+    launch refusal, a verifier with tools that left processes running, an argv
+    Gemini CLI's parser refused, or a Gemini CLI verifier that could not be
+    contained: no ``--policy`` advertised, its deny-all policy file or its own
+    directory unavailable, or a ``.env`` file Gemini CLI would load that is not
+    the home directory's own); it carries the backend's detail. *limit* is set
+    when the backend's usage limit refused the call
+    (``OneshotResult.usage_limit`` — the refusal's own text —
     and ``usage_limit_kind``, its regime): the caller launches no further
     sample and the review ends with no verdict. Infrastructure failures (backend
     unavailable, launch failure, timeout, non-zero exit, an exception) return

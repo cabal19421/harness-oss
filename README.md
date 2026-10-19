@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 ![Grounding](https://img.shields.io/badge/grounding-Python%20%2B%20Go-blueviolet)
-![Tests](https://img.shields.io/badge/tests-2361%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-2465%20passing-brightgreen)
 
 ---
 
@@ -31,17 +31,17 @@ The core runs on the Python standard library alone — no cloud services or API 
 - 🧮 **z3 is capability, not speed** — without it the stdlib backend still decides call arity, and the SMT-only checks **abstain to `unverified`** (never a failure), so a z3-less machine loses findings but never gains false ones. Each backend declares its kinds in `capabilities`, and the z3 backend *probes* the API it needs at construction, so an incompatible release degrades cleanly instead of half-working. `--require-z3` / `HARNESS_REQUIRE_Z3=1` turns a missing or unusable z3 into a loud `Z3Unavailable` error instead of a silent downgrade.
 - 🎯 **Grounded against the target environment** — third-party imports resolve against the *target project's* virtualenv (`.venv`/`venv` site-packages, found by path inspection — no target code is ever executed, no target interpreter launched) with the harness's own interpreter as the fallback tier. `HARNESS_TARGET_SITE_PACKAGES` force-adds directories for layouts the heuristic misses.
 - 🔬 **Auditable rules (`--explain`)** — `harness verify --explain` prints the exact constraint generated for every call site and guard chain this run — the real z3 assertions, its inputs, and sat/unsat/abstained — so you can see *why* it passed or failed and that the rule is re-derived fresh each run.
-- 🪝 **Grounding side-car (`--hook`)** — `harness verify --hook` reads a PostToolUse-style hook event (the JSON shape agentic CLIs emit from an after-edit hook) on stdin, grounds the edited `.py`/`.go` file, and puts findings in front of the agent (exit 2 → stderr) as the reason to fix them. PostToolUse runs *after* the write, so it **surfaces** — wire the same command to **PostToolBatch** (also handled, via `{"decision": "block"}`) when you want the loop halted. Drops into any agent CLI with after-edit hooks, a git `pre-commit` hook, an on-save task, or CI.
+- 🪝 **Grounding side-car (`--hook`)** — `harness verify --hook` reads a PostToolUse-style or Gemini CLI AfterTool hook event (the JSON shape agentic CLIs emit from an after-edit hook) on stdin, grounds the edited `.py`/`.go` file, and puts findings in front of the agent (exit 2 → stderr) as the reason to fix them. PostToolUse runs *after* the write, so it **surfaces** — wire the same command to **PostToolBatch** (also handled, via `{"decision": "block"}`) when you want the loop halted. Drops into any agent CLI with after-edit hooks, a git `pre-commit` hook, an on-save task, or CI.
 
 **Design-docs → PRs pipeline**
 - 🛠️ **The loop** — Drop markdown design docs in `designs/`; the pipeline decomposes them into independent tasks, isolates each in a git worktree, implements (an `agent-cli` ralph loop, direct-API `openai`/`gemini` loops, or `ide-handoff` packets you build in **Google Antigravity or VSCodium/Copilot**), gates each change with **grounding + your test suite** (a type-checker leg is added only when mypy/pyright is installed and configured for the repo, or `go build` for Go), tags an advisory risk level, and opens one PR per task (`--pr local` or `--pr github`). See **[PIPELINE.md](PIPELINE.md)**.
 - 🎓 **An oracle that knows what it couldn't run** — each validation command is classified `passed` / `failed` / `infrastructure` (the tool never got as far as judging the code) / `preexisting`. Only `failed` counts against the agent — but a suite where *nothing* ran is red, not a vacuous green, and an excuse the agent's own diff manufactured is revoked by re-running that command at the diff base. Tool versions (`{"pytest": "9.0.3"}`) are recorded so a verdict flip from a *tool upgrade* is distinguishable from a regression.
-- 🌙 **Unattended-safe** — built to start and walk away from: a failed iteration is **rolled back** (no broken edits bleed forward), a transient model overload **backs off** (jittered, honouring a server `Retry-After`), a depleted-credit error **aborts**, an exhausted subscription **quota window is waited out** rather than burned through, a green change a hook rejects is **kept for repair**, and `--max-tokens` / `--max-cost` bound spend on every backend (the USD cap needs a known per-model rate — set `HARNESS_MODEL_PRICES` on `openai`/`gemini`, whose default models ship unpriced). A host **sleep inhibitor** holds the machine awake, and **Ctrl-C is safe** — the detached agent's process group is terminated, the abort is journaled, and the task stays resumable.
+- 🌙 **Unattended-safe** — built to start and walk away from: a failed iteration is **rolled back** (no broken edits bleed forward), a transient model overload **backs off** (jittered, honouring a server `Retry-After`), a depleted-credit error **aborts**, an exhausted subscription **quota window is waited out** rather than burned through, a green change a hook rejects is **kept for repair**, and `--max-tokens` / `--max-cost` bound spend on every backend (the USD cap needs a known per-model rate — set `HARNESS_MODEL_PRICES` on `openai`/`gemini`, whose default models ship unpriced, and on Gemini CLI, which reports no USD, for any served model outside the built-in `gemini-2.x` rates). A host **sleep inhibitor** holds the machine awake, and **Ctrl-C is safe** — the detached agent's process group is terminated, the abort is journaled, and the task stays resumable.
 - 🛟 **Supervised & self-healing** — `harness pipeline supervise` reports per-task **liveness** (heartbeats bound to a *process identity*, a monotonic clock and a per-incarnation generation token, so a recycled pid, a clock step or a leftover record can never read as alive) and `--recover` rolls back **provably** crashed/hung runs, keeping committed work and parking uncommitted edits on the **stash**. Anything unverifiable is `unknown`: reported, never acted on. `harness pipeline prune` deletes only branches whose work has **landed** and reconciles worktree directories the plan lost track of; teardown is refuse-and-report, never bulldoze.
 - 🛡️ **Safe on untrusted input** — design text is scrubbed of secrets + prompt-injection before it reaches a backend; `--untrusted` allowlist-filters a design's `(validate:)` commands *below* the executable (multiplexer subcommands, output-redirecting flags, and the `NAME=value` env prefix each get their own allowlist), adds what survives to the operator's oracle instead of substituting for it, and drops the branch's own agent config; validation runs shell-free where it can; re-pushes use `--force-with-lease`, never a blind force.
-- 🔒 **Bound to the reviewed commit** — the risk level a PR carries only means something if the pushed tree earned it. The review freezes one SHA, and immediately before the push (under the repo git lock) a HEAD that no longer is — or descends from — that SHA withholds the PR and records a `push_guard` span. On GitHub, `gh auth` is checked *before* the push and an existing PR is adopted only when its head ref matches and it is not cross-repository — and counts as done only once its body has been re-published for the reviewed head, which harness does only over a body that is this task's own and unedited since.
+- 🔒 **Bound to the reviewed commit** — the risk level a PR carries only means something if the pushed tree earned it. The review freezes one SHA, and immediately before the push (under the repo git lock) a published branch (`refs/heads/<branch>`) that was not that SHA when the review froze it, or a branch or HEAD that no longer is — or descends from — it, withholds the PR and records a `push_guard` span. On GitHub, `gh auth` is checked *before* the push and an existing PR is adopted only when its head ref matches and it is not cross-repository — and counts as done only once its body has been re-published for the reviewed head, which harness does only over a body that is this task's own and unedited since.
 - 🖥️ **Two front-ends** — Editor-first **VSCodium tasks** (the default), *or* a **tmux cockpit** (`harness pipeline tmux`) that runs several features simultaneously, one per window, with a live dashboard.
-- 🔌 **Provider-agnostic backends** — the only model-coupled piece. `ide-handoff`, `agent-cli`, **`openai` (ChatGPT)**, and **`gemini`** ship in-tree (`agent-cli` drives an external agentic CLI — `gemini` by default; register a drop-in built on `AgentCliBackend(cli="<binary>")` to drive another — probing its `--help` and withholding the optional flags a CLI doesn't advertise, a pinned `--model` excepted; the API backends are direct, stdlib-HTTP, no SDK; truncated replies and refusals are detected from `finish_reason`/`refusal` and re-prompted rather than written to disk). Register your own (OpenCode, aider, an Azure endpoint, …) with one call. The grounding + test gate judges every backend identically. Risk level (low/medium/high) is **advisory routing metadata for review** — harness never auto-merges on it.
+- 🔌 **Provider-agnostic backends** — the only model-coupled piece. `ide-handoff`, `agent-cli`, **`openai` (ChatGPT)**, and **`gemini`** ship in-tree (`agent-cli` drives an external agentic CLI — `gemini` by default; register a drop-in built on `AgentCliBackend(cli="<binary>")` to drive another — probing its `--help` to pick the flag family it speaks — Gemini CLI's `--approval-mode`/`--allowed-tools` (allow rules translated to its tool names), or the legacy `--permission-mode`/`--allowedTools`; when the help lists neither family or both, or cannot be read, the binary's name picks it and that family's flags go unprobed — and withholding the optional flags a CLI doesn't advertise, a pinned `--model` excepted; the API backends are direct, stdlib-HTTP, no SDK; truncated replies and refusals are detected from `finish_reason`/`refusal` and re-prompted rather than written to disk). Register your own (OpenCode, aider, an Azure endpoint, …) with one call. The grounding + test gate judges every backend identically. Risk level (low/medium/high) is **advisory routing metadata for review** — harness never auto-merges on it.
 
 **Anti-hallucination gates (in the pipeline)**
 - 🔎 **Independent verifiers (at least two)** — **fresh-context** second opinions re-read each diff against its task; whenever the gate is on, **≥ 2** independent verifiers vote per implementer. A failed verdict blocks the change; an abstain — including a split vote with no strict majority, or a round in which fewer than two verifiers answered usably — raises its risk to human review. Where the backend can enforce a JSON schema on the answer, the verdict is read from a validated object, and an answer that *ran* but did not conform **blocks** instead of silently skipping.
@@ -56,7 +56,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 **Foundations**
 - 🔍 **Dependency doctor** — `harness status` reports the grounding solver and the constraint kinds it decides, backend availability, every external tool it can use — `git`, `gh`, `tmux`, `agent` (the agent CLI driving the `agent-cli` backend; default binary `gemini`), `go`, `npm` — with its detected-vs-required version, the optional Python extras, and an extensions summary. See **[INSTALL.md](INSTALL.md)**.
 - 📓 **Two observability channels** — an append-only JSONL **span trace** (`.harness/trace.jsonl`, one line per consequential decision) and a **verbose log** (`-v`/`-vv`, `HARNESS_LOG`) whose output is secret-redacted *and* terminal-safe. See **[LOGGING.md](LOGGING.md)**.
-- 🧪 **Tested** — **2361 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
+- 🧪 **Tested** — **2465 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
 
 ---
 
@@ -104,7 +104,7 @@ flowchart TD
       BACK --> ORACLE["oracle: grounding + tests (+ types when configured)"]
       ORACLE -->|red| BACK
       ORACLE -->|green| REV["≥2 fresh-context verifiers → review → advisory risk"]
-      REV --> PUSH{"HEAD still the reviewed SHA?"}
+      REV --> PUSH{"branch + HEAD still the reviewed SHA (or a descendant)?"}
       PUSH -->|yes| PR["PR: local · github"]
       PUSH -->|no| HOLD["withhold + push_guard span"]
       SUP["supervise · recover · prune"] -. liveness/cleanup .-> WT
@@ -265,12 +265,12 @@ harness pipeline complete <task-id> --pr local      # after you implement it
 # 2b. …or let an unattended agent-cli ralph loop (Gemini CLI by default) write +
 #     verify the code, bounded by a budget (rolls back failures, recovers
 #     crashes). --max-tokens and --max-cost both work on every backend — on
-#     agent-cli both are parsed best-effort from the CLI's JSON envelope; on
-#     openai/gemini cost is an estimate from a per-model rate table, and they
-#     report tokens only. NOTE: the *default* openai/gemini models are NOT in
-#     that table, so --max-cost cannot fire on them until you set
-#     HARNESS_MODEL_PRICES (harness warns at task start; --max-tokens is
-#     unaffected).
+#     agent-cli both are parsed best-effort from the CLI's JSON envelope, except
+#     that Gemini CLI reports no USD, so there (as on openai/gemini, which
+#     report tokens only) cost is an estimate from a per-model rate table.
+#     NOTE: the *default* openai/gemini models are NOT in that table, so
+#     --max-cost cannot fire on them until you set HARNESS_MODEL_PRICES
+#     (harness warns at task start; --max-tokens is unaffected).
 harness pipeline run --repo . --backend agent-cli --pr github --parallel 3 \
                      --max-tokens 5000000 --max-cost 20
 
@@ -357,7 +357,7 @@ harness/
 │       ├── cockpit.py         # tmux cockpit (run features simultaneously)
 │       ├── orchestrator.py    # Ties ingest→ground→implement→verify→review→PR; recovery + supervise/prune
 │       └── store.py           # Repo-local plan persistence (.harness/pipeline.json) + the run lock
-├── tests/                     # 2361 passing, 1 skipped (pytest; config in pytest.toml)
+├── tests/                     # 2465 passing, 1 skipped (pytest; config in pytest.toml)
 │   ├── conftest.py            # Isolated cwd/data per test
 │   ├── test_grounding.py      test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py   test_grounding_precision.py
@@ -373,6 +373,7 @@ harness/
 │   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
 │   ├── test_pr_refresh.py            test_cockpit_targets.py
 │   ├── test_config_version_probe.py  test_diff_integrity.py
+│   ├── test_gemini_cli_envelope.py   test_gemini_cli_flags.py
 │   ├── test_hidden_index_entries.py  test_mutation_record.py
 │   ├── test_nested_repos.py          test_oracle_honesty.py
 │   ├── test_quota_cli_limits.py      test_relaunch_gate.py
@@ -417,8 +418,8 @@ The table below is the **selected** set most runs touch. Every
 | `HARNESS_REPO`, `HARNESS_DESIGNS` | Pipeline target repo / designs dir | `.` / `designs` |
 | `HARNESS_BACKEND`, `HARNESS_PR`, `HARNESS_PARALLEL`, `HARNESS_MAX_ITERS` | Pipeline backend / PR mode / parallelism / ralph cap | `ide-handoff` / `local` / `1` / `15` |
 | `HARNESS_TEST_CMD`, `HARNESS_TYPE_CMD`, `HARNESS_LINT_CMD` | Override the pipeline oracle commands | auto-detected |
-| `HARNESS_MAX_TOKENS`, `HARNESS_MAX_COST_USD` | Budget caps that stop an unattended run (tokens on any token-tracking backend; USD parsed best-effort from the agent CLI's JSON envelope on **agent-cli**, estimated on `openai`/`gemini` — and only for models the rate table prices, which the shipped defaults are **not**: see `HARNESS_MODEL_PRICES`) | unbounded |
-| `HARNESS_MODEL_PRICES` | Per-model USD rates for the API backends: `model=in/cached/out` per 1M tokens, comma-separated. **Required for `HARNESS_MAX_COST_USD` to have any effect on the default `openai`/`gemini` models** — the built-in table knows only `gpt-4.1*`/`gpt-4o*`/`gemini-2.x`, so an unpriced model contributes $0 and the USD cap can never trip | unset |
+| `HARNESS_MAX_TOKENS`, `HARNESS_MAX_COST_USD` | Budget caps that stop an unattended run (tokens on any token-tracking backend; USD parsed best-effort from the agent CLI's JSON envelope on **agent-cli** (estimated per served model on Gemini CLI, whose envelope has no USD), estimated on `openai`/`gemini` — and only for models the rate table prices, which the shipped defaults are **not**: see `HARNESS_MODEL_PRICES`) | unbounded |
+| `HARNESS_MODEL_PRICES` | Per-model USD rates for the API backends and for Gemini CLI on `agent-cli`: `model=in/cached/out` per 1M tokens, comma-separated. **Required for `HARNESS_MAX_COST_USD` to have any effect on the default `openai`/`gemini` models, and on Gemini CLI for any served model outside the built-in `gemini-2.x` rates** — the built-in table knows only `gpt-4.1*`/`gpt-4o*`/`gemini-2.x`, so an unpriced model contributes $0 and the USD cap can never trip | unset |
 | `HARNESS_VERIFY` | Independent verifier gate: ≥ 2 fresh-context second opinions on each diff (fail → block, abstain → high risk); `0` turns the gate off entirely | `1` (on) |
 | `HARNESS_VERIFY_SAMPLES` | Independent verifier votes per diff — **minimum 2** while the gate is on; majority wins, a split → human review | `2` |
 | `HARNESS_NO_PROGRESS_WINDOW` | Abstain to a human after N iterations reach the same failing state (`0` disables) | `3` |

@@ -6,6 +6,9 @@
 
 set -euo pipefail
 
+# Headless Gemini CLI exits 55 in an untrusted folder; a value you set wins.
+export GEMINI_CLI_TRUST_WORKSPACE="${GEMINI_CLI_TRUST_WORKSPACE-true}"
+
 # One independent, separately-verifiable task per agent. Overlapping tasks cause
 # merge conflicts — keep them disjoint.
 tasks=(

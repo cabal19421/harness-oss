@@ -347,8 +347,8 @@ class ReviewGate:
         # tree that earned it. Leftover work is committed here rather than inside
         # PrCreator.open (which used to sweep up whatever happened to be dirty at
         # push time, minutes and several gates later) so there is exactly one
-        # reviewed SHA — and _open_pr refuses to push anything that is not it or
-        # a descendant of it.
+        # reviewed SHA — and _open_pr refuses to publish a branch that is not it
+        # or a descendant of it (see _unbound).
         try:
             reviewed_sha = self._freeze_reviewed_commit(ctx, commit=open_pr)
         except gitutil.ProtectedPathError as exc:
@@ -356,6 +356,22 @@ class ReviewGate:
             # downstream can be bound to one. Stop here rather than judging (and
             # possibly publishing) a tree the pipeline was told not to touch.
             return self._protected_path_fail(ctx, exc)
+        # The commit just frozen is HEAD; what the PR step publishes is the
+        # branch. Its tip is read HERE, with nothing run since the freeze,
+        # because only equality at this point proves the two are one tree:
+        # later, a branch that descends from the reviewed commit cannot be told
+        # from one that was already past it — a HEAD detached BEHIND the
+        # branch, whose older tree every gate below would judge while the
+        # publish carried the commits after it. _open_pr withholds the PR then.
+        frozen_tip = ""
+        if open_pr and reviewed_sha:
+            pr_branch = self._pr_branch(task, ctx.worktree)
+            frozen_tip = gitutil.branch_tip(ctx.worktree, pr_branch)
+            if frozen_tip and frozen_tip != reviewed_sha:
+                logger.warning("[%s] the review froze HEAD %s, which is not the "
+                               "tip of refs/heads/%s (%s) — its gates judge HEAD, "
+                               "so the PR will be withheld", task.id,
+                               reviewed_sha[:12], pr_branch, frozen_tip[:12])
         oracle = oracle or self._oracle(ctx)
         if oracle.validation_interrupted or shutdown.requested():
             # The rule: a validation run the shutdown handler cut short has no
@@ -553,6 +569,7 @@ class ReviewGate:
         if open_pr and passed:
             pr_result = self._open_pr(ctx, task, risk, oracle, changed,
                                       reviewed_sha=reviewed_sha,
+                                      frozen_tip=frozen_tip,
                                       stale_notes=stale_notes)
         elif open_pr and not passed:
             logger.info("[%s] PR withheld: review not green", task.id)
@@ -1102,7 +1119,14 @@ class ReviewGate:
     def _open_pr(self, ctx: ImplementContext, task: Task, risk: RiskLevel,
                  oracle: OracleResult, changed: list[str], *,
                  reviewed_sha: str = "",
+                 frozen_tip: str = "",
                  stale_notes: list[str] | None = None) -> PrResult:
+        """Publish the reviewed commit, or withhold it with a ``push_guard`` span.
+
+        *frozen_tip* is the commit the published branch was at when
+        :meth:`review` froze *reviewed_sha* — ``""`` when it was not read, which
+        compares nothing (see :meth:`_unbound`).
+        """
         from .sanitize import sanitize_publication
 
         creator = get_pr_creator(self.pr_mode)
@@ -1115,22 +1139,23 @@ class ReviewGate:
                              rejected=ctx.rejected_validation,
                              no_operator_oracle=ctx.untrusted_without_operator_oracle,
                              reviewed_sha=reviewed_sha, stale_notes=stale_notes)
-        branch = task.branch or gitutil.current_branch(ctx.worktree)
+        branch = self._pr_branch(task, ctx.worktree)
         # The push/commit is the only repo-level git mutation → serialise it.
         with step(logger, "open PR (includes wait on repo git lock)",
                   task=task.id, mode=self.pr_mode, branch=branch,
                   base=ctx.base_branch), self._git_lock:
-            # Re-read HEAD *inside* the lock: harness has real concurrent
-            # worktree mutators (Supervisor.recover resets them; the tmux
-            # cockpit runs one process per task). A HEAD that no longer
-            # descends from the reviewed commit means the diff that earned
-            # this risk level is not the diff we would push — fail CLOSED.
-            bound, why = head_bound_to_review(ctx.worktree, reviewed_sha)
-            if not bound:
+            # Re-read the branch and HEAD *inside* the lock: harness has real
+            # concurrent worktree mutators (Supervisor.recover resets them; the
+            # tmux cockpit runs one process per task). A verdict that is not
+            # about the tree we would publish fails CLOSED — and is traced
+            # here, before the publisher is handed anything.
+            unbound = self._unbound(ctx, reviewed_sha, branch, frozen_tip)
+            if unbound is not None:
+                why, tip = unbound
                 ctx.trace.span("push_guard", ok=False, task=task.id,
                                reviewed=reviewed_sha[:12],
                                head=gitutil.head_sha(ctx.worktree)[:12],
-                               detail=why[:200])
+                               tip=tip[:12], detail=why[:200])
                 logger.error("[%s] PR withheld: %s", task.id, why)
                 return PrResult(ok=False, detail=why)
             return creator.open(
@@ -1139,6 +1164,61 @@ class ReviewGate:
                 reviewed_sha=reviewed_sha,
                 protected_paths=ctx.config.protected_paths,
             )
+
+    @staticmethod
+    def _pr_branch(task: Task, worktree: Path) -> str:
+        """The branch the PR step publishes: the task's own, else the one checked out."""
+        return task.branch or gitutil.current_branch(worktree)
+
+    @staticmethod
+    def _unbound(ctx: ImplementContext, reviewed_sha: str, branch: str,
+                 frozen_tip: str) -> tuple[str, str] | None:
+        """Why this verdict is not about the tree :meth:`_open_pr` would publish.
+
+        ``(detail, tip)`` — *tip* the commit ``refs/heads/<branch>`` is at, for
+        the ``push_guard`` span — or ``None`` when the PR may be opened. Three
+        questions, in this order; a "no" to any of them withholds the PR:
+
+        1. Is the branch — what the publishers publish — the reviewed commit or
+           a descendant of it (:func:`~harness.pipeline.pr.head_bound_to_review`
+           with *branch*)? A HEAD detached PAST the branch fails here: the review
+           froze HEAD while the branch kept an older commit.
+        2. WAS the branch the reviewed commit when the review froze it
+           (*frozen_tip*)? A HEAD detached BEHIND the branch passes question 1 —
+           the branch descends from it — while every gate judged HEAD's older
+           tree, and only equality at the freeze tells commits made before the
+           review from commits made after it.
+        3. Is HEAD still the reviewed commit or a descendant of it? The gates
+           after the validation run — grounding, the changed-file list that the
+           frozen-acceptance guard and the risk escalators read, mutation, the
+           verifier — read the worktree at HEAD, after the validation commands
+           ran in it. A HEAD moved off the reviewed commit means they judged
+           another tree, however bound the branch still is.
+
+        No reviewed SHA binds nothing, and a HEAD or branch ref that cannot be
+        read fails OPEN, as :func:`~harness.pipeline.pr.head_bound_to_review`
+        documents. An unreadable branch ref still publishes nothing: the
+        publishers' ahead-count gate reads it too, and withholds the PR.
+        """
+        bound, why = head_bound_to_review(ctx.worktree, reviewed_sha, branch=branch)
+        if not bound:
+            return why, gitutil.branch_tip(ctx.worktree, branch)
+        if reviewed_sha and frozen_tip and frozen_tip != reviewed_sha:
+            detail = (f"HEAD {reviewed_sha[:12]} was not the tip of refs/heads/"
+                      f"{branch} ({frozen_tip[:12]}) when the review froze it — "
+                      f"the verdict is about a tree that is not the one "
+                      f"published; refusing to publish work that was never "
+                      f"reviewed")
+            return detail, frozen_tip
+        bound, why = head_bound_to_review(ctx.worktree, reviewed_sha)
+        if not bound:
+            tip = gitutil.branch_tip(ctx.worktree, branch)
+            if tip:
+                why += (f" (refs/heads/{branch} still carries the reviewed commit, "
+                        f"but the gates after the validation run read the "
+                        f"worktree at HEAD)")
+            return why, tip
+        return None
 
     def _pr_body(self, task: Task, risk: RiskLevel, oracle: OracleResult,
                  changed: list[str], *, validation: list[str] | None = None,

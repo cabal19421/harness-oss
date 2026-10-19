@@ -50,6 +50,9 @@ flags from `AGENT_FLAGS`). Key flags:
 `-p` runs a single prompt without a TUI; `--allowed-tools` pre-approves the listed
 tools so the agent never stops to ask; `--approval-mode auto_edit` auto-approves
 file edits; `--output-format json` makes the result machine-readable.
+Headless Gemini CLI needs a trusted folder (it exits 55 in an untrusted one):
+the scripts export `GEMINI_CLI_TRUST_WORKSPACE=true` unless you set it, or
+you can trust the folder in Gemini CLI.
 Gemini CLI docs: https://github.com/google-gemini/gemini-cli
 
 > Safety: `--allowed-tools` is scoped to `npm`/`git` (plus `gh` in `review.sh`)

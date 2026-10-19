@@ -493,6 +493,13 @@ class PipelineConfig:
     # `Bash(python:*)` + `Write` already imply arbitrary execution transitively,
     # so the read-only utilities grant nothing new — they just stop the loop
     # burning iterations on commands that are already morally allowed.
+    #
+    # The rules are written in the legacy family's syntax (`Read`, `Edit`,
+    # `Bash(<argv0>:*)`); on Gemini CLI the agent-cli backend translates them to
+    # its tool names for `--allowed-tools` (`run_shell_command(<argv0>)`, …) and
+    # drops — with a WARNING, never widening — a rule Gemini CLI cannot express
+    # (`_gemini_allow_entries`). A call those rules deny does not end a Gemini
+    # CLI invocation: the model is told it was denied and the turn goes on.
     allowed_tools: str = ("Read,Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),"
                           "Bash(pytest:*),Bash(npm:*),Bash(go:*),Bash(make:*),"
                           "Bash(cargo:*),Bash(head:*),Bash(tail:*),Bash(grep:*),"

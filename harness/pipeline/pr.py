@@ -196,22 +196,40 @@ def _unowned_push(worktree: Path, branch: str) -> PrResult | None:
     return PrResult(ok=False, detail=detail)
 
 
-def head_bound_to_review(worktree: Path, reviewed_sha: str) -> tuple[bool, str]:
-    """Is the worktree's HEAD still the tree the review verdict was about?
+def head_bound_to_review(worktree: Path, reviewed_sha: str, *,
+                         branch: str | None = None) -> tuple[bool, str]:
+    """Is the commit about to be published still the tree the review verdict was about?
 
     The risk level harness stamps on a PR only means something if the pushed
     commit is the commit that earned it. Between the review and the push the
     worktree has real concurrent mutators (``Supervisor.recover`` resets
     worktrees; the tmux cockpit runs one process per task), so the last thing
-    before an irreversible remote side effect is: HEAD must *be* ``reviewed_sha``
-    or a descendant of it. A diverged HEAD (reset/rebase/checkout) is refused.
+    before an irreversible remote side effect is: the bound revision must *be*
+    ``reviewed_sha`` or a descendant of it. A diverged one (reset/rebase/
+    checkout) is refused.
+
+    The bound revision is the worktree's HEAD unless *branch* is given. What
+    gets published is ``refs/heads/<branch>`` — pushed, or handed over as the
+    local PR — and the publishers' ahead-count gate measures that ref too, so
+    the publishers and the review gate in front of them pass *branch*: bound
+    to HEAD alone, a HEAD detached past the branch passed while the published
+    branch lacked the reviewed commit. With *branch*, the tip of that ref (read
+    fully qualified by :func:`gitutil.branch_tip`, so a tag sharing the name
+    cannot answer for it) must be ``reviewed_sha`` or descend from it, and a
+    refusal names HEAD too when HEAD is not that tip. The review gate binds
+    HEAD as well, in a call of its own: the gates after its oracle read the
+    worktree at HEAD (:meth:`~harness.pipeline.review.ReviewGate._unbound`).
+    An empty *branch* names no ref and binds HEAD, as ``None`` does.
 
     Returns ``(ok, detail)``. Fails OPEN — with a loud warning — only when the
-    binding cannot be evaluated at all (no reviewed SHA recorded, unreadable
-    HEAD): that is an infrastructure error, not evidence of divergence.
+    binding cannot be evaluated at all (no reviewed SHA recorded, an unreadable
+    HEAD or branch ref): that is an infrastructure error, not evidence of
+    divergence.
     """
     if not reviewed_sha:
         return True, ""
+    if branch:
+        return _branch_bound_to_review(worktree, reviewed_sha, branch)
     head = gitutil.head_sha(worktree)
     if not head:
         logger.warning("cannot read HEAD of %s to bind the push to reviewed "
@@ -227,6 +245,36 @@ def head_bound_to_review(worktree: Path, reviewed_sha: str) -> tuple[bool, str]:
     detail = (f"worktree HEAD moved off the reviewed commit: reviewed "
               f"{reviewed_sha[:12]}, HEAD is now {head[:12]} and does not "
               f"descend from it — refusing to push work that was never reviewed")
+    logger.error("%s (%s)", detail, worktree)
+    return False, detail
+
+
+def _branch_bound_to_review(worktree: Path, reviewed_sha: str,
+                            branch: str) -> tuple[bool, str]:
+    """:func:`head_bound_to_review` with *branch*: binds ``refs/heads/<branch>``, what is published."""
+    ref = f"refs/heads/{branch}"
+    tip = gitutil.branch_tip(worktree, branch)
+    if not tip:
+        logger.warning("cannot read %s in %s to bind the publish to reviewed "
+                       "commit %s — proceeding (fail-open on an unreadable "
+                       "branch ref)", ref, worktree, trunc(reviewed_sha, 12))
+        return True, ""
+    if tip == reviewed_sha:
+        return True, ""
+    if gitutil.is_ancestor(worktree, reviewed_sha, tip):
+        logger.debug("publish binding ok: %s at %s descends from reviewed "
+                     "commit %s", ref, trunc(tip, 12), trunc(reviewed_sha, 12))
+        return True, ""
+    # HEAD explains the refusal; it decides nothing. The shape check is there
+    # because plain rev-parse echoes an unborn HEAD back as the word "HEAD".
+    head = gitutil.head_sha(worktree)
+    elsewhere = (f" (the worktree's HEAD is at {head[:12]}, but the branch is "
+                 f"what gets published)"
+                 if head != tip and gitutil.looks_like_object_name(head) else "")
+    detail = (f"branch {branch!r} does not carry the reviewed commit: reviewed "
+              f"{reviewed_sha[:12]}, {ref} is at {tip[:12]} and does not "
+              f"descend from it{elsewhere} — refusing to publish work that was "
+              f"never reviewed")
     logger.error("%s (%s)", detail, worktree)
     return False, detail
 
@@ -295,7 +343,8 @@ class LocalBranchPR(PrCreator):
             if not gitutil.nothing_to_commit(worktree):
                 gitutil.commit(worktree, title)
 
-        bound, why = head_bound_to_review(worktree, reviewed_sha)
+        # The branch is the PR, so the branch — not HEAD — is what is bound.
+        bound, why = head_bound_to_review(worktree, reviewed_sha, branch=branch)
         if not bound:
             return PrResult(ok=False, detail=why)
 
@@ -370,8 +419,9 @@ class GitHubPR(PrCreator):
             if not gitutil.nothing_to_commit(worktree):
                 gitutil.commit(worktree, title)
         # Last check before the irreversible remote side effect: the commit we
-        # are about to push must be the reviewed one (or descend from it).
-        bound, why = head_bound_to_review(worktree, reviewed_sha)
+        # are about to push — the branch's tip, not HEAD — must be the reviewed
+        # one (or descend from it).
+        bound, why = head_bound_to_review(worktree, reviewed_sha, branch=branch)
         if not bound:
             return PrResult(ok=False, detail=why)
         base_rev, branch_rev = _ahead_revs(repo, base, branch)
@@ -484,7 +534,11 @@ class GitHubPR(PrCreator):
 
         The lease is necessary but not sufficient, so it is paired with
         :func:`gitutil.unlanded_by_patch_id`: any remote commit whose *content*
-        is missing locally aborts the retry outright (see below).
+        is missing from what the retry would push aborts the retry outright (see
+        below). Both sides of that check are the refs the retry involves, fully
+        qualified — ``refs/heads/<branch>``, which is what it pushes, and
+        ``refs/remotes/origin/<branch>``, which its bare lease is held on — never
+        HEAD, and never the short ``origin/<branch>``.
         """
         msg = (failed.err or failed.out or "").lower()
         if not any(s in msg for s in ("non-fast-forward", "rejected", "fetch first", "stale info")):
@@ -505,35 +559,51 @@ class GitHubPR(PrCreator):
         # (Anchoring the lease to our own reviewed SHA would NOT help:
         # ``--force-with-lease=<ref>:<sha>`` asserts what the REMOTE ref holds,
         # and the remote can never be at the local commit we are pushing.)
-        remote_ref = f"origin/{branch}"
-        head = gitutil.head_sha(worktree)
+        #
+        # Both sides are the refs the retry involves, spelled in full. The local
+        # side is refs/heads/<branch>, what the retry pushes — not HEAD, which a
+        # detached checkout parks anywhere: one carrying the remote commits'
+        # patches (the fetched tip checked out, a cherry-pick) read as "nothing
+        # would be orphaned" while the branch lacked them, and one parked on the
+        # base refused a routine re-run. The remote side is
+        # refs/remotes/origin/<branch>, what the bare lease is held on — not
+        # `origin/<branch>`, a revision: git resolves it to
+        # refs/tags/origin/<branch> ahead of refs/remotes/origin/<branch>, so a
+        # tag of that name answered for the ref the lease is held on.
+        local_ref = f"refs/heads/{branch}"
+        remote_ref = f"refs/remotes/origin/{branch}"
+        local = gitutil.branch_tip(worktree, branch)
         have_remote_ref = gitutil.ref_exists(worktree, remote_ref)
-        if not head or not have_remote_ref:
-            logger.warning("cannot run the patch-id clobber check for %r (local "
-                           "HEAD=%r, %s resolves=%s) — falling back to the bare "
-                           "lease alone", branch, trunc(head, 12), remote_ref,
+        if not local or not have_remote_ref:
+            logger.warning("cannot run the patch-id clobber check for %r (%s=%r, "
+                           "%s resolves=%s) — falling back to the bare lease "
+                           "alone", branch, local_ref, local[:12], remote_ref,
                            have_remote_ref)
         else:
-            orphans = gitutil.unlanded_by_patch_id(worktree, head, remote_ref)
+            orphans = gitutil.unlanded_by_patch_id(worktree, local, remote_ref)
             if orphans:
+                shown = ", ".join(c[:12] for c in orphans[:8])
                 logger.error("REFUSING the force-push retry of %r: %d commit(s) on "
-                             "%s have no patch-id equivalent in %s and would be "
+                             "%s have no patch-id equivalent in %s (at %s), the "
+                             "branch the retry would push, and would be "
                              "destroyed: %s. Fetch and rebase them in, or push by "
                              "hand once you have decided what to keep.",
-                             branch, len(orphans), remote_ref, trunc(head, 12),
-                             ", ".join(c[:12] for c in orphans[:8]))
+                             branch, len(orphans), remote_ref, local_ref,
+                             local[:12], shown)
                 return gitutil.GitResult(
                     failed.code or 1, failed.out,
                     (f"refusing --force-with-lease retry: {len(orphans)} commit(s) on "
-                     f"{remote_ref} are not present by patch-id in the local head "
-                     f"({', '.join(c[:12] for c in orphans[:8])}) and would be "
-                     f"clobbered. Original push error: {failed.err or failed.out}"),
+                     f"{remote_ref} ({shown}) are not present by patch-id in "
+                     f"{local_ref} ({local[:12]}), the branch the retry would push, "
+                     f"and would be clobbered. Original push error: "
+                     f"{failed.err or failed.out}"),
                 )
         logger.warning("push of %r rejected as non-fast-forward — retrying once "
                        "with bare --force-with-lease (leased on the stored "
                        "remote-tracking ref, no fetch, so an out-of-band remote "
                        "advance is still refused)", branch)
-        # Bare lease (no explicit SHA, no fetch) → anchored to refs/remotes/origin/<branch>.
+        # Bare lease (no explicit SHA, no fetch) → anchored to refs/remotes/origin/<branch>,
+        # and confined to the worktree like the plain push (see force_push_with_lease).
         return gitutil.force_push_with_lease(worktree, "origin", branch, "")
 
     @staticmethod

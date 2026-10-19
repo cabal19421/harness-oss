@@ -21,6 +21,10 @@ to load this file automatically.)
 - Fail-closed behaviors are contracts, not defaults to relax: the
   untrusted-designs suppression, worktree teardown refusals, and recovery's
   "unknown is never acted on" rule must not be weakened to make a test pass.
-- The agent-cli backend probes the driven CLI's `--help` and passes optional
-  flags only when advertised (a pinned `--model` is the one exception); never
-  add another unprobed optional flag.
+- The agent-cli backend probes the driven CLI's `--help`, picks its flag family
+  from it (Gemini CLI's `--approval-mode`/`--allowed-tools`, or the legacy
+  `--permission-mode`/`--allowedTools`; neither, both or no readable help → by
+  binary name, whose family flags are then passed as listed) and passes
+  optional flags only when advertised (a pinned `--model` is the one
+  exception); never add another unprobed optional flag, and never change the
+  legacy family's argv.

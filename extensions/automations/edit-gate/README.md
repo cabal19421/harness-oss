@@ -12,8 +12,8 @@ already have: `harness verify --hook`.
 ## How it works
 
 `harness verify --hook` reads a **PostToolUse**-style hook event (the JSON shape
-agentic CLIs emit from an after-edit hook) on stdin, extracts the edited file,
-grounds it, and:
+agentic CLIs emit from an after-edit hook) or Gemini CLI's **AfterTool** event
+on stdin, extracts the edited file, grounds it, and:
 
 - **exit 0** — clean (or non-`.py`/`.go`, or any error): silent, never disrupts the loop
 - **exit 2** — hallucinated/wrong-arity symbol: the findings go to stderr, which
@@ -39,11 +39,8 @@ editor on-save task, CI — are unaffected.
 
 ## Install (agent CLIs with after-edit hooks)
 
-This snippet is for agent CLIs that support after-edit hooks. **Gemini CLI
-currently has no such hooks** — if you drive Gemini CLI, skip the snippet and
-use the side-car/manual invocation path described below instead: run the same
-`--hook` primitive from a git `pre-commit` hook, an editor on-save task, or CI
-(see [Try it](#try-it)).
+This snippet is for agent CLIs with PostToolUse hooks; for Gemini CLI use the
+[AfterTool block](#gemini-cli-aftertool) below.
 
 1. Make sure `harness` is on PATH (or use the absolute path to it in the command).
 2. Merge the `hooks` block from [settings.snippet.json](settings.snippet.json)
@@ -86,6 +83,33 @@ Four details in that snippet are load-bearing:
 gone from the agent's toolset), and so is `NotebookEdit` — it only ever writes
 `.ipynb`, which this gate skips.
 
+## Gemini CLI (AfterTool)
+
+Gemini CLI has hooks, on by default, configured under `hooks` in
+`~/.gemini/settings.json` or a trusted project's `.gemini/settings.json`
+([hooks](https://github.com/google-gemini/gemini-cli/blob/v0.64.0/docs/hooks/index.md),
+[reference](https://github.com/google-gemini/gemini-cli/blob/v0.64.0/docs/hooks/reference.md));
+for harness's own pipeline runs put the block in `~/.gemini/settings.json`,
+since a worktree's `.gemini/settings.json` is the branch's file. Wire
+**AfterTool** — its `matcher` is a regular expression over the tool name — on
+Gemini CLI's two file-editing tools, `write_file` and `replace`:
+
+```json
+{ "hooks": { "AfterTool": [ {
+  "matcher": "^(write_file|replace)$",
+  "hooks": [ { "type": "command", "name": "harness-grounding", "timeout": 60000,
+    "command": "harness verify --hook --project $GEMINI_PROJECT_DIR" } ]
+} ] } }
+```
+
+Leave `$GEMINI_PROJECT_DIR` unquoted: Gemini CLI replaces it with an already
+shell-quoted path before the shell runs. On AfterTool, exit 2 *replaces* the
+tool's result with harness's stderr, so the finding is what the model reads back
+from its own write. Gemini CLI waits for its hooks, so `timeout` (milliseconds,
+default 60000) bounds a cold index — a hook that times out is a warning and the
+turn goes on — and with no per-suffix filter every write starts the interpreter,
+which exits at once for a file that is not `.py`/`.go`.
+
 ## Blocking variant (PostToolBatch)
 
 Wire the same command to `PostToolBatch` to make the finding stop the loop
@@ -116,6 +140,10 @@ echo '{"hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{"file_pa
   | harness verify --hook --project .
 echo "exit: $?"   # 0 = clean, 2 = findings on stderr
 
+# Gemini CLI's AfterTool event (same exit codes)
+echo '{"hook_event_name":"AfterTool","tool_name":"write_file","tool_input":{"file_path":"path/to/changed.py"}}' \
+  | harness verify --hook --project .
+
 # batch form (also prints a {"decision":"block"} JSON object on stdout)
 echo '{"hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Edit","tool_input":{"file_path":"path/to/changed.py"}}]}' \
   | harness verify --hook --project .
@@ -124,4 +152,4 @@ echo '{"hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Edit","tool
 The same `--hook` primitive works for any runtime that can run a command on a
 file-change event (a git `pre-commit` hook, an editor on-save task, CI …): send
 `{"file_path": "…"}` on stdin and read the exit code. This is the path to use
-with hook-less agent CLIs such as Gemini CLI.
+with an agent CLI that has no after-edit hook.

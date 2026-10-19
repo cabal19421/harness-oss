@@ -10,6 +10,9 @@ set -euo pipefail
 
 BRANCH="${1:?usage: review.sh <branch>}"
 
+# Headless Gemini CLI exits 55 in an untrusted folder; a value you set wins.
+export GEMINI_CLI_TRUST_WORKSPACE="${GEMINI_CLI_TRUST_WORKSPACE-true}"
+
 # Restore whatever the operator had checked out, even when the agent (or this
 # script) fails mid-way — the review must not strand the main working copy on
 # the agent branch with half-finished rebase state.

@@ -641,13 +641,30 @@ def head_sha(repo: Path | str, ref: str = "HEAD") -> str:
     return git(["rev-parse", ref], cwd=repo).out
 
 
+def branch_tip(cwd: Path | str, branch: str) -> str:
+    """The commit ``refs/heads/<branch>`` points at, read in *cwd* — ``""`` if unreadable.
+
+    The ref is always spelled in full: a bare *branch* is a revision, and git's
+    disambiguation ranks ``refs/tags/<branch>`` above it (see :func:`qualify_ref`),
+    so a tag sharing the name would answer for the branch. ``--verify --quiet``
+    is what lets a missing or broken ref read as ``""``: plain ``rev-parse``
+    (:func:`head_sha`) echoes an argument it cannot resolve back on stdout, so
+    a caller would be handed the ref's own name as if it were a commit.
+    """
+    res = git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"],
+              cwd=cwd)
+    return res.out if res.ok else ""
+
+
 def ref_exists(cwd: Path | str, ref: str) -> bool:
-    """Does *ref* resolve in this repo/worktree? (e.g. ``origin/agent/x``).
+    """Does *ref* resolve in this repo/worktree? (e.g. ``refs/remotes/origin/agent/x``).
 
     Callers use it to tell "nothing to compare against" apart from a comparison
     that genuinely found nothing — a distinction the safety checks that consume
     ``rev-list`` output cannot make on their own, since a failed rev-list and an
-    empty result both come back as no lines.
+    empty result both come back as no lines. Spell a ref in full: a short
+    ``origin/agent/x`` is a revision, and git resolves a tag of that name ahead
+    of the remote-tracking ref (see :func:`qualify_ref`).
     """
     return git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).ok
 
@@ -5277,8 +5294,13 @@ def unlanded_by_patch_id(cwd: Path | str, new_head: str, remote: str) -> list[st
     side whose patch-id has no equivalent on *new_head* — exactly the commits a
     force-push would clobber. Empty ⇒ a force-push only replays equivalent
     content and is safe. The pipeline's one force-push, pr.py's lease-guarded
-    retry, runs this check first whenever HEAD and ``origin/<branch>`` both
-    resolve, and otherwise falls back to the bare lease alone.
+    retry, runs this check first whenever ``refs/heads/<branch>`` and
+    ``refs/remotes/origin/<branch>`` both resolve, and otherwise falls back to
+    the bare lease alone.
+
+    It answers for the push only when *new_head* is the commit the push sends
+    (the pushed branch's tip, not HEAD) and *remote* is the remote-tracking ref
+    it replaces, spelled in full (see :func:`ref_exists`).
     """
     res = git(
         ["rev-list", "--cherry-pick", "--right-only", f"{new_head}...{remote}"],
@@ -5298,7 +5320,10 @@ def force_push_with_lease(
 
     The lease is pinned to the SHA we last verified for the remote ref, so a
     legitimate rebase replaces it but a concurrent out-of-band push is *refused*
-    rather than silently clobbered. A bare ``--force`` is never used.
+    rather than silently clobbered. A bare ``--force`` is never used. Confined
+    to *worktree* like the pipeline's plain push (:func:`git`'s *confine*): a
+    ``.git`` marker lost after the caller's ownership proof cannot send the
+    force-push to an enclosing repository.
     """
     lease = f"--force-with-lease={branch}:{expected_sha}" if expected_sha else "--force-with-lease"
     if expected_sha:
@@ -5311,7 +5336,8 @@ def force_push_with_lease(
         logger.debug("force-push %s to %s: bare --force-with-lease (no expected "
                      "SHA) — leased on the stored remote-tracking ref",
                      branch, remote)
-    return git(["push", lease, remote, branch], cwd=worktree, timeout=timeout)
+    return git(["push", lease, remote, branch], cwd=worktree, timeout=timeout,
+               confine=True)
 
 
 # No `remote_url()` accessor on purpose: `git remote get-url` returns the

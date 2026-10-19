@@ -222,6 +222,7 @@ def _gh_envs(monkeypatch, repo: Path) -> list[tuple[list[str], object]]:
         m.setattr(gitutil, "working_tree_dirty", lambda cwd: False)
         m.setattr(gitutil, "commits_ahead", lambda repo, base, branch: 1)
         m.setattr(gitutil, "head_sha", lambda repo, ref="HEAD": "0123456789abcdef")
+        m.setattr(gitutil, "branch_tip", lambda cwd, branch: "0123456789abcdef")
         m.setattr(gitutil, "is_ancestor", lambda cwd, a, d: True)
         m.setattr(gitutil, "worktree_owner_proof", lambda path: gitutil.OwnerProof(True))
         m.setattr(gitutil, "git", lambda args, **kw: gitutil.GitResult(0, "", ""))

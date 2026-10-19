@@ -21,6 +21,9 @@ backends share one hardened loop:
 * :class:`LoopBudget` — a token / cost cap that bounds an overnight run.
 * :func:`estimate_cost_usd` — per-model USD estimate for the API backends, whose
   providers report tokens but never a price.
+* :func:`parse_gemini_usage` / :func:`gemini_retry_seconds` — Gemini CLI's
+  per-model token counts (priced with that estimate, since its envelope carries
+  no USD) and the retry delay its HTTP 429 states.
 * :func:`commit_repair_prompt` — when a green change won't commit, ask the next
   iteration to repair the workspace instead of starting new work.
 """
@@ -642,6 +645,30 @@ def quota_budget_covers(text: str, *, cap: float, waits: int,
     return reset is not None and reset <= cap_s * count
 
 
+# Gemini CLI's HTTP 429 states its delay in one of three forms: Google's own
+# wording ("Please retry in 37.5s"), the sentence Gemini CLI appends from the
+# error's RetryInfo ("Suggested retry after 1800s."), or the raw field of
+# Google's JSON error body when the message carries it.
+_GEMINI_RETRY = re.compile(
+    r"(?:Please retry in|Suggested retry after)\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)\b",
+    re.IGNORECASE)
+_GEMINI_RETRY_DELAY = re.compile(r'"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"')
+
+
+def gemini_retry_seconds(message: str) -> float | None:
+    """The longest delay Gemini CLI's 429 *message* states, in seconds; ``None`` if none.
+
+    The longest wins: a retry before the longest stated delay costs another
+    full Gemini CLI retry ladder. ``ms`` is divided by 1000. Never raises.
+    """
+    if not isinstance(message, str) or not message:
+        return None
+    delays = [float(m.group(1)) / (1000.0 if m.group(2).lower() == "ms" else 1.0)
+              for m in _GEMINI_RETRY.finditer(message)]
+    delays += [float(m.group(1)) for m in _GEMINI_RETRY_DELAY.finditer(message)]
+    return max(delays) if delays else None
+
+
 def wait_out_quota_window(seconds: float, *, beat=None, slice_seconds: float = 300.0) -> bool:
     """Sleep *seconds*, calling *beat* between slices. True if cut short.
 
@@ -958,6 +985,74 @@ def parse_agent_usage(stdout: str) -> tuple[int, float]:
         for k in ("input_tokens", "output_tokens",
                   "cache_creation_input_tokens", "cache_read_input_tokens"):
             tokens += _as_int(usage.get(k))
+    return tokens, cost
+
+
+#: The per-model token fields Gemini CLI's envelope reports that harness adds up
+#: (``cached`` and ``input`` are parts of ``prompt``, never added again).
+_GEMINI_TOKEN_PARTS = ("prompt", "candidates", "thoughts", "tool")
+
+
+def _token_count(v) -> int:
+    """A non-negative token count out of one envelope field; 0 on drift.
+
+    :func:`_as_int` plus the one failure it lets through: Python's JSON reader
+    accepts ``Infinity``, which no integer holds.
+    """
+    try:
+        return max(0, _as_int(v))
+    except OverflowError:
+        return 0
+
+
+def parse_gemini_usage(stdout: str) -> tuple[int, float]:
+    """``(tokens, cost_usd)`` from Gemini CLI's ``-o json`` envelope, summed over every model.
+
+    Per served model (``stats.models.<id>.tokens``): ``prompt`` is the input
+    count with its ``cached`` part inside it, ``candidates`` the output,
+    ``thoughts`` the thinking and ``tool`` the tool-use prompt. Tokens toward
+    ``max_tokens`` are ``prompt + candidates + thoughts + tool`` (``total`` only
+    when none of those is present). The envelope carries no USD, so the cost is
+    :func:`estimate_cost_usd` per served model — input ``prompt − cached +
+    tool``, cached ``cached``, output ``candidates + thoughts`` — and an unpriced
+    model counts $0, named once at WARNING. Without that, ``max_cost_usd`` could
+    never trip on Gemini CLI, which advertises no ``--max-budget-usd``.
+
+    Defensive like :func:`parse_agent_usage`: shape drift yields what parsed and
+    never raises.
+    """
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError, RecursionError) as exc:
+        if stdout:
+            logger.warning("Gemini CLI stdout is not valid JSON (%s: %s) — counting 0 "
+                           "tokens/$0 for this call, so an active budget cap cannot "
+                           "see its spend", type(exc).__name__, exc)
+        else:
+            logger.debug("empty Gemini CLI stdout, no usage to parse — counting 0 tokens/$0")
+        return 0, 0.0
+    stats = data.get("stats") if isinstance(data, dict) else None
+    models = stats.get("models") if isinstance(stats, dict) else None
+    if not isinstance(models, dict):
+        logger.debug("Gemini CLI envelope lists no stats.models — counting 0 tokens/$0")
+        return 0, 0.0
+    tokens, cost = 0, 0.0
+    for model, entry in models.items():
+        counts = entry.get("tokens") if isinstance(entry, dict) else None
+        if not isinstance(counts, dict):
+            continue
+        prompt, candidates, thoughts, tool = (_token_count(counts.get(k))
+                                              for k in _GEMINI_TOKEN_PARTS)
+        cached = _token_count(counts.get("cached"))
+        if any(k in counts for k in _GEMINI_TOKEN_PARTS):
+            tokens += prompt + candidates + thoughts + tool
+        else:
+            tokens += _token_count(counts.get("total"))
+        estimate = estimate_cost_usd(str(model),
+                                     input_tokens=max(0, prompt - cached) + tool,
+                                     cached_input_tokens=min(cached, prompt),
+                                     output_tokens=candidates + thoughts)
+        cost += estimate or 0.0
     return tokens, cost
 
 

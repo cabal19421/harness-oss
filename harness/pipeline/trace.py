@@ -34,8 +34,9 @@ Agent invocation
     * ``backends/api_base.py`` (response path) — **per iteration**: ``ok``,
       ``tokens``, ``cost_usd``, ``issue`` (the classified problem kind, ``""``
       when clean), ``duration_s``.
-    * ``backends/api_base.py`` (HTTP/transport-error path) — ``ok=False``,
-      ``failure_kind``, ``retry_after_s``, ``duration_s``, ``detail``. This is
+    * ``backends/api_base.py`` (error path: an HTTP or transport error, or a
+      malformed provider payload) — ``ok=False``, ``failure_kind``,
+      ``retry_after_s``, ``duration_s``, ``detail``. This is
       the **only** site that emits ``failure_kind``; the agent-cli backend
       signals a non-retryable failure as ``permanent=True`` instead.
     * ``orchestrator.py`` — **one per task**, summarising the whole
@@ -116,8 +117,10 @@ Git / delivery
     ``removed``, ``survivors``, ``kept``, ``detail``) when it removed a nested
     repository the attempt created, one survived it, or its sweep could not
     decide (``ok=false`` unless it only removed).
-    ``push_guard`` — HEAD is no longer the reviewed commit (nor a descendant of
-    it), so the PR was withheld.
+    ``push_guard`` — the review gate withheld the PR: the published branch
+    (``refs/heads/<branch>``) is not (or does not descend from) the reviewed
+    commit, was not that commit when the review froze it, or HEAD no longer is
+    (or descends from) it (``reviewed``, ``head``, ``tip``, ``detail``).
     ``pr`` — a PR was opened or refused.
 
 Fleet

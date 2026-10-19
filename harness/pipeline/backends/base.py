@@ -709,9 +709,14 @@ class OneshotResult:
       gate skips, exactly like every other fail-open branch in the pipeline.
     * ``ran=False`` with ``abstain`` set — the call could not be made, for a
       reason that must NOT read as a skip: the OS refused to exec it (E2BIG,
-      refused identically on every sample), or a call that ran with tools was
-      terminated and its tool processes are still in the worktree it judged.
-      ``detail`` says which; the gate abstains (high risk, human review).
+      refused identically on every sample), a call that ran with tools was
+      terminated and its tool processes are still in the worktree it judged,
+      Gemini CLI's argument parser refused the argv (refused identically on
+      every sample), or agent-cli could not contain a Gemini CLI verifier call
+      (no ``--policy`` advertised, its deny-all policy file or its own directory
+      unavailable, or a ``.env`` file Gemini CLI would load that is not the
+      home directory's own). ``detail`` says which; the gate abstains (high
+      risk, human review).
     * ``ran=False`` with ``usage_limit`` set (and ``abstain``) — the backend's
       usage limit refused the call: ``usage_limit`` is the refusal's own text
       (agent-cli: the CLI's marked refusal, ``_cli_limit_text``), and

@@ -10,9 +10,14 @@ backends share one hardened loop:
 * :func:`classify_invocation_failure` — is an agent failure *permanent* (abort
   now), *transient* (back off and retry), or a *quota window* (wait until the
   subscription window reopens)?
+* :func:`cli_usage_limit_kind` / :func:`cli_reset_seconds` — the same question
+  for the agent CLI's OWN usage-limit refusal (which the backend reads out of
+  the result envelope's structured fields, never out of prose), and when that
+  window reopens, in the zone the CLI names.
 * :func:`backoff_seconds` — a ``60s · 2^(n-1)`` exponential backoff, with
   jitter and support for a server-supplied ``Retry-After``.
-* :func:`quota_wait_seconds` — how long until an exhausted quota window reopens.
+* :func:`quota_wait_seconds` — how long until an exhausted quota window reopens;
+  :func:`quota_budget_covers` — whether the quota-wait budget reaches it at all.
 * :class:`LoopBudget` — a token / cost cap that bounds an overnight run.
 * :func:`estimate_cost_usd` — per-model USD estimate for the API backends, whose
   providers report tokens but never a price.
@@ -29,7 +34,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
@@ -253,7 +258,7 @@ def parse_retry_after(value) -> float | None:
 
 # ── subscription quota windows (the third failure regime) ────────────────────────
 
-# "resets at 3pm" is the operator-facing form; "…|1754150400" is the CLI's
+# "resets at 3pm" is the operator-facing form; "…|1754150400" is a CLI's
 # machine-readable one. Both are best-effort: an unparseable message falls back
 # to `default`, which is why the caller must still bound how many times it waits.
 _QUOTA_EPOCH = re.compile(r"(?:limit\s+reached|resets?(?:\s+at)?)\s*\|\s*(\d{9,13})", re.IGNORECASE)
@@ -267,14 +272,282 @@ _QUOTA_AT = re.compile(
     r"reset\w*[^\n]{0,20}?\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.IGNORECASE)
 _UNIT_SECONDS = {"second": 1.0, "minute": 60.0, "hour": 3600.0}
 
+# ── the agent CLI's own usage-limit refusal ──────────────────────────────────────
+#
+# An agent CLI that reports usage limits in its result envelope (not every CLI
+# does) ends a turn that a usage limit refused with a result envelope it MARKS
+# (``is_error`` true, ``subtype`` success, and ``api_error_status`` 429 — or,
+# on newer CLIs, a typed ``api_error``), whose ``result`` is text the CLI wrote
+# itself: "You've hit your session limit · resets 10:53pm (UTC)". None of the
+# legacy patterns above match that wording; the only marker left in the detail
+# was the envelope's `429`, so a session limit that reopened 37 minutes later
+# was retried as a transient blip until its tasks aborted.
+#
+# These patterns are applied ONLY to that CLI-marked text, which the agent-cli
+# backend reads out of the envelope's structured fields (its ``_cli_limit_text``)
+# and hands over separately — never to the general failure detail, which
+# carries model-written prose ("agent report: …"). Widening ``_QUOTA_WINDOW``
+# instead would let an agent that merely QUOTES the wording park its own task
+# for max_quota_waits × quota_wait_cap_seconds.
+#
+# The CLI's own prefix list (its usage-limit and org-policy prefixes plus the
+# "<Model> requires usage credits" family), matched at the START of the text,
+# as the CLI itself matches it. "You've reached your rate limit" is excluded: an
+# ordinary rate limit stays the transient regime.
+_CLI_LIMIT_PREFIX = re.compile(
+    r"(?:You['’]ve hit your "
+    r"|You['’]ve reached your (?!(?:[\w'’-]+ ){0,2}rate limit)"
+    r"|You['’]re out of (?:usage credits|extra usage)"
+    r"|Your org is out of usage\b"
+    r"|Your seat type doesn['’]t include "
+    r"|Your usage allocation has been disabled by your admin"
+    r"|Your group['’]s usage limit is set to \$0"
+    r"|This service is disabled for your org"
+    r"|[A-Z][\w.-]*(?: [^\u00b7\n]{1,40})? requires usage credits\b)")
+# The names the CLI gives a reopening WINDOW: the five-hour session, the weekly
+# and per-model weekly limits, and its generic "usage limit" / "limit". Hit with
+# no reset stated, these get the bounded default wait; any other limit with no
+# reset needs an operator.
+_CLI_WINDOW_HIT = re.compile(
+    r"You['’]ve (?:hit|reached) your "
+    r"(?:(?:session|weekly|[A-Z][\w.-]*(?: \d+(?:\.\d+)?)?|usage) )?limit\b")
+# Text asking an operator to act — raise a cap, add funds or credits, switch
+# models. Nothing reopens on its own, and harness never switches the pinned model.
+_CLI_OPERATOR_ACTION = re.compile(
+    r"contact your admin|ask your admin|raise it|switch to another model"
+    r"|switch models|/model\b|/usage-credits|add funds",
+    re.IGNORECASE)
+# The CLI's reset clause, in the zone it names: "resets 10:53pm (UTC)" (within
+# 24h: the NEXT occurrence of that time), "resets Oct 20, 3pm
+# (America/New_York)", and "resets Jan 2, 2027, 8pm (UTC)" — a year only when it
+# is not the current one. Anchored on "resets " rather than " · resets", since a
+# spend-cap refusal carries it as "· your session limit resets <T>". The space
+# before am/pm is optional and may be a no-break or narrow no-break space (an
+# ICU that emits U+202F leaves "10:53 PM"), and am/pm may be in either case.
+_CLI_RESET = re.compile(
+    r"\bresets (?:(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?P<day>\d{1,2}), (?:(?P<year>\d{4}), )?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?[ \u00a0\u2009\u202f]?(?P<ampm>[ap]m)\b"
+    r"(?: \((?P<zone>[^()\n]{1,64})\))?",
+    re.IGNORECASE)
+_MONTHS = {name: number for number, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+    start=1)}
+# UTC under the names the CLI (or a zone database) may print — resolved without
+# zoneinfo, which needs tzdata the platform may not have (Windows without the
+# tzdata wheel).
+_UTC_ZONES = frozenset({
+    "utc", "gmt", "z", "uct", "zulu", "universal", "greenwich", "gmt0", "gmt+0",
+    "gmt-0", "etc/utc", "etc/gmt", "etc/uct", "etc/zulu", "etc/universal",
+    "etc/greenwich", "etc/gmt0", "etc/gmt+0", "etc/gmt-0"})
+#: A time-only reset printed up to this long ago is the window that has just
+#: reopened, not that time tomorrow: the CLI prints whole minutes, truncated (a
+#: reset at 10:53:50 prints "10:53pm"), a moment before harness reads them,
+#: from the server's epoch, against a local clock that may run a little fast.
+#: Without the slack, a window seconds from reopening read as a reset nearly
+#: 24h away — past the wait budget, so a stop. The slack looks back across the
+#: named zone's midnight too: "11:59pm" read at 00:01 is the window that
+#: reopened two minutes ago, not tonight's. Misread the other way (a reset
+#: genuinely 23h45m–24h off) it costs a grace wait, after which the same clause
+#: is read with :data:`_CLI_RESET_REPEAT_SLACK_SECONDS`. Kept under 30 minutes
+#: so that a reset 23h30m away still reads as tomorrow.
+_CLI_RESET_SLACK_SECONDS = 900.0
+#: The slack for the SAME time-only clause back after a grace wait the slack
+#: above granted (:func:`cli_reset_slack`). Never zero: read strictly, a window
+#: seconds from reopening — a reset at second :50 first read at :05, or a local
+#: clock a minute or two fast — came back as "that time tomorrow", past the
+#: wait budget, and the task stopped as permanent seconds before the window
+#: reopened. Five minutes still covers the minute the CLI truncates, the grace
+#: waits already spent and a clock a few minutes fast, and each further grace
+#: wait it grants is one of ``max_quota_waits``. A reset genuinely 23h45m–23h55m
+#: off prints a time 5–15 minutes in the past, so its first return reads as
+#: tomorrow; one closer to 24h is read as reopened for a few more grace waits,
+#: until the clause has aged past five minutes or the waits run out.
+_CLI_RESET_REPEAT_SLACK_SECONDS = 300.0
 
-def quota_reset_seconds(detail: str, *, now: float | None = None) -> float | None:
+
+def _cli_zone(name: str | None) -> tzinfo | None:
+    """The tzinfo for the zone the CLI named, or ``None`` when it cannot be had.
+
+    UTC's aliases resolve without :mod:`zoneinfo`. Everything else goes through
+    it, and every failure — an unknown name, a malformed key, no tzdata on the
+    platform, no zoneinfo at all — is ``None``: the caller then reads the time
+    in the local zone, which is the one the CLI formats in unless it was given
+    another (it is harness's child and inherits ``TZ``).
+    """
+    key = (name or "").strip()
+    if not key:
+        return None
+    if key.lower() in _UTC_ZONES:
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo  # stdlib; its tzdata may be absent
+        return ZoneInfo(key)
+    except Exception as exc:   # noqa: BLE001 — a zone we cannot resolve degrades
+        logger.debug("cannot resolve the zone %r the agent CLI named (%s: "
+                     "%s) — reading its reset time in the local zone",
+                     trunc(key, 64), type(exc).__name__, trunc(str(exc), 120))
+        return None
+
+
+def cli_reset_seconds(text: str, *, now: float | None = None,
+                      slack: float = _CLI_RESET_SLACK_SECONDS) -> float | None:
+    """Seconds until the reset the agent CLI states in *text*, or ``None``.
+
+    Reads the CLI's reset clause (see :data:`_CLI_RESET`) in the zone it names.
+    A time-only clause is the NEXT occurrence of that wall time: today while it
+    is ahead — or passed less than *slack* ago (by default
+    :data:`_CLI_RESET_SLACK_SECONDS`), which is a window that has just reopened
+    — and tomorrow otherwise: the CLI's own rule (a past time means tomorrow),
+    applied only past the slack. The slack looks back across the zone's
+    midnight as well: a time still ahead today whose reading YESTERDAY passed
+    less than *slack* ago (a clause printed just before midnight, read just
+    after it) has just reopened too — never that time tonight, nearly a day
+    away. A wall time the zone repeats (the hour a DST
+    change turns back) is its LATER occurrence, in both forms, so a wait read
+    from it is never too short — at worst an hour long, in that hour once a
+    year (:func:`_latest_reading`). A date with no year is in the current year
+    (the CLI prints the year only when it differs). A zone that cannot be
+    resolved, or a platform without tzdata, falls back to the local zone.
+    Never raises and never returns a negative number.
+    """
+    try:
+        match = _CLI_RESET.search(text or "")
+        if match is None:
+            return None
+        hour, minute = int(match["hour"]), int(match["minute"] or 0)
+        if not (1 <= hour <= 12 and 0 <= minute <= 59):
+            return None
+        hour = hour % 12 + (12 if match["ampm"].lower() == "pm" else 0)
+        t0 = time.time() if now is None else float(now)
+        # ``None`` means local time: naive datetimes, whose .timestamp() applies
+        # the local zone's own rules (DST included) without tzdata.
+        zone = _cli_zone(match["zone"])
+        ref = datetime.fromtimestamp(t0, zone)
+        if match["mon"]:
+            year = int(match["year"]) if match["year"] else ref.year
+            when = _latest_reading(datetime(year, _MONTHS[match["mon"].lower()],
+                                            int(match["day"]), hour, minute,
+                                            tzinfo=zone))
+        else:
+            today = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            when = _latest_reading(today)
+            window = max(0.0, float(slack))
+            if when <= t0:
+                # Passed: within the slack, a window that has just reopened;
+                # beyond it, that wall time tomorrow (the CLI prints a time
+                # only for a reset under 24h away).
+                if when > t0 - window:
+                    return 0.0
+                when = _latest_reading(today + timedelta(days=1))
+            elif t0 - window < _latest_reading(today - timedelta(days=1)) <= t0:
+                # Ahead today, but the same wall time YESTERDAY passed within
+                # the slack: printed just before the zone's midnight and read
+                # just after it, it is the window that has just reopened —
+                # the in-day slack above, across the date line.
+                return 0.0
+        return max(0.0, when - t0)
+    except Exception as exc:   # noqa: BLE001 — Feb 30, an out-of-range year: no reset
+        logger.debug("unparseable reset clause in the agent CLI's refusal "
+                     "(%s: %s) — no reset time", type(exc).__name__,
+                     trunc(str(exc), 120))
+        return None
+
+
+def _latest_reading(wall: datetime) -> float:
+    """The LATER instant a wall time names, as an epoch.
+
+    Both folds are read: in the hour a DST change repeats, "1:30am" names two
+    instants an hour apart and this is the second; a time in the gap a change
+    skips (which the CLI never prints) is the instant after the gap. A reset
+    read from it is therefore never early, so a wait is never too short.
+    *wall* may be naive (the local zone) or aware.
+    """
+    return max(wall.replace(fold=0).timestamp(), wall.replace(fold=1).timestamp())
+
+
+def cli_reset_clause(text: str) -> str:
+    """The agent CLI's reset clause in *text* as printed, or ``""``.
+
+    ``"resets 1:11am (UTC)"`` out of "You've hit your session limit · resets
+    1:11am (UTC)". The quota waits compare it across refusals: the same
+    time-only clause back after a grace wait that the slack granted is read
+    with the narrower repeat slack (:func:`cli_reset_slack`).
+    """
+    try:
+        match = _CLI_RESET.search(text or "")
+    except TypeError:
+        return ""
+    return match.group(0) if match else ""
+
+
+def cli_reset_slack(clause: str, reopened_clause: str) -> float | None:
+    """The *slack* to read a refusal's reset with (:func:`cli_reset_seconds`).
+
+    *clause* is the refusal's reset clause (:func:`cli_reset_clause`);
+    *reopened_clause* the clause the last quota wait read as a window that had
+    just reopened (``""`` when it read none so). ``None`` — the default
+    :data:`_CLI_RESET_SLACK_SECONDS` — unless *clause* is that same clause back,
+    which is read with :data:`_CLI_RESET_REPEAT_SLACK_SECONDS`: still "just
+    reopened" while it was printed under five minutes ago, that time tomorrow
+    past it. Never ``0``: a strict re-read stopped a window seconds from
+    reopening as one nearly a day away.
+    """
+    if clause and clause == reopened_clause:
+        return _CLI_RESET_REPEAT_SLACK_SECONDS
+    return None
+
+
+def cli_usage_limit_kind(text: str, *, now: float | None = None) -> FailureKind | None:
+    """The failure regime of the agent CLI's usage-limit refusal *text*.
+
+    *text* must be the CLI's OWN refusal — the ``result`` of an envelope the CLI
+    marked as a usage-limit API error (the agent-cli backend's
+    ``_cli_limit_text``) — never the general failure detail, which carries
+    model-written prose. ``None`` when it does not start with one of the CLI's
+    usage-limit prefixes; the caller then falls back to
+    :func:`classify_invocation_failure`.
+
+    * ``quota-window`` — a reset is stated, so the window reopens on its own
+      (even beside a spend cap: "· your session limit resets <T>" — the cap
+      only blocked overage); or a named window (session / weekly / per-model /
+      the generic names) is hit with no reset and no operator action named, which
+      gets the bounded default wait.
+    * ``permanent`` — everything else the CLI refuses with: spend and usage
+      caps, credits, seat type, org, allocation, a $0 group, "<Model> requires
+      usage credits", "Switch to another model". Only an operator lifts these,
+      and harness never switches the pinned model.
+    """
+    t = (text or "").strip()
+    if not _CLI_LIMIT_PREFIX.match(t):
+        return None
+    kind: FailureKind
+    if cli_reset_seconds(t, now=now) is not None:
+        kind = "quota-window"
+        why = "it states when the window reopens"
+    elif _CLI_WINDOW_HIT.match(t) and not _CLI_OPERATOR_ACTION.search(t):
+        kind = "quota-window"
+        why = "a named window with no reset stated — the bounded default wait applies"
+    else:
+        kind = "permanent"
+        why = ("no reset is stated and only an operator can lift it — retrying or "
+               "waiting cannot succeed")
+    logger.warning("classified the agent CLI's own usage-limit refusal as %s "
+                   "(%s): %s", kind.upper(), why, trunc(redact(t), 200))
+    return kind
+
+
+def quota_reset_seconds(detail: str, *, now: float | None = None,
+                        cli_slack: float | None = None) -> float | None:
     """Seconds until an exhausted quota window reopens, parsed from *detail*.
 
     Returns ``None`` when the message carries no recoverable reset time. Never
-    raises and never returns a negative number. Clock-time forms ("resets at
-    3pm") are interpreted as UTC — best-effort, which is safe because every
-    caller clamps the result to a cap.
+    raises and never returns a negative number. The agent CLI's own clause
+    ("resets 10:53pm (UTC)", "resets Oct 20, 3pm (America/New_York)") is read
+    in the zone it names (:func:`cli_reset_seconds`, with *cli_slack* as its
+    *slack* when given); the older clock-time forms ("resets at 3pm") are
+    interpreted as UTC — best-effort, which is safe because every caller clamps
+    the result to a cap.
     """
     text = detail or ""
     t0 = time.time() if now is None else now
@@ -296,6 +569,10 @@ def quota_reset_seconds(detail: str, *, now: float | None = None) -> float | Non
             if when_dt.tzinfo is None:
                 when_dt = when_dt.replace(tzinfo=timezone.utc)
             return max(0.0, when_dt.timestamp() - t0)
+    cli = (cli_reset_seconds(text, now=t0) if cli_slack is None
+           else cli_reset_seconds(text, now=t0, slack=cli_slack))
+    if cli is not None:
+        return cli
     rel = _QUOTA_IN.search(text)
     if rel:
         return max(0.0, float(rel.group(1)) * _UNIT_SECONDS[rel.group(2).lower()])
@@ -319,18 +596,20 @@ def quota_reset_seconds(detail: str, *, now: float | None = None) -> float | Non
 
 
 def quota_wait_seconds(detail: str, *, default: float = 900.0, cap: float = 18000.0,
-                       grace: float = 30.0, now: float | None = None) -> float:
+                       grace: float = 30.0, now: float | None = None,
+                       cli_slack: float | None = None) -> float:
     """How long to sleep before retrying an exhausted subscription quota window.
 
-    *cap* bounds the wait (0 disables waiting entirely, so an operator can opt
-    back into the old abort-or-backoff behavior); *grace* is added to a parsed
-    reset time so the retry lands just *after* the window reopens rather than
-    exactly on the boundary, where it would fail again and cost another wait.
-    An unparseable message falls back to *default*.
+    *cap* bounds the wait (0 disables waiting entirely: both loops then stop at
+    once, treating the window as permanent — it is not retried on the transient
+    ladder); *grace* is added to a parsed reset time so the retry lands just
+    *after* the window reopens rather than exactly on the boundary, where it
+    would fail again and cost another wait. An unparseable message falls back
+    to *default*. *cli_slack* is handed to :func:`quota_reset_seconds`.
     """
     if cap <= 0:
         return 0.0
-    reset = quota_reset_seconds(detail, now=now)
+    reset = quota_reset_seconds(detail, now=now, cli_slack=cli_slack)
     if reset is None:
         logger.info("quota window exhausted but no reset time found in the error "
                     "text — waiting the default %.0fs before retrying", default)
@@ -340,6 +619,27 @@ def quota_wait_seconds(detail: str, *, default: float = 900.0, cap: float = 1800
         logger.info("quota window reopens in ~%.0fs — waiting %.0fs (reset + %.0fs grace)",
                     reset, min(cap, wait), grace)
     return max(0.0, min(cap, wait))
+
+
+def quota_budget_covers(text: str, *, cap: float, waits: int,
+                        now: float | None = None) -> bool:
+    """Whether *waits* quota waits of at most *cap* seconds reach the reset *text* states.
+
+    True only for a stated reset (:func:`quota_reset_seconds`) no further off
+    than ``cap × waits`` — a window that reopens on its own inside the
+    quota-wait budget, the refusals the implement loop waits out instead of
+    failing. False when waiting is disabled (*cap* 0), no wait is allowed, or
+    no reset is stated: unknown is never a proof that a window reopens in time.
+    Never raises.
+    """
+    try:
+        cap_s, count = float(cap), int(waits)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (cap_s > 0 and count > 0) or not isinstance(text, str):
+        return False
+    reset = quota_reset_seconds(text, now=now)
+    return reset is not None and reset <= cap_s * count
 
 
 def wait_out_quota_window(seconds: float, *, beat=None, slice_seconds: float = 300.0) -> bool:
@@ -496,9 +796,10 @@ class LoopBudget:
     def remaining_cost(self) -> float | None:
         """USD left before the cost cap trips, or ``None`` when uncapped.
 
-        Handed to the agent CLI as a per-invocation cap, so the bound survives
-        the one failure mode this class cannot see: ``parse_agent_usage``
-        returning silent zeros when the CLI's JSON shape drifts.
+        Handed to the agent CLI as a per-invocation cap when it advertises one,
+        so the bound survives the one failure mode this class cannot see:
+        ``parse_agent_usage`` returning silent zeros when the CLI's JSON shape
+        drifts.
         """
         if self.max_cost_usd is None:
             return None
@@ -514,11 +815,10 @@ class LoopBudget:
 #
 # WHY THIS EXISTS: an agent CLI's JSON envelope can report `total_cost_usd`
 # directly, so the agent-cli backend feeds a real number to
-# `LoopBudget.add(cost_usd=…)`.
-# The chat-completion APIs report TOKENS ONLY and never a price — so without a
-# rate table `max_cost_usd` was wired up, printed in the startup log, and could
-# never trip on the openai/gemini paths. A documented cap that silently does
-# nothing is worse than no cap at all.
+# `LoopBudget.add(cost_usd=…)`. The chat-completion APIs report TOKENS ONLY and
+# never a price — so without a rate table `max_cost_usd` was wired up, printed
+# in the startup log, and could never trip on the openai/gemini paths. A
+# documented cap that silently does nothing is worse than no cap at all.
 #
 # These are ESTIMATES. Prefix-matched longest-first, so dated snapshots
 # ("gpt-4.1-2025-04-14") inherit their family's rate. Providers reprice without
@@ -682,7 +982,7 @@ def _denial_entries(stdout: str) -> list:
 def parse_permission_denials(stdout: str) -> list[str]:
     """Tool names the CLI refused to run, from ``permission_denials`` in its JSON.
 
-    In non-interactive JSON mode the agent CLI reports every tool call blocked
+    In non-interactive JSON mode some agent CLIs report every tool call blocked
     by the allow rules as ``{"tool_name": …, "reason": …}``. A denial is
     **deterministic** — the same allow list refuses the same tool on every
     attempt — so the caller must classify it as permanent instead of burning

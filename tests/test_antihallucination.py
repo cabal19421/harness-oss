@@ -8,6 +8,7 @@ isn't blaming a dependency without evidence.
 """
 from __future__ import annotations
 
+import functools
 import subprocess
 from pathlib import Path
 
@@ -183,10 +184,10 @@ def test_verifier_confidence_percentage_form():
     assert abs((r.confidence or 0) - 0.8) < 1e-9
 
 
-# ── BUG 4: truncation must never be mistakable for absence ────────────────────
-# tx-source-resolve was FAILED 2-0 at confidence 0.76 with reason 1 "The diff
+# ── truncation must never be mistakable for absence ───────────────────────────
+# A pipeline task was FAILED 2-0 at confidence 0.76 with reason 1 "The diff
 # contains exactly one file stanza … No test file is present." —
-# tests/test_gcp_sources.py WAS on the branch, added by the same commit 67ed096.
+# tests/test_gcp_sources.py WAS on the branch, added by the very same commit.
 # The judge's own reason 2 admitted the diff was truncated. diff_text clips
 # GLOBALLY over chunks appended committed→uncommitted→untracked, so trailing
 # files vanish entirely, and the prompt told the judge to answer "not shown"
@@ -424,8 +425,8 @@ def test_review_verifier_pass_is_clean(tmp_path):
 
 
 def test_review_gate_hands_the_verifier_a_manifest_of_every_changed_file(tmp_path):
-    """WIRING (BUG 4): review must pass the manifest, not just build one. Asserted
-    against the real prompt the judge receives."""
+    """WIRING: review must pass the manifest, not just build one. Asserted against
+    the real prompt the judge receives."""
     ctx = _ctx(tmp_path, {"app.py": "x = 1\n",
                           "lib/helper.py": "y = 2\n",
                           "tests/test_app.py": "assert True\n"})
@@ -525,7 +526,7 @@ def test_verifier_report_defaults_are_safe():
     assert r.verdict == "skip" and r.ok and not r.blocking and r.feedback() == ""
 
 
-# ── security batch 1 regressions ─────────────────────────────────────────────────
+# ── security regressions ─────────────────────────────────────────────────────────
 
 
 def test_verifier_template_echo_does_not_flip_fail_to_pass():
@@ -662,6 +663,16 @@ def _fake_agent_cli(monkeypatch, *, help_text: str, stdout: str = "{}", rc: int 
 
     monkeypatch.setattr(ac.shutil, "which", lambda _n: "/usr/bin/gemini")
     monkeypatch.setattr(ac, "_CLI_HELP_CACHE", {"gemini": help_text})
+    # Pin the version as well. Under a hard floor pinned for the agent CLI,
+    # availability fails CLOSED on a version that cannot be verified, so a fake
+    # states one (the recommended floor, when one is pinned) — and gets a probe
+    # cache of its own: nothing real runs, and nothing leaks into or out of the
+    # process-wide cache (this host's own CLI, or none, decides nothing).
+    from harness import config
+    monkeypatch.setattr(config, "tool_version",
+                        functools.cache(config.tool_version.__wrapped__))
+    monkeypatch.setattr(config, "_probe_version_text",
+                        lambda _name, _cli: config.TOOL_MIN_VERSIONS.get("agent", "1.0.0"))
     # Swap the module's own `subprocess` reference, not the real module — other
     # harness code (gitutil) runs real commands through subprocess.run.
     monkeypatch.setattr(ac, "subprocess", types.SimpleNamespace(
@@ -721,7 +732,7 @@ def test_verifier_oneshot_read_write_path_keeps_the_allow_list(tmp_path, monkeyp
     assert "--tools" not in cmd
 
 
-# ── structured verdicts (A20): no prose regex, and drift must not fail open ──────
+# ── structured verdicts: no prose regex, and drift must not fail open ────────────
 
 
 def test_ask_oneshot_structured_sends_the_schema_and_reads_structured_output(
@@ -775,7 +786,7 @@ def test_verifier_uses_the_structured_verdict_without_any_prose(tmp_path):
 
 
 def test_verifier_schema_drift_blocks_instead_of_failing_open():
-    """The A20 tightening: an answer that RAN under an enforced schema and did not
+    """Drift fails closed: an answer that RAN under an enforced schema and did not
     conform is the gate's own contract breaking — failing open would delete the
     verifier exactly when drift broke it."""
     from harness.pipeline.backends.base import OneshotResult
@@ -836,7 +847,7 @@ def test_review_gate_blocks_on_verifier_contract_drift(tmp_path):
     assert not res.passed and res.risk == "high"
 
 
-# ── adversarial review follow-up: the MANIFEST has its own cap ─────────────────
+# ── the MANIFEST has its own cap ───────────────────────────────────────────────
 
 def test_clipped_manifest_is_not_advertised_as_complete():
     """The manifest is what makes a truncated diff safe to judge — so presenting a

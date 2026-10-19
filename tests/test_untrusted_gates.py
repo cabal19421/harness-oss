@@ -294,7 +294,7 @@ def test_a_trivially_green_design_command_cannot_hide_a_red_operator_leg(tmp_pat
     assert report.legs[1].status == LEG_PASSED, "the design's green no-op did run"
 
 
-# ── F1: a design leg cannot stand in for an operator leg that never ran ─────────
+# ── a design leg cannot stand in for an operator leg that never ran ─────────────
 #
 # `ValidationReport.ok` excuses a leg that could not run and passes as soon as
 # ANY leg ran green. Under --untrusted that pair of rules composes into a hole:
@@ -337,7 +337,7 @@ def test_a_required_leg_that_found_defects_is_still_the_agents_failure():
 def test_a_green_design_leg_cannot_rescue_an_operator_suite_that_never_ran(tmp_path,
                                                                           monkeypatch,
                                                                           caplog):
-    """The reported repro, end to end through the runner."""
+    """The hole above, end to end through the runner."""
     caplog.set_level(logging.ERROR, logger="harness.pipeline.backends.base")
     _pytest_on_path(monkeypatch)
     repo = _init_repo(tmp_path / "repo")          # a worktree with no .venv of its own
@@ -376,7 +376,7 @@ def test_the_agent_is_told_a_required_check_never_ran_not_that_nothing_ran():
     assert "NONE of the validation commands" not in feedback
 
 
-# ── F2: a blank command is not an oracle leg ───────────────────────────────────
+# ── a blank command is not an oracle leg ───────────────────────────────────────
 
 
 def test_dedup_commands_drops_blanks_and_repeats():
@@ -405,7 +405,7 @@ def test_a_blank_command_is_dropped_from_both_sides_of_the_union():
     assert rejected == []
 
 
-# ── F3: the PR attests the oracle that RAN ─────────────────────────────────────
+# ── the PR attests the oracle that RAN ─────────────────────────────────────────
 
 
 def test_the_pr_body_attests_the_oracle_that_ran_not_the_declared_list(tmp_path):
@@ -459,7 +459,7 @@ def test_the_pr_body_still_defaults_to_the_declared_list(tmp_path):
     assert f"- `{SMOKE}`" in body
 
 
-# ── F7: the operator's oracle is resolved once per context ─────────────────────
+# ── the operator's oracle is resolved once per context ─────────────────────────
 
 
 def _count_default_validation(monkeypatch) -> list[int]:

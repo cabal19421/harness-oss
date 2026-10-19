@@ -18,6 +18,7 @@ Three families of test live here:
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -147,8 +148,14 @@ def test_already_exists_is_case_insensitive_and_adopts_open_pr(gh, tmp_path):
                                    "<!-- harness:task=t1 risk=low head=cafe1234beef -->\n")
     assert res.ok and res.url == "https://github.com/o/r/pull/3"
     assert "already exists" in res.detail.lower()
-    assert gh.argv_for("pr", "edit")[:4] == ["gh", "pr", "edit",
-                                             "https://github.com/o/r/pull/3"]
+    # …through a body-only REST PATCH at the PR's own host, never `gh pr edit`
+    # (its lookup needs read:org; see tests/test_pr_refresh.py).
+    patch = gh.argv_for("api")
+    assert patch == ["gh", "api", "--hostname", "github.com", "--method", "PATCH",
+                     "repos/o/r/pulls/3", "--input", "-", "--silent"]
+    assert json.loads(gh.stdin[gh.calls.index(patch)]) == {
+        "body": "## body\n- `a.py`\n<!-- harness:task=t1 risk=low head=cafe1234beef -->\n"}
+    assert not gh.argv_for("pr", "edit")
 
 
 def test_identical_head_and_base_error_is_not_mistaken_for_a_duplicate(gh, tmp_path):
@@ -294,21 +301,26 @@ def test_version_parser_handles_all_three_cli_shapes():
     from harness.config import _parse_version
 
     assert _parse_version("gh version 2.97.0 (2026-07-31)\nhttps://…") == (2, 97, 0)
-    assert _parse_version("2.1.214 (dev build)") == (2, 1, 214)
+    assert _parse_version("0.8.2 (dev build)") == (0, 8, 2)
     assert _parse_version("go version go1.26.5 linux/amd64") == (1, 26, 5)
     assert _parse_version("no digits here") is None
 
 
 def test_go_floor_knows_about_both_live_release_branches():
-    """1.26.0 is NEWER than 1.25.10 yet misses the backports — a single `>=`
-    against one floor would green-light it."""
+    """1.27.0 is NEWER than 1.26.9 yet misses the GO-2026-6601/6602 fix — a
+    single `>=` against one floor would green-light it — and 1.25 is
+    end-of-life: never fixed, so no 1.25.x passes."""
     from harness.config import _meets_floor
 
-    assert _meets_floor("go", (1, 25, 10))
-    assert not _meets_floor("go", (1, 25, 9))
-    assert not _meets_floor("go", (1, 26, 0))
-    assert _meets_floor("go", (1, 26, 3))
-    assert _meets_floor("go", (1, 27, 0))
+    assert _meets_floor("go", (1, 26, 9))
+    assert not _meets_floor("go", (1, 26, 8))
+    assert not _meets_floor("go", (1, 26, 3))
+    assert not _meets_floor("go", (1, 27, 0))
+    assert not _meets_floor("go", (1, 27, 1))
+    assert _meets_floor("go", (1, 27, 2))
+    assert _meets_floor("go", (1, 28, 0))
+    assert not _meets_floor("go", (1, 25, 10))
+    assert not _meets_floor("go", (1, 25, 14))
     assert not _meets_floor("go", (1, 24, 12))
 
 
@@ -328,16 +340,16 @@ def test_a_cli_below_an_injected_hard_floor_blocks_the_backend(monkeypatch):
     from harness import config
     from harness.pipeline.backends.agent_cli import AgentCliBackend
 
-    monkeypatch.setitem(config.TOOL_MIN_VERSIONS, "agent", "2.1.214")
-    monkeypatch.setitem(config.TOOL_HARD_MIN_VERSIONS, "agent", "2.1.163")
-    _fake_version(monkeypatch, "agent", "2.1.100 (dev build)")
+    monkeypatch.setitem(config.TOOL_MIN_VERSIONS, "agent", "0.9.0")
+    monkeypatch.setitem(config.TOOL_HARD_MIN_VERSIONS, "agent", "0.5.0")
+    _fake_version(monkeypatch, "agent", "0.4.2 (dev build)")
     try:
         info = config.tool_version("agent", cli="gemini")
         assert info.blocked and not info.ok
-        assert "2.1.100" in info.detail and "2.1.163" in info.detail
+        assert "0.4.2" in info.detail and "0.5.0" in info.detail
         ok, reason = AgentCliBackend().available()
         assert not ok
-        assert "2.1.100" in reason and "worktree" in reason.lower()
+        assert "0.4.2" in reason and "worktree" in reason.lower()
     finally:
         config.tool_version.cache_clear()
 
@@ -346,9 +358,9 @@ def test_a_cli_between_the_floors_only_warns(monkeypatch):
     from harness import config
     from harness.pipeline.backends.agent_cli import AgentCliBackend
 
-    monkeypatch.setitem(config.TOOL_MIN_VERSIONS, "agent", "2.1.214")
-    monkeypatch.setitem(config.TOOL_HARD_MIN_VERSIONS, "agent", "2.1.163")
-    _fake_version(monkeypatch, "agent", "2.1.170 (dev build)")
+    monkeypatch.setitem(config.TOOL_MIN_VERSIONS, "agent", "0.9.0")
+    monkeypatch.setitem(config.TOOL_HARD_MIN_VERSIONS, "agent", "0.5.0")
+    _fake_version(monkeypatch, "agent", "0.7.3 (dev build)")
     try:
         info = config.tool_version("agent", cli="gemini")
         assert not info.ok and not info.blocked
@@ -392,7 +404,7 @@ def test_status_prints_the_detected_vs_required_pair(monkeypatch, capsys):
         config.tool_version.cache_clear()
     out = capsys.readouterr().out
     assert "2.40.0 (require >= 2.97.0)" in out          # installed, too old
-    assert "1.26.9 (require >= 1.25.10)" in out         # installed, fine
+    assert "1.26.9 (require >= 1.26.9 / 1.27.2)" in out  # installed, fine: both branches
 
 
 def test_the_outdated_warning_is_emitted_once_per_process(monkeypatch, caplog):

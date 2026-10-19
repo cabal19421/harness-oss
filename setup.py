@@ -34,7 +34,7 @@ setup(
         # 'guard_exclusivity' constraint kinds (the builtin solver abstains on
         # both). Not a speed-up — a capability. See INSTALL.md.
         #
-        # Deliberately UNCAPPED. Tested range: 4.12 … 5.1.0.0. The 4.x→5.x major
+        # Deliberately UNCAPPED. Tested range: 4.12 … 5.3.1.0. The 4.x→5.x major
         # bump broke nothing this package uses (Int/Real/RealVal/BoolVal/And/Or/
         # Not/Solver/add/check/assertions/sat/unsat all predate 4.12; 5.0.0's one
         # documented break is Java-only), and `Z3Solver.__init__` now probes those
@@ -44,7 +44,8 @@ setup(
         "z3": ["z3-solver>=4.12"],
         # Process reclamation inside a worktree (procutil.py). Optional ONLY on
         # Linux, where there is a /proc fallback — on macOS and Windows psutil is
-        # the sole implementation and the fallback is a no-op, so unattended runs
+        # the sole implementation: without it nothing can scan, so worktree
+        # removal and reset fail closed (`unverified-scan`), and unattended runs
         # there want this extra. Floor 7.1.3: 7.1.0 fixed the Process.cwd()
         # FileNotFoundError race on the exact path procutil walks (#2514/#2515),
         # and 7.1.2/7.1.3 fixed C-extension crashes — a SIGSEGV would blow
@@ -68,7 +69,8 @@ setup(
             # Capped. mypy 2.0 turned `local_partial_types` and `strict_bytes` ON
             # by default and rejects `--python-version 3.9` outright; the cap is
             # what stops a 3.0 doing the same again silently. mypy.ini pins every
-            # flipped default explicitly so 1.x and 2.x agree on this codebase.
+            # flipped default explicitly — including `native_parser`, which 2.4
+            # flipped ON inside the cap — so 1.x and 2.x agree on this codebase.
             "mypy>=2.0,<3",
             "ruff>=0.1",
             "pre-commit>=3.0",

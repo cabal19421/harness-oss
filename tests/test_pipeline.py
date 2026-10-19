@@ -32,8 +32,27 @@ from harness.pipeline.spec import PipelineConfig as _Cfg  # noqa: F401
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
+# The fixtures' own git calls, pinned against the global/system config of
+# whoever runs the suite. The hostile-config gate (GIT_CONFIG_GLOBAL and
+# GIT_CONFIG_SYSTEM at core.ignoreStat=true, status.showUntrackedFiles=no, …)
+# proves HARNESS's own calls survive such a config; it must not rewrite the
+# repos the tests build. Unpinned, core.ignoreStat=true made every entry these
+# helpers' `git add`/`git commit` wrote assume-unchanged — a test's later edits
+# vanished from `git status` and `commit -a`, and harness rightly refused trees
+# whose index hid paths — and showUntrackedFiles=no hid the untracked files a
+# test reads back. Only the fixtures are pinned: harness's calls still face the
+# run's config. (diff.external has no `-c` off-switch; no call here asks
+# `git diff` for a patch.)
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never")
+
+
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
+                          capture_output=True, text=True, check=False)
 
 
 def _init_repo(path: Path) -> Path:
@@ -682,7 +701,7 @@ def test_orchestrator_blocks_nothing_when_no_designs(tmp_path):
 # ── regression tests for the adversarial-review findings ────────────────────────
 
 
-def test_subheadings_under_tasks_keep_items(tmp_path):  # finding [7]
+def test_subheadings_under_tasks_keep_items(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     _write_design(repo, "phased.md", """# Phased
 ## Tasks
@@ -697,14 +716,14 @@ def test_subheadings_under_tasks_keep_items(tmp_path):  # finding [7]
     assert {t.id for t in plan.tasks} == {"a", "b"}     # sub-headings don't drop items
 
 
-def test_all_checked_checklist_yields_no_tasks(tmp_path):  # finding [17]
+def test_all_checked_checklist_yields_no_tasks(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     _write_design(repo, "done.md", "# Done\n## Tasks\n- [x] a\n- [x] b\n")
     plan = plan_from_designs(repo, repo / "designs")
     assert plan.tasks == []                              # no spurious whole-doc task
 
 
-def test_cross_doc_ids_are_folder_aware(tmp_path):  # finding [6]
+def test_cross_doc_ids_are_folder_aware(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     (repo / "designs" / "a").mkdir(parents=True)
     (repo / "designs" / "b").mkdir(parents=True)
@@ -715,14 +734,14 @@ def test_cross_doc_ids_are_folder_aware(tmp_path):  # finding [6]
     assert len({t.id for t in plan.tasks}) == 2          # distinct, folder-aware ids
 
 
-def test_validation_fence_tolerates_info_string(tmp_path):  # finding [16]
+def test_validation_fence_tolerates_info_string(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     _write_design(repo, "v.md", "# V\n## Tasks\n- [ ] x\n## Validation\n```bash \npytest -q\n```\n")
     plan = plan_from_designs(repo, repo / "designs")
     assert plan.tasks[0].validation == ["pytest -q"]
 
 
-def test_code_block_variants_and_dedent(tmp_path):  # findings [13][14]
+def test_code_block_variants_and_dedent(tmp_path):
     gate = GroundingGate(tmp_path)
     # info-string after the language is still grounded
     assert gate.check_design("```python title=foo.py\nimport os\nos.getcwd()\n```").files_checked == 1
@@ -732,7 +751,7 @@ def test_code_block_variants_and_dedent(tmp_path):  # findings [13][14]
     assert gate.check_design("- a list item:\n\n  ```python\n  import os\n  os.getcwd()\n  ```\n").ok
 
 
-def test_worktree_registration_is_exact(tmp_path):  # finding [4]
+def test_worktree_registration_is_exact(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     wm = WorktreeManager(repo, tmp_path / "wt", base_branch="main")
     wm.ensure("10")                                     # registers .../wt-10
@@ -740,7 +759,7 @@ def test_worktree_registration_is_exact(tmp_path):  # finding [4]
     assert not wm._is_registered(wm.path_for("1"))
 
 
-def test_base_ref_pins_sha_on_detached_head(tmp_path):  # finding [3]
+def test_base_ref_pins_sha_on_detached_head(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     (repo / "x").write_text("1")
     _git(["add", "-A"], repo)
@@ -752,7 +771,7 @@ def test_base_ref_pins_sha_on_detached_head(tmp_path):  # finding [3]
     assert ref != "HEAD" and ref.startswith(first[:8])  # a concrete SHA, never "HEAD"
 
 
-def test_complete_guard_rejects_terminal_states(tmp_path):  # finding [26]
+def test_complete_guard_rejects_terminal_states(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     _write_design(repo, "f.md", "# F\n## Tasks\n- [ ] a (id: a)\n")
     cfg = PipelineConfig(repo=repo, designs_dir="designs", worktree_root=tmp_path / "wt")
@@ -765,7 +784,7 @@ def test_complete_guard_rejects_terminal_states(tmp_path):  # finding [26]
     assert run.status == "done" and "nothing to do" in run.detail   # not demoted
 
 
-def test_cycle_detection(tmp_path):  # finding [8]
+def test_cycle_detection(tmp_path):
     from harness.pipeline.orchestrator import _tasks_in_cycles
     cyc = Plan(repo="/r", designs_dir="d")
     cyc.upsert(Task(id="a", title="A", design_doc="d", depends_on=["b"]))
@@ -777,7 +796,7 @@ def test_cycle_detection(tmp_path):  # finding [8]
     assert _tasks_in_cycles(dag) == set()
 
 
-def test_git_missing_binary_does_not_crash(monkeypatch, tmp_path):  # finding [20]
+def test_git_missing_binary_does_not_crash(monkeypatch, tmp_path):
     from harness.pipeline import gitutil
     def _boom(*a, **k):
         raise FileNotFoundError("git")
@@ -879,7 +898,7 @@ def test_seeded_grounding_only_checks_own_delta(tmp_path):
     assert gitutil.changed_files(task.path, base=seed) == ["own.py"]
 
 
-# ── BUG 1: a grown dependency list must actually reach a re-seeded worktree ────
+# ── a grown dependency list must actually reach a re-seeded worktree ───────────
 # _seed_dependencies returned early on `if task.start_ref:` — the mere EXISTENCE
 # of a base from a prior attempt skipped dependency seeding wholesale. start_ref
 # is written on every run (orchestrator.py), and plan() preserves it while
@@ -887,11 +906,11 @@ def test_seeded_grounding_only_checks_own_delta(tmp_path):
 # left later attempts running in a tree that never merged them while the plan and
 # the task prompt both claimed they were present.
 #
-# PROVEN: gx-mutation-contract ran attempt 1 with 3 declared deps and recorded
-# start_ref 60847f4; two more deps were added by amendment; attempts 2 and 3 show
-# depends_on of 5, NO seeding lines in the log, and diff base still 60847f4.
-# `git merge-base --is-ancestor agent/gx-preflight-empty-key
-# agent/gx-mutation-contract` returned NO. The agent abstained twice saying "the
+# PROVEN: a task ran attempt 1 with 3 declared deps and recorded its start_ref;
+# two more deps were added by amendment; attempts 2 and 3 show depends_on of 5,
+# NO seeding lines in the log, and the diff base still attempt 1's start_ref.
+# The ancestry check `git merge-base --is-ancestor agent/<added-dep>
+# agent/<task-id>` returned NO. The agent abstained twice saying "the
 # amendment's declared dependencies are absent from this worktree" — a correct
 # diagnosis the operator overrode, wasting two design cycles.
 
@@ -942,7 +961,7 @@ def test_dependency_added_between_attempts_is_actually_merged(tmp_path):
 
 def test_reseed_is_a_noop_when_no_dependency_changed(tmp_path, caplog):
     """The optimisation the old guard existed for must survive, now keyed on real
-    ancestry. Fails if someone 'fixes' BUG 1 by re-merging unconditionally."""
+    ancestry. Fails if someone 'fixes' the bug by re-merging unconditionally."""
     orch, plan, task, wt = _seed_fixture(tmp_path, ("dep-a",))
     first = orch._seed_dependencies(task, wt, plan)
     task.start_ref = first
@@ -1035,7 +1054,7 @@ def test_reseed_tolerates_a_deleted_dependency_branch(tmp_path, caplog):
 
 
 def test_seed_uses_the_dep_records_branch_field(tmp_path):
-    """PROVEN (gcp-policy-grounding, 2026-08-09): a done dep whose record carried
+    """PROVEN in production: a done dep whose record carried
     branch='agent/gx-operator-register-open' was silently skipped because seeding
     derived `agent/<task-id>` by convention and that branch did not exist — the
     dependent's worktree never got the dep's work and the agent re-hit the exact
@@ -1140,14 +1159,14 @@ def test_dependency_completed_after_the_first_seed_is_seeded_later(tmp_path):
         "a dependency that completed after the first seed was never seeded"
 
 
-# ── BUG 5: terminal statuses need a supported requeue path ────────────────────
+# ── terminal statuses need a supported requeue path ───────────────────────────
 # _select_tasks unions plan.ready() (pending-only) with
 # by_status("implementing","review","failed"). 'awaiting-human' (set by an
 # abstention) and 'blocked' (attempt budget exhausted) are in NEITHER set, so no
 # run ever picks them up again — the orchestrator even logs "reset status/attempts
 # by hand to retry". `pipeline complete` is not a requeue: it goes straight to
-# review and can mark a task done WITHOUT the work being performed. Two tasks this
-# session required hand-editing .harness/pipeline.json.
+# review and can mark a task done WITHOUT the work being performed. Retrying such
+# a task meant hand-editing .harness/pipeline.json.
 
 
 def _requeue_orch(tmp_path, tasks, **cfg_kw):
@@ -1355,13 +1374,13 @@ def test_review_and_implementing_resumes_are_not_dependency_gated(tmp_path):
     assert "r" in picked and "i" in picked
 
 
-# ── BUG 4: a manifest the diff truncation cannot reach ────────────────────────
+# ── a manifest the diff truncation cannot reach ───────────────────────────────
 
 
 def test_diff_manifest_lists_every_file_that_diff_text_truncates_away(tmp_path):
     """diff_text clips GLOBALLY over concatenated chunks, so trailing files vanish
     entirely — which is how a test file added by the same commit went unshown and a
-    verifier concluded it was missing (tx-source-resolve, failed 2-0)."""
+    verifier concluded it was missing (failed 2-0)."""
     from harness.pipeline import gitutil
 
     repo = _init_repo(tmp_path / "repo")
@@ -1484,11 +1503,11 @@ def test_save_merged_is_concurrent_safe(tmp_path):
 def test_save_merged_stale_owned_row_does_not_regress_newer_on_disk(tmp_path):
     """Two runs both *own* the same task; the loser must not clobber the winner.
 
-    Observed 2026-08-09 on the gcp-policy-grounding plan: run A attempted T early
-    (ended awaiting-human at t1); run B, concurrent on the same plan, completed T
-    (done at t2 > t1). Run A's *final* save_merged upserted its stale in-memory
-    row unconditionally, regressing done -> awaiting-human. Per-task
-    last-write-wins by updated_at keeps B's strictly newer on-disk row.
+    Observed in production: run A attempted T early (ended awaiting-human at t1);
+    run B, concurrent on the same plan, completed T (done at t2 > t1). Run A's
+    *final* save_merged upserted its stale in-memory row unconditionally,
+    regressing done -> awaiting-human. Per-task last-write-wins by updated_at
+    keeps B's strictly newer on-disk row.
     """
     from harness.pipeline import store
     repo = _init_repo(tmp_path / "repo")

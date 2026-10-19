@@ -380,11 +380,13 @@ class RunLog:
         """Stamp ``heartbeat.json`` with where this run currently is.
 
         ``status`` is free text for the reader's benefit (liveness is decided
-        from the *task's* status plus the pid identity, never from this field):
+        from the *task's* status plus the pid identity, not from this field):
         ``implementing`` / ``review`` while working, then one of ``done``,
         ``failed``, ``awaiting-human``, or ``aborted`` — the last meaning
         somebody stopped the run with a signal rather than the loop giving up
-        (see :mod:`harness.pipeline.shutdown`).
+        (see :mod:`harness.pipeline.shutdown`). The one value liveness reads is
+        ``parked`` (``supervisor.PARKED``): a run that left a task at ``review``
+        and exited cleanly, so recovery does not take it for a crash.
         """
         self._ensure_dir()
         pid = pid if pid is not None else os.getpid()

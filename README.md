@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 ![Grounding](https://img.shields.io/badge/grounding-Python%20%2B%20Go-blueviolet)
-![Tests](https://img.shields.io/badge/tests-1160%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-2361%20passing-brightgreen)
 
 ---
 
@@ -41,7 +41,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 - 🛡️ **Safe on untrusted input** — design text is scrubbed of secrets + prompt-injection before it reaches a backend; `--untrusted` allowlist-filters a design's `(validate:)` commands *below* the executable (multiplexer subcommands, output-redirecting flags, and the `NAME=value` env prefix each get their own allowlist), adds what survives to the operator's oracle instead of substituting for it, and drops the branch's own agent config; validation runs shell-free where it can; re-pushes use `--force-with-lease`, never a blind force.
 - 🔒 **Bound to the reviewed commit** — the risk level a PR carries only means something if the pushed tree earned it. The review freezes one SHA, and immediately before the push (under the repo git lock) a HEAD that no longer is — or descends from — that SHA withholds the PR and records a `push_guard` span. On GitHub, `gh auth` is checked *before* the push and an existing PR is adopted only when its head ref matches and it is not cross-repository — and counts as done only once its body has been re-published for the reviewed head, which harness does only over a body that is this task's own and unedited since.
 - 🖥️ **Two front-ends** — Editor-first **VSCodium tasks** (the default), *or* a **tmux cockpit** (`harness pipeline tmux`) that runs several features simultaneously, one per window, with a live dashboard.
-- 🔌 **Provider-agnostic backends** — the only model-coupled piece. `ide-handoff`, `agent-cli`, **`openai` (ChatGPT)**, and **`gemini`** ship in-tree (`agent-cli` drives an external agentic CLI — `gemini` by default; register a drop-in built on `AgentCliBackend(cli="<binary>")` to drive another — probing its `--help` and withholding the optional flags a CLI doesn't advertise; the API backends are direct, stdlib-HTTP, no SDK; truncated replies and refusals are detected from `finish_reason`/`refusal` and re-prompted rather than written to disk). Register your own (OpenCode, aider, an Azure endpoint, …) with one call. The grounding + test gate judges every backend identically. Risk level (low/medium/high) is **advisory routing metadata for review** — harness never auto-merges on it.
+- 🔌 **Provider-agnostic backends** — the only model-coupled piece. `ide-handoff`, `agent-cli`, **`openai` (ChatGPT)**, and **`gemini`** ship in-tree (`agent-cli` drives an external agentic CLI — `gemini` by default; register a drop-in built on `AgentCliBackend(cli="<binary>")` to drive another — probing its `--help` and withholding the optional flags a CLI doesn't advertise, a pinned `--model` excepted; the API backends are direct, stdlib-HTTP, no SDK; truncated replies and refusals are detected from `finish_reason`/`refusal` and re-prompted rather than written to disk). Register your own (OpenCode, aider, an Azure endpoint, …) with one call. The grounding + test gate judges every backend identically. Risk level (low/medium/high) is **advisory routing metadata for review** — harness never auto-merges on it.
 
 **Anti-hallucination gates (in the pipeline)**
 - 🔎 **Independent verifiers (at least two)** — **fresh-context** second opinions re-read each diff against its task; whenever the gate is on, **≥ 2** independent verifiers vote per implementer. A failed verdict blocks the change; an abstain — including a split vote with no strict majority, or a round in which fewer than two verifiers answered usably — raises its risk to human review. Where the backend can enforce a JSON schema on the answer, the verdict is read from a validated object, and an answer that *ran* but did not conform **blocks** instead of silently skipping.
@@ -56,7 +56,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 **Foundations**
 - 🔍 **Dependency doctor** — `harness status` reports the grounding solver and the constraint kinds it decides, backend availability, every external tool it can use — `git`, `gh`, `tmux`, `agent` (the agent CLI driving the `agent-cli` backend; default binary `gemini`), `go`, `npm` — with its detected-vs-required version, the optional Python extras, and an extensions summary. See **[INSTALL.md](INSTALL.md)**.
 - 📓 **Two observability channels** — an append-only JSONL **span trace** (`.harness/trace.jsonl`, one line per consequential decision) and a **verbose log** (`-v`/`-vv`, `HARNESS_LOG`) whose output is secret-redacted *and* terminal-safe. See **[LOGGING.md](LOGGING.md)**.
-- 🧪 **Tested** — **1160 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
+- 🧪 **Tested** — **2361 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
 
 ---
 
@@ -66,7 +66,7 @@ Stated plainly, because a gate you misunderstand is worse than no gate:
 
 - **It never auto-merges.** Risk (`low`/`medium`/`high`) is triage metadata for a human or an external runner. Every task lands as a PR you merge yourself.
 - **Grounding proves *existence*, not correctness.** It answers "does this symbol/signature exist"; it cannot tell you the change does the right thing. That axis belongs to your test suite and the independent verifiers — which are model calls, and are wrong sometimes.
-- **Gates fail *open* on infrastructure.** A verifier that cannot run, a solver that cannot decide, a `go vet` that isn't applicable — none of these block a PR. The one deliberate exception is a broken *output contract* (a schema-validated verifier answer that didn't conform) and an explicitly-requested capability (`--require-z3`), which fail loudly instead.
+- **Gates fail *open* on infrastructure.** A verifier that cannot run, a solver that cannot decide, a `go vet` that isn't applicable — none of these block a PR. The deliberate exceptions: a broken *output contract* (a schema-validated verifier answer that didn't conform) and an explicitly-requested capability (`--require-z3`) fail loudly instead, and an `agent-cli` verifier refused by a usage limit ends the review with no verdict, so nothing is published until a later review judges the change (see [PIPELINE.md § Usage limits](PIPELINE.md#usage-limits)).
 - **Without z3 you lose findings.** `call_binding` and `guard_exclusivity` abstain to `unverified` on the builtin solver. That is honest, not silent — but it is a smaller check.
 - **The planner is deterministic, not clever.** `designs/*.md` are decomposed by reading markdown structure. A vague design yields a vague task.
 - **Extensions are never executed by harness.** Skills, MCP manifests and automations are discovered and listed. A runtime you control does the running.
@@ -134,7 +134,7 @@ Full deep-dive: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Requirement | Version | Purpose |
 |---|---|---|
 | Python | ≥ 3.10 | Runtime |
-| git | any recent | The design-docs → PRs pipeline (worktrees, branches) |
+| git | any recent; ≥ 2.31 for the submodule hold proof | The design-docs → PRs pipeline (worktrees, branches) |
 | pip | latest | Package installation |
 | Node.js / npm | any recent *(optional)* | JS/TS repos the pipeline validates via an `npm test` oracle |
 
@@ -189,9 +189,9 @@ Backends:
 Dependencies (see INSTALL.md):
   ✔ git — required for the design-docs → PRs pipeline (worktrees, branches)
   ✔ gh — `pipeline --pr github` (open real GitHub PRs) — >= 2.97.0 recommended  2.97.0 (require >= 2.97.0)
-  ✔ tmux — `pipeline tmux` cockpit (watch several features at once)
-  ✔ agent — the agent-cli backend (unattended ralph loop) + the review verifier (default binary: gemini)
-  ✗ go — Go grounding: augments the stdlib set via `go list std` (optional)
+  ✔ tmux — `pipeline tmux` cockpit (watch several features at once) — needs >= 2.1 (exact `=` session targets)
+  ✔ agent — the agent-cli backend (unattended ralph loop) + the review verifier (default binary: gemini) — a hard floor you pin refuses a version below it, or one it cannot verify
+  ✗ go — Go grounding: augments the stdlib set via `go list std` (optional) — >= 1.26.9 / 1.27.2 recommended
   ✔ npm — JS/TS repos the pipeline validates via an `npm test` oracle (optional)
   ✔ z3 — SMT solver: call-binding + guard-exclusivity grounding (optional; those checks abstain without it)
   ✔ psutil — reclaim processes still running inside a worktree before it is removed
@@ -200,10 +200,12 @@ Extensions: 2 skill(s), 1 MCP server(s), 2 automation(s)   (harness extensions)
 ```
 
 The version column is a *pair* on purpose: "installed" and "recent enough to be
-safe" are different states. Every shipped floor is a warning; the same tables
-also support hard minimums (a tool below one makes the dependent feature report
-itself unavailable), and operators can pin floors — soft or hard — for the agent
-CLI they drive (see [INSTALL.md § Why those minimums](INSTALL.md#why-those-minimums)).
+safe" are different states. Every shipped floor is a warning, and none ships for
+the agent CLI. The version tables in `harness/config.py` take hard minimums
+too, and operators can pin floors — soft or hard — for the agent CLI they
+drive: a hard floor makes the `agent-cli` backend report itself unavailable
+when the CLI is below it, or when its version cannot be verified against it
+(see [INSTALL.md § Why those minimums](INSTALL.md#why-those-minimums)).
 
 ---
 
@@ -344,7 +346,7 @@ harness/
 │       ├── notes.py           # Per-task run notes, liveness heartbeat + TaskClaim (flock)
 │       ├── supervisor.py      # Liveness reporting (supervise) + crash recovery
 │       ├── procutil.py        # Terminate processes still inside a worktree before teardown
-│       ├── shutdown.py        # Graceful Ctrl-C/SIGTERM: terminate the detached agent, record the abort
+│       ├── shutdown.py        # Graceful Ctrl-C/SIGTERM/SIGHUP: terminate the detached agent, record the abort
 │       ├── nosleep.py         # Keep the host awake for the run (systemd-inhibit / caffeinate)
 │       ├── sanitize.py        # Scrub untrusted design text (secrets + prompt-injection)
 │       ├── trust.py           # Fail-closed allowlist for design-provided validation commands
@@ -355,7 +357,7 @@ harness/
 │       ├── cockpit.py         # tmux cockpit (run features simultaneously)
 │       ├── orchestrator.py    # Ties ingest→ground→implement→verify→review→PR; recovery + supervise/prune
 │       └── store.py           # Repo-local plan persistence (.harness/pipeline.json) + the run lock
-├── tests/                     # 1160 passing, 1 skipped (pytest; config in pytest.toml)
+├── tests/                     # 2361 passing, 1 skipped (pytest; config in pytest.toml)
 │   ├── conftest.py            # Isolated cwd/data per test
 │   ├── test_grounding.py      test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py   test_grounding_precision.py
@@ -369,7 +371,16 @@ harness/
 │   ├── test_run_entry_guards.py      test_untrusted_gates.py
 │   ├── test_verifier_manifest_guard.py  test_worktree_process_safety.py
 │   ├── test_launch_and_timeout_failures.py  test_markerless_worktrees.py
-│   └── test_pr_refresh.py
+│   ├── test_pr_refresh.py            test_cockpit_targets.py
+│   ├── test_config_version_probe.py  test_diff_integrity.py
+│   ├── test_hidden_index_entries.py  test_mutation_record.py
+│   ├── test_nested_repos.py          test_oracle_honesty.py
+│   ├── test_quota_cli_limits.py      test_relaunch_gate.py
+│   ├── test_repo_location_env.py     test_sanitize_gh_read_path.py
+│   ├── test_shutdown_sighup.py       test_submodule_pointers.py
+│   ├── test_success_exit_leftovers.py  test_trust_runner.py
+│   ├── test_unpopulated_submodules.py  test_validation_runner.py
+│   └── test_validation_shutdown.py   test_verifier_usage_limit.py
 ├── designs/                   # ← drop your design .md files here (pipeline input)
 │   ├── TEMPLATE.md
 │   └── example-pipeline-clean.md
@@ -456,4 +467,4 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture deep-dive |
 | [LOGGING.md](LOGGING.md) | Verbose logs & spans: `-v/-vv`, `HARNESS_LOG`, the span vocabulary, recipes |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
-| [AGENTS.md](AGENTS.md) | The agent context file — contributor gates and constraints; Gemini CLI loads it via `context.fileName` |
+| [AGENTS.md](AGENTS.md) | The agent context file — contributor gates and constraints; Gemini CLI loads it when `context.fileName` in `.gemini/settings.json` names it |

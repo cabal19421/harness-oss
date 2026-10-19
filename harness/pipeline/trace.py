@@ -10,10 +10,13 @@ to ``<repo>/.harness/trace.jsonl``:
      "backend": "agent-cli", "ok": true, "duration_s": 212.4,
      "tokens": 48211, "cost_usd": 0.61, ...}
 
-This module docstring is the **authoritative span vocabulary** — 22 types. Adding
+This module docstring is the **authoritative span vocabulary** — 25 types. Adding
 a span means adding it here first; PIPELINE.md's span table and LOGGING.md both
 point at this list, and a type that exists only in a call site is one no
-documented ``jq`` query or ``--type`` filter will ever find.
+documented ``jq`` query or ``--type`` filter will ever find. A test holds the
+two together (``tests/test_hardening.py``): it reads every ``.span("<type>", …)``
+call under ``harness/`` and fails on a type missing here, on a type listed here
+that nothing emits, and when the count above is out of date.
 
 Run / lifecycle
     ``run_start``, ``run_end`` — one orchestrator run opens / closes (``run_end``
@@ -26,7 +29,8 @@ Agent invocation
     differs by site, so a query must not assume one shape:
 
     * ``backends/agent_cli.py`` — **per iteration**: ``ok``, ``permanent``,
-      ``tokens``, ``cost_usd``, ``duration_s``, ``detail`` (on failure).
+      ``tokens``, ``cost_usd``, ``duration_s``, ``detail`` (on failure, or
+      naming the leftover processes the sweep reclaimed after an exit 0).
     * ``backends/api_base.py`` (response path) — **per iteration**: ``ok``,
       ``tokens``, ``cost_usd``, ``issue`` (the classified problem kind, ``""``
       when clean), ``duration_s``.
@@ -43,31 +47,75 @@ Agent invocation
     (``iteration`` is present on the three per-iteration sites).
 
     ``quota_wait`` — the loop is sleeping out an exhausted subscription quota
-    window (``wait_s``).
-    ``shutdown`` — a Ctrl-C/SIGTERM stopped the loop: the detached agent was
-    terminated and the task left resumable.
+    window (``wait_s``). With ``stage="review"`` it is the orchestrator,
+    waiting before a review the usage limit refused runs again.
+    ``shutdown`` — a Ctrl-C/SIGTERM/SIGHUP stopped the loop (``signal`` names
+    which) and the task was left resumable. ``stage`` says which half of the
+    iteration it cut short: ``agent`` (the agent's turn; the agent-cli backend
+    terminates its detached agent) or ``validation`` (the oracle's validation
+    run was terminated, which is no verdict and is not recorded as a failure).
+    ``worktree_preserved`` says the tree was left as it was, not discarded.
     ``abstain`` — the backend emitted the ``ABSTAIN`` sentinel and handed the
     task to a human.
 
 Gates
-    ``validation`` — the oracle's validation leg verdict.
+    ``validation`` — the oracle's validation leg verdict (``ok``, ``commands``,
+    ``failed``, ``infrastructure``, ``preexisting``, ``stalled``,
+    ``duration_s``). A run a shutdown cut short has NO verdict and carries
+    ``interrupted=true`` with ``ok=null``, so a query for failed validations
+    (``.ok==false``) does not find it. A run in which a command left a process
+    the sweep could not reclaim has no verdict either: ``ok=null``, with
+    ``interrupted=false`` and a ``left_running`` field naming the command and
+    the pids.
     ``validation_infra`` — one validation command was *excused* from the verdict:
     it could not run at all, or was already failing at the diff base.
     ``grounding`` — the grounding gate's verdict on the changed files.
     ``verify`` — the independent-verifier gate (``verdict``, ``confidence``,
     ``votes``, ``agreement``, and ``error`` when the gate's own output contract
-    broke rather than the diff being wrong).
+    broke rather than the diff being wrong). A sample the backend's usage limit
+    refused leaves the gate with NO verdict: ``no_verdict`` says why,
+    ``usage_limit_kind`` gives the regime, and ``verdict`` stays ``abstain``,
+    the fallback for a reader that ignores them.
     ``dep_blame`` — the dependency-blame gate fired.
     ``freeze`` — a frozen acceptance test was modified; review fails outright.
     ``protected_path`` — a dirty path matched a ``protected_paths`` rule
     (``path``, ``rule``), so the catch-all ``git add -A`` was refused and review
-    failed before the oracle ran; nothing staged, committed or reset.
-    ``mutation`` — the mutation gate's score for the change.
-    ``review`` — the review gate's verdict (``passed``, ``risk``, ``files``).
+    failed before the oracle ran; nothing staged, committed or reset. Also
+    emitted, with ``rule`` empty, for the three other refusals at that commit
+    boundary. ``HiddenIndexError``: index flags hiding edits could not be
+    cleared or read; nothing is staged, and ``path`` is the first hidden path,
+    empty when the index was unreadable. ``UnregisteredGitlinkError``: the stage
+    would add a gitlink ``.gitmodules`` does not register; ``git add -A`` had
+    already run, only that gitlink is unstaged again, and ``path`` is the first
+    such gitlink. ``StageFailedError``: ``git add -A`` itself failed; nothing
+    is staged, and ``path`` is empty.
+    ``hidden_index`` — the review cleared index flags (assume-unchanged,
+    skip-worktree) that hid edits from ``git status``, so the commit and every
+    gate after it saw them (``cleared``, ``files``).
+    ``stale_submodules`` — submodule checkouts KNOWN to be left behind the
+    commit their pointer records (the target is not in the clone and nothing
+    may fetch it): validation ran against the stale checkout, the review says
+    so, and a ``low`` risk is raised to ``medium`` (``count``, ``detail``).
+    ``mutation`` — the mutation gate's score for the change (``total``,
+    ``killed``, ``score``, ``survivors``, ``skipped``). When a shutdown cut the
+    mutants' runs short, ``score=null`` and ``skipped`` names the interruption:
+    no verdict.
+    ``review`` — the review gate's verdict (``passed``, ``risk``, ``files``,
+    ``head``, ``reasons``). A review left with no verdict — by a shutdown, a
+    validation run with ``left_running``, or the backend's usage limit — has
+    ``passed=null`` with ``interrupted=true``, plus ``usage_limit_kind`` and
+    ``reopens`` when the usage limit was the cause.
 
 Git / delivery
-    ``git`` — a repo-level git operation worth auditing (today: seeding a
-    dependency's work into a worktree).
+    ``git`` — a repo-level git operation worth auditing. Seeding a dependency's
+    work into a worktree: ``op=seed-merge`` (``dep``, ``outcome``) when a
+    dependency did not merge, or with ``stuck=true`` (``detail``) when its
+    merge could not be aborted and seeding stopped; ``op=submodule-resync``
+    (``paths``) when a submodule checkout could not follow the seed merge. An
+    agent loop's discard: ``op=discard-readback`` (``iteration``, ``ok``,
+    ``removed``, ``survivors``, ``kept``, ``detail``) when it removed a nested
+    repository the attempt created, one survived it, or its sweep could not
+    decide (``ok=false`` unless it only removed).
     ``push_guard`` — HEAD is no longer the reviewed commit (nor a descendant of
     it), so the PR was withheld.
     ``pr`` — a PR was opened or refused.
@@ -91,6 +139,20 @@ Fleet
     (a fresh mtime is the only evidence of a writer whose cwd is outside the
     tree), ``unverified-scan`` (the tree could not be scanned at all, and an
     unprovable scan is never proof of quiet).
+    ``launch_skipped`` — a task was not launched, with ``reason``, ``pids``,
+    ``detail`` and the task's ``status``; the status and the attempt count are
+    left as they were. ``worktree-busy``, ``survivors`` and ``unverified-scan``
+    (the words ``recovery_skipped`` uses) mean its reused worktree may still be
+    written to; that is non-terminal, and a later run checks again.
+    ``mutant-record`` means the mutation gate's record cannot be settled: the
+    file it names holds neither its mutant nor the original (edited since), or
+    still holds that exact mutant where the record cannot apply it (HEAD moved
+    under it, or a tree the record cannot prove its own), or the record, the
+    file or the tree's HEAD cannot be read — so no tree it touched may commit
+    until someone looks, and no later run clears that by itself, so the run
+    reports it as an error. ``usage-limit`` means the quota-wait policy holds
+    back a review the usage limit refused; that is non-terminal, and the task
+    stays at ``review``.
     ``prune`` — a worktree was reclaimed, refused-and-reported, or errored.
 
 Span types are ``snake_case`` without exception: they are jq keys and grep

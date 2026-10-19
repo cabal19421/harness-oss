@@ -4,7 +4,7 @@ Harness has two observability channels that answer different questions:
 
 | Channel | File | Question it answers |
 |---|---|---|
-| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able — 22 documented span types. |
+| **Span traces** (`pipeline/trace.py`) | `.harness/trace.jsonl` | *Morning-after:* what did each gate decide, what did the run cost, why did a task die at 3am? Structured, greppable, `jq`-able — 25 documented span types. |
 | **Verbose logs** (`harness/log.py`) | stderr / `HARNESS_LOG_FILE` | *Right-now:* why did routing pick that agent, what exact git command ran and what did it print, which fallback fired, where did 40 seconds go? |
 
 Spans are the flight recorder; logs are the cockpit voice channel. Every span
@@ -28,9 +28,13 @@ HARNESS_LOG=debug harness …                       # env instead of flags
 HARNESS_LOG=info,harness.grounding=debug harness …  # per-module levels
 HARNESS_LOG_FILE=/tmp/run.log harness pipeline run  # full DEBUG log to a file,
                                                      # independent of console level
+harness --log-file /tmp/run.log pipeline run        # the same, as a flag (either position)
 ```
 
-- Logs go to **stderr**; stdout stays clean for parseable command output.
+- Logs go to **stderr**; stdout stays clean for parseable command output. The
+  exception is `verify --hook`, where stderr is the hook's protocol channel:
+  the hook drops the stderr sink, so `-v`/`-vv` do not show its logs; the
+  file sink (`--log-file` / `HARNESS_LOG_FILE`) still records them.
 - Default console level is **WARNING** — output is unchanged unless you ask.
 - Colour follows the console: honoured `NO_COLOR`, disabled when not a TTY.
 - The file sink always records **DEBUG** with `(file.py:line)` call sites.
@@ -38,9 +42,9 @@ HARNESS_LOG_FILE=/tmp/run.log harness pipeline run  # full DEBUG log to a file,
 ## Reading a line
 
 ```
-18:25:47.509 DEBUG   pipeline.worktree [run-20260711T1825-4711|t3]  ▶ create worktree  branch=agent/t3
-             │       │                 │                            │
-             level   module (harness. prefix dropped)               message
+18:25:47.509 DEBUG   pipeline.worktree [run-20260711T182539-4711|t3]  ▶ create worktree  branch=agent/t3
+             │       │                 │                              │
+             level   module (harness. prefix dropped)                 message
                                       [run-id|task-id] — stamped automatically
                                       inside PipelineOrchestrator workers
 ```
@@ -59,9 +63,9 @@ harness pipeline trace --task t3
 harness pipeline trace --type verify -n 20        # the last 20 verifier verdicts
 
 # Why was a PR withheld even though review passed?
-jq 'select(.type=="push_guard")' .harness/trace.jsonl
+jq 'select(.type=="push_guard" or (.type=="pr" and .ok==false))' .harness/trace.jsonl
 
-# Which validation legs were excused, and why did the loop sleep?
+# Which validation legs were excused, and why did a loop or a review wait?
 jq 'select(.type=="validation_infra" or .type=="quota_wait")' .harness/trace.jsonl
 
 # Which subprocess calls were slow?
@@ -117,13 +121,18 @@ logger = get_logger(__name__)
    operator's terminal. Both `redact()` and `trunc()` run
    `sanitize_control()` (C0 minus `\t`/`\n`, DEL, C1 → `?`), so anything
    clipped or redacted is already safe; call `sanitize_control()` directly if
-   you log external text through neither.
+   you log external text through neither. A file name needs more than that:
+   spell it with `gitutil.display_path()`, the way `git diff --name-only`
+   prints it by default (one line of printable ASCII), in a log line, a span
+   or a message. Raw, a name that is not UTF-8 holds a lone surrogate: the
+   strict UTF-8 `HARNESS_LOG_FILE` sink prints `--- Logging error ---` with a
+   traceback and drops the record, and a span carrying it is never written.
 8. **Logging must never change behaviour** — no exception may escape a log
    call; never log inside a hot inner loop (per-token, per-AST-node).
 9. Correlate pipeline work with `log_context(run_id=…, task_id=…)` — it's a
    `contextvars` scope, so it survives threads only if entered *inside* the
    worker function.
-10. **Span types are `snake_case`, and the vocabulary — 22 types — lives in
+10. **Span types are `snake_case`, and the vocabulary — 25 types — lives in
     `trace.py`'s module docstring** (`validation_infra`, `push_guard`,
     `quota_wait`, `recovery_skipped`, `freeze`, …), reproduced with meanings in
     [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl). Add

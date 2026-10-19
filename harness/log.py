@@ -54,7 +54,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 __all__ = [
     "fmt_cmd",
@@ -327,12 +327,37 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # characters git and gh actually wrap URLs in ("fatal: Authentication failed
 # for 'https://…'"). Deliberately not limited to http(s): the rewrite is a
 # no-op unless the URL carries userinfo, so a wider net costs nothing.
-_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>]+")
+#
+# U+FFFD stops the run too. The publication scrub turns a control character
+# into U+FFFD before this pass sees the text, and form feed, the C0 separators
+# and NEL were whitespace here: read as a URL character, U+FFFD joined two
+# URLs that one of those had kept apart, the second's `user:pass@` was only
+# path text to the parser, and it was published where it had been masked.
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>\ufffd]+")
+# The second reading, for text that holds U+FFFD. A control character in a
+# password is part of the password (a BEL or NUL there was always masked with
+# the rest of it), but the reading above cuts the userinfo at it and leaves no
+# `@` to find. Here U+FFFD may sit anywhere in the span up to the last `@`
+# before the path (the span the fallback below masks for a URL the parser
+# refuses, `?` and `#` included), and the parser still decides what in it is
+# userinfo. Groups: the scheme, that span, then host and path up to U+FFFD,
+# which are read for the parser but not consumed. Only a URL with U+FFFD
+# before its path is read again. A match starts only where a run of scheme
+# characters does, its scheme from the run's first letter as above, so each
+# run is tried once and the scan stays linear. Both readings scan the text as
+# given and only name userinfo to mask, so neither hides a URL from the other
+# and whatever either one masks stays masked.
+_URL_FFFD_USERINFO_RE = re.compile(
+    r"(?<![A-Za-z0-9+.\-])[0-9+.\-]*([A-Za-z][A-Za-z0-9+.\-]*://)"
+    r"(?=[^\s'\"<>/]*\ufffd)([^\s'\"<>/]*@)(?=([^\s'\"<>\ufffd]*))")
 # Fallback for a URL urlsplit() refuses (unbalanced brackets in the netloc, a
 # non-numeric port). Greedy up to the *last* '@' before the path, matching
 # urlsplit's own rpartition('@') split so the fallback never leaves behind
 # something the parser would have called userinfo.
 _URL_USERINFO_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)[^/]*@")
+# The userinfo of a URL urlsplit() accepts: up to the last '@' before the first
+# '/', '?' or '#' — exactly its netloc, split by its rpartition('@').
+_URL_NETLOC_USERINFO_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#]*@")
 
 # Token shapes mirror sanitize.py's design-doc scrubber, kept local so log.py
 # stays a leaf module (grounding imports it; pipeline imports grounding).
@@ -385,22 +410,31 @@ def sanitize_control(text: str) -> str:
     return _CONTROL_RE.sub("?", text)
 
 
-def _redact_url_userinfo(match: re.Match[str]) -> str:
-    """Rewrite ``scheme://user:pass@host/…`` → ``scheme://redacted@host/…``."""
-    url = match.group(0)
+def _userinfo_end(url: str) -> int:
+    """Where the userinfo to mask in *url* ends (the index of its ``@``), or 0.
+
+    The userinfo the parser reads; for a URL it refuses (unbalanced brackets,
+    a port it cannot read), everything up to the last ``@`` before the path.
+    Only that span is ever replaced, and everything after its ``@`` stays
+    exactly as written. Rebuilt from its parsed parts, a URL that ended in an
+    empty port lost the colon: ``https://x@Authorization: token …`` came back
+    as ``…@authorization token …``, and the keyword pattern that masks the
+    token anchors on that colon.
+    """
     try:
         parts = urlsplit(url)
         if not (parts.username or parts.password):
-            return url                       # nothing to hide; leave verbatim
-        host = parts.hostname or ""
-        if parts.port is not None:
-            host = f"{host}:{parts.port}"
+            return 0                         # nothing to hide; leave verbatim
+        # A port the parser cannot read (`host:x`, out of range) raises here:
+        # such a URL is unparseable, and masked as one, as it always was.
+        _ = parts.port
     except ValueError:
         # Unparseable but URL-shaped — drop everything up to the last '@'
         # before the path rather than hand back a string we could not parse.
-        return _URL_USERINFO_RE.sub(r"\1redacted@", url)
-    return urlunsplit((parts.scheme, f"redacted@{host}", parts.path,
-                       parts.query, parts.fragment))
+        found = _URL_USERINFO_RE.match(url)
+    else:
+        found = _URL_NETLOC_USERINFO_RE.match(url)
+    return found.end() - 1 if found else 0
 
 
 def redact_url_userinfo(text: str) -> str:
@@ -412,10 +446,37 @@ def redact_url_userinfo(text: str) -> str:
     prompt). A credentialled remote carries no keyword and no token shape, so a
     keyword/shape scrubber alone passes it through verbatim.
 
-    Idempotent: re-running it on already-rewritten text is a no-op, because
-    ``redacted@host`` is still parsed as userinfo and rewrites to itself.
+    Text holding U+FFFD is read twice, and the userinfo either reading names
+    is masked: once with U+FFFD ending a URL (:data:`_URL_RE`), so two URLs it
+    separates are two, and once with U+FFFD allowed up to the last ``@``
+    before the path (:data:`_URL_FFFD_USERINFO_RE`), so a password holding one
+    is masked whole. Text without one is read once, exactly as before.
+
+    Idempotent on what it writes: ``redacted@host`` is still parsed as
+    userinfo and rewrites to itself. (A netloc whose ``[`` and ``]`` balance
+    only across the userinfo it masked is unparseable on a second run, and is
+    masked further.)
     """
-    return _URL_RE.sub(_redact_url_userinfo, text)
+    urls = [(m.start(), m.group(0)) for m in _URL_RE.finditer(text)]
+    if "\ufffd" in text:
+        urls += [(m.start(1), m.group(1) + m.group(2) + m.group(3))
+                 for m in _URL_FFFD_USERINFO_RE.finditer(text)]
+    ends: dict[int, int] = {}                # userinfo start -> its '@'
+    for offset, url in urls:
+        end = _userinfo_end(url)
+        if end:
+            start = offset + url.index("://") + 3
+            ends[start] = max(ends.get(start, 0), offset + end)
+    out: list[str] = []
+    pos = 0
+    for start, end in sorted(ends.items()):
+        if start < pos:                      # inside the userinfo before it
+            pos = max(pos, end)
+            continue
+        out.extend((text[pos:start], "redacted"))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # ── home-directory paths ──────────────────────────────────────────────────────
@@ -445,11 +506,18 @@ _LEADING_BOUNDARY = r"(?<![A-Za-z0-9_.~%+/-])"
 # Windows path. The user segment stops at the next separator, so only
 # `<root>/<user>` is replaced and the remainder survives as context (`~/x`,
 # not `~`).
+#
+# U+FFFD (what the publication scrub leaves for a control character) is part
+# of the user segment, so an account name holding one is replaced whole —
+# except in front of `file://`. Form feed, the C0 separators and NEL used to
+# end the segment as whitespace; as U+FFFD the segment ran on into the `file`
+# of a second `file:///home/<user>` path, and the leading boundary refuses the
+# `//home` that was left, so that second account name was published.
 _HOME_PATH_RE = re.compile(
     _LEADING_BOUNDARY
     + r"(?:file://)?(?:[A-Za-z]:)?"
     r"(?:/|\\{1,2})(?:[Hh][Oo][Mm][Ee]|[Uu][Ss][Ee][Rr][Ss])(?:/|\\{1,2})"
-    r"[^/\\\s\"'`<>()\[\]{},;:&|*?]+"
+    r"(?:[^/\\\s\"'`<>()\[\]{},;:&|*?\ufffd]|\ufffd(?!file://))+"
 )
 
 

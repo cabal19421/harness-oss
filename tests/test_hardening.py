@@ -57,8 +57,27 @@ from harness.pipeline.notes import RunLog
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
+# The fixtures' own git calls, pinned against the global/system config of
+# whoever runs the suite. The hostile-config gate (GIT_CONFIG_GLOBAL and
+# GIT_CONFIG_SYSTEM at core.ignoreStat=true, status.showUntrackedFiles=no, …)
+# proves HARNESS's own calls survive such a config; it must not rewrite the
+# repos the tests build. Unpinned, core.ignoreStat=true made every entry these
+# helpers' `git add`/`git commit` wrote assume-unchanged — a test's later edits
+# vanished from `git status` and `commit -a`, and harness rightly refused trees
+# whose index hid paths — and showUntrackedFiles=no hid the untracked files a
+# test reads back. Only the fixtures are pinned: harness's calls still face the
+# run's config. (diff.external has no `-c` off-switch; no call here asks
+# `git diff` for a patch.)
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never")
+
+
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
+                          capture_output=True, text=True, check=False)
 
 
 def _init_repo(path: Path) -> Path:
@@ -1833,8 +1852,8 @@ def _install_failing_precommit(repo: Path):
 
 
 def test_commit_failure_preserves_green_work_agent(tmp_path):
-    """HIGH #2/#4: a green-but-uncommittable solution is PRESERVED, not discarded,
-    and the loop aborts via the commit-failure cap (not the non-green cap)."""
+    """A green-but-uncommittable solution is PRESERVED, not discarded, and the
+    loop aborts via the commit-failure cap (not the non-green cap)."""
     ctx = _agent_ctx(tmp_path)
     ctx.config.max_iters = 5
     ctx.config.max_consecutive_failures = 2
@@ -1849,8 +1868,8 @@ def test_commit_failure_preserves_green_work_agent(tmp_path):
 
 
 def test_commit_failure_preserves_green_work_api(tmp_path):
-    """MEDIUM #5: the API loop increments + caps on persistent commit failure
-    (instead of silently burning every iteration), and preserves the work."""
+    """The API loop increments + caps on persistent commit failure (instead of
+    silently burning every iteration), and preserves the work."""
     repo = _init_repo(tmp_path / "repo")
     wm = WorktreeManager(repo, tmp_path / "wt", base_branch="main")
     wt = wm.ensure("t")
@@ -1875,8 +1894,8 @@ def test_commit_failure_preserves_green_work_api(tmp_path):
 
 
 def test_recover_preserves_committed_green_commit(tmp_path):
-    """MEDIUM #6: recovery wipes uncommitted debris but KEEPS a green commit the
-    agent landed before crashing in the review window."""
+    """Recovery wipes uncommitted debris but KEEPS a green commit the agent
+    landed before crashing in the review window."""
     repo, wm = _wm(tmp_path)
     wt = wm.ensure("t")
     base_sha = gitutil.head_sha(repo, "main")
@@ -1903,7 +1922,7 @@ def test_recover_preserves_committed_green_commit(tmp_path):
 
 
 def test_glob_tilde_route_to_shell_and_rejected_untrusted():
-    """MEDIUM #8 / LOW #10: glob/tilde/CR are shell metachars."""
+    """Glob/tilde/CR are shell metachars."""
     assert trust.has_shell_metachars("pytest tests/*.py")
     assert trust.has_shell_metachars("cat ~/secrets")
     assert trust.has_shell_metachars("a\rrm -rf ~")
@@ -1915,8 +1934,8 @@ def test_glob_tilde_route_to_shell_and_rejected_untrusted():
 
 
 def test_feedback_round_not_inflated_by_body_marker(tmp_path):
-    """LOW #9: a header-looking line inside a feedback body must not inflate the
-    round counter."""
+    """A header-looking line inside a feedback body must not inflate the round
+    counter."""
     from harness.pipeline.backends.ide_handoff import PACKET_NAME, append_feedback_round
     wt = tmp_path / "wt"
     wt.mkdir()
@@ -1927,8 +1946,8 @@ def test_feedback_round_not_inflated_by_body_marker(tmp_path):
 
 
 def test_safe_repush_uses_bare_lease_not_fetch(tmp_path, monkeypatch):
-    """HIGH #1: _safe_repush must NOT git-fetch (which would defeat the lease); it
-    uses a bare --force-with-lease against the stored remote-tracking ref."""
+    """_safe_repush must NOT git-fetch (which would defeat the lease); it uses a
+    bare --force-with-lease against the stored remote-tracking ref."""
     from harness.pipeline.pr import GitHubPR
     calls = []
 
@@ -1993,6 +2012,17 @@ def _stub_agent_cli(monkeypatch, *, help_text=_HELP_MODERN, stdout="{}", rc=0,
 
     monkeypatch.setattr(ac.shutil, "which", lambda _n: "/usr/bin/gemini")
     monkeypatch.setattr(ac, "_CLI_HELP_CACHE", {"gemini": help_text})
+    # Pin the version as well. Under a hard floor pinned for the agent CLI,
+    # availability fails CLOSED on a version that cannot be verified, so the
+    # stub states one (the recommended floor, when one is pinned) — with a probe
+    # cache of its own: this host's own CLI, or none, decides nothing.
+    import functools
+
+    from harness import config
+    monkeypatch.setattr(config, "tool_version",
+                        functools.cache(config.tool_version.__wrapped__))
+    monkeypatch.setattr(config, "_probe_version_text",
+                        lambda _name, _cli: config.TOOL_MIN_VERSIONS.get("agent", "1.0.0"))
     # Swap the module's own `subprocess` reference, not the real module: gitutil
     # (which _build_prompt calls) runs real git through subprocess.run.
     monkeypatch.setattr(ac, "subprocess", types.SimpleNamespace(
@@ -2130,7 +2160,7 @@ def test_permission_denials_tolerate_shape_drift():
         ' {"tool_name": "Bash"}]}') == ["Bash", "Edit"]
 
 
-# ── BUG 3: a denial must record WHICH command was denied ──────────────────────
+# ── a denial must record WHICH command was denied ─────────────────────────────
 # A task died PERMANENT with "permission denied for tool(s) Bash" and nothing
 # recorded the command. Recovering it meant digging through the agent CLI's own
 # session transcripts. The tool NAME is not actionable; the ARGUMENT is what
@@ -2404,7 +2434,7 @@ def test_harness_is_autodetected_as_a_pytest_and_mypy_configured_repo():
 def test_mypy_ini_pins_the_defaults_that_flipped_in_mypy_2():
     body = (_REPO_ROOT / "mypy.ini").read_text(encoding="utf-8")
     for key in ("python_version", "local_partial_types", "strict_bytes",
-                "allow_redefinition"):
+                "allow_redefinition", "native_parser"):
         assert re.search(rf"^{key}\s*=", body, re.MULTILINE), key
 
 
@@ -2965,3 +2995,53 @@ def test_prevent_sleep_knob_is_on_by_default_and_env_overridable(monkeypatch, tm
     assert PipelineConfig.from_env(repo=str(tmp_path)).prevent_sleep is False
     monkeypatch.delenv("HARNESS_PREVENT_SLEEP")
     assert PipelineConfig.from_env(repo=str(tmp_path)).prevent_sleep is True
+
+
+# ── trace.py's span vocabulary is the one the code emits ──────────────────────
+
+
+def _emitted_span_types() -> dict[str, list[str]]:
+    """``{type: [call sites]}`` for every span emission under harness/.
+
+    A span emission is a ``.span(...)`` call whose FIRST POSITIONAL argument is
+    a string constant; its fields follow as keywords. Only those are counted —
+    a ``.span(...)`` call with no positional type or a dynamic one carries no
+    literal a jq query or ``--type`` filter could ever name, and an unrelated
+    ``.span()`` (a regex match's, say) is not a span at all, so both are skipped
+    rather than mistaken for vocabulary.
+    """
+    found: dict[str, list[str]] = {}
+    for path in sorted((_REPO_ROOT / "harness").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "span"):
+                continue
+            first = node.args[0] if node.args else None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.setdefault(first.value, []).append(
+                    f"{path.relative_to(_REPO_ROOT)}:{node.lineno}")
+    return found
+
+
+def test_the_trace_vocabulary_lists_every_span_the_code_emits():
+    """trace.py's docstring is the AUTHORITATIVE vocabulary (PIPELINE.md and
+    LOGGING.md point at it). Pre-fix it said 22 types while the code emitted 25:
+    `hidden_index`, `launch_skipped` and `stale_submodules` were in no list a
+    `jq` query or `--type` filter is written from."""
+    from harness.pipeline import trace
+
+    doc = trace.__doc__ or ""
+    documented: set[str] = set()
+    for m in re.finditer(r"^    ((?:``[a-z_]+``(?:, )?)+) — ", doc, re.MULTILINE):
+        documented.update(re.findall(r"``([a-z_]+)``", m.group(1)))
+    emitted = _emitted_span_types()
+
+    assert sorted(set(emitted) - documented) == [], "emitted but not documented"
+    assert sorted(documented - set(emitted)) == [], "documented but never emitted"
+    count = re.search(r"authoritative span vocabulary\*\* — (\d+) types", doc)
+    assert count and int(count.group(1)) == len(emitted), (
+        f"the docstring's count says {count and count.group(1)}, the code emits "
+        f"{len(emitted)}: {sorted(emitted)}")
+    assert all(re.fullmatch(r"[a-z]+(?:_[a-z]+)*", t) for t in emitted), \
+        "span types are snake_case without exception"

@@ -7,7 +7,28 @@ from pathlib import Path
 
 import pytest
 
+from harness.pipeline.gitutil import REPO_LOCATION_ENV
+
 _ROOT = Path(__file__).resolve().parent.parent
+
+# Scrubbed at IMPORT, before any fixture of any scope runs. git exports GIT_DIR
+# (absolute, in a linked worktree) and GIT_INDEX_FILE to every hook, `!` alias,
+# `rebase -x` and `bisect run` command, and one of them outranks the `cwd=` /
+# `-C` every fixture helper here names: run that way, fixture setup moved the
+# caller's branches, replaced its staged index, registered worktrees in it and
+# wrote `core.bare=true` into its shared config. A function-scoped autouse
+# fixture would come too late — a module-scoped fixture (test_hidden_index_
+# entries.py's `_stat_aged`) builds its repositories before any function-scoped
+# one runs. GIT_NAMESPACE as well: it re-roots refs pushed to the local bare
+# remotes these tests create.
+#
+# Kept on purpose, as harness itself keeps it: the GIT_CONFIG_* family. So a
+# hook directory named by `git -c core.hooksPath=<dir>` (git exports it as
+# GIT_CONFIG_PARAMETERS), or an absolute core.hooksPath in global config, is
+# every fixture repository's hook directory too: a hook that runs these gates
+# belongs in the repository's own config, or every fixture commit runs it again.
+for _key in (*REPO_LOCATION_ENV, "GIT_NAMESPACE"):
+    os.environ.pop(_key, None)
 
 
 @pytest.fixture(autouse=True)

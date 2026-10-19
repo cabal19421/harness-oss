@@ -67,8 +67,9 @@ def _init_repo(path: Path) -> Path:
     _git(["config", "commit.gpgsign", "false"], path)
     # Hermetic against the developer's ~/.gitconfig: both of these change what
     # `git status` reports, which is the very thing several tests here assert
-    # on — and one of them (showUntrackedFiles) is the C2 bug's trigger, so a
-    # machine that sets it globally must not quietly turn those tests green.
+    # on — and one of them (showUntrackedFiles) triggers the config-silenced
+    # `git status` bug, so a machine that sets it globally must not quietly
+    # turn those tests green.
     _git(["config", "status.showUntrackedFiles", "normal"], path)
     _git(["config", "diff.ignoreSubmodules", "none"], path)
     (path / "README.md").write_text("# r\n")
@@ -356,7 +357,7 @@ def test_in_progress_operation_detects_a_conflicted_rebase(tmp_path):
     assert gitutil.in_progress_operation(repo) == "REBASE_HEAD"
 
 
-# ── MEDIUM C2: `git status` must not be config-silenced ──────────────────────
+# ── `git status` must not be config-silenced ─────────────────────────────────
 
 
 def test_working_tree_dirty_sees_new_files_under_show_untracked_files_no(tmp_path):
@@ -388,9 +389,9 @@ def test_new_files_are_committed_under_show_untracked_files_no(tmp_path):
 
 
 def test_protected_paths_still_guards_new_files_under_show_untracked_files_no(tmp_path):
-    """The security half of C2: a config that hides untracked files also hid
-    them from the protected-path guard, because the guard is only reached once
-    the worktree reads dirty."""
+    """The security half: a config that hides untracked files also hid them
+    from the protected-path guard, because the guard is only reached once the
+    worktree reads dirty."""
     repo = _init_repo(tmp_path / "repo")
     wt = tmp_path / "wt"
     _git(["worktree", "add", "-q", "-b", "agent/t", str(wt)], repo)
@@ -404,7 +405,7 @@ def test_protected_paths_still_guards_new_files_under_show_untracked_files_no(tm
     assert "REAL_SECRET" not in _git(["log", "-p", "--all"], wt).stdout
 
 
-# ── MEDIUM A1: the morning-after surface names the real cause ────────────────
+# ── the morning-after surface names the real cause ───────────────────────────
 
 
 def test_unstageable_dirt_is_named_in_the_outcome_and_the_runlog(tmp_path):
@@ -469,7 +470,7 @@ def test_unstageable_dirt_reason_is_empty_when_that_is_not_the_situation(tmp_pat
     assert gitutil.unstageable_dirt_reason(repo) == ""     # stageable, staged
 
 
-# ── MEDIUM B1: a diff the gate cannot decode must not crash the gate ─────────
+# ── a diff the gate cannot decode must not crash the gate ────────────────────
 
 
 def test_diff_text_survives_a_tracked_non_utf8_file(tmp_path):
@@ -508,11 +509,11 @@ def _mixed_changeset(tmp_path: Path) -> Path:
 
 
 def test_one_undecodable_file_never_empties_the_whole_diff(tmp_path):
-    """HIGH-1. An empty diff is a REVIEW BYPASS: ``verifier.verify_change``
-    short-circuits on ``not diff.strip()`` to verdict ``skip`` (ok, non-blocking),
-    so a single latin-1 byte anywhere in the changeset would ship ``auth.py``
-    unreviewed. Every decodable file must still render, and the one that cannot
-    must be named."""
+    """An empty diff is a REVIEW BYPASS: ``verifier.verify_change`` short-circuits
+    on ``not diff.strip()`` to verdict ``skip`` (ok, non-blocking), so a single
+    latin-1 byte anywhere in the changeset would ship ``auth.py`` unreviewed.
+    Every decodable file must still render, and the one that cannot must be
+    named."""
     repo = _mixed_changeset(tmp_path)
 
     diff = gitutil.diff_text(repo, base="main")
@@ -541,7 +542,7 @@ def test_an_undecodable_file_arms_the_verifiers_truncation_rule(tmp_path):
 
 
 def test_verify_change_does_not_skip_a_changeset_with_an_undecodable_file(tmp_path):
-    """The end-to-end shape of HIGH-1: the gate must actually JUDGE."""
+    """The empty-diff bypass, end to end: the gate must actually JUDGE."""
     from harness.pipeline import verifier
 
     repo = _mixed_changeset(tmp_path)
@@ -571,7 +572,7 @@ def test_diff_body_degrades_to_a_failed_result_not_an_exception(tmp_path):
     assert not res.ok and res.out == "" and "not decodable" in res.err
 
 
-# ── LOW B3: a leading or trailing space is part of the name ──────────────────
+# ── a leading or trailing space is part of the name ──────────────────────────
 
 
 def test_leading_and_trailing_space_names_are_not_trimmed(tmp_path):
@@ -605,10 +606,10 @@ def test_untracked_space_names_survive_too(tmp_path):
 
 
 def test_status_porcelain_z_keeps_a_leading_space_in_a_filename(tmp_path):
-    """LOW-5: the first entry used to need a heuristic (``git`` stripped the
-    leading blank status byte off it), and that heuristic could not tell an
-    unstaged modification from a filename that genuinely starts with a space.
-    With ``strip=False`` the status prefix is sliced unconditionally."""
+    """The first entry used to need a heuristic (``git`` stripped the leading
+    blank status byte off it), and that heuristic could not tell an unstaged
+    modification from a filename that genuinely starts with a space. With
+    ``strip=False`` the status prefix is sliced unconditionally."""
     repo = _init_repo(tmp_path / "repo")
     (repo / " lead.txt").write_text("l\n")
 
@@ -616,7 +617,8 @@ def test_status_porcelain_z_keeps_a_leading_space_in_a_filename(tmp_path):
 
 
 def test_protected_rule_matches_a_leading_space_filename(tmp_path):
-    """Why LOW-5 is not cosmetic: the guard matches on what this returns."""
+    """Why the leading space is not cosmetic: the guard matches on what
+    ``status_porcelain_z`` returns."""
     repo = _init_repo(tmp_path / "repo")
     (repo / " secret.env").write_text("TOKEN=x\n")
 
@@ -655,21 +657,27 @@ def test_changed_files_decodes_a_quote_path_name(tmp_path):
 
 def test_a_non_ascii_file_reaches_the_manifest_and_the_diff(tmp_path):
     """PRE-FIX: the modified file was in NEITHER — dropped from the listing the
-    verifier prompt calls COMPLETE and AUTHORITATIVE, with no trace anywhere."""
+    verifier prompt calls COMPLETE and AUTHORITATIVE, with no trace anywhere.
+
+    Both now spell a non-ASCII name the way git prints it by default
+    (``gitutil.display_path``: one printable ASCII token), so the body names
+    every file exactly as the manifest does — the body used to render raw
+    UTF-8 names (``core.quotePath=false``), which stopped matching once the
+    manifest quoted them, and flipped to the quoted form whole whenever one
+    name in the change was not UTF-8."""
+    from harness.pipeline import verifier
+
     repo = _repo_with_non_ascii_change(tmp_path)
     changed = gitutil.changed_files(repo, base="main")
 
     manifest = gitutil.diff_manifest(repo, base="main", paths=changed)
     diff = gitutil.diff_text(repo, base="main", paths=changed)
 
-    assert manifest == ["M café.txt", "A naïve.txt"]
-    # For a NON-ASCII name the body spells it the way the manifest does, or a
-    # reader comparing the two cannot tell "unshown" from "absent" after all.
-    # (Only non-ASCII: `core.quotePath=false` does not stop git quoting a name
-    # containing `"`, `\` or a control byte, so the two CAN still disagree on
-    # those — see `_diff_body`. This closes the common case, not every case.)
-    assert "diff --git a/café.txt b/café.txt" in diff
-    assert "+two" in diff and "caf\\303\\251" not in diff
+    assert manifest == ['M "caf\\303\\251.txt"', 'A "na\\303\\257ve.txt"']
+    assert 'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"' in diff
+    assert 'diff --git "a/na\\303\\257ve.txt" "b/na\\303\\257ve.txt"' in diff
+    assert "+two" in diff and "café" not in diff
+    assert verifier._unshown_manifest_paths("\n".join(manifest), diff) == []
 
 
 def test_unquote_path_is_a_no_op_on_names_git_does_not_quote(tmp_path):
@@ -684,13 +692,16 @@ def test_unquote_path_is_a_no_op_on_names_git_does_not_quote(tmp_path):
     (r'"a\nb.txt"', "a\nb.txt"),
     (r'"say \"hi\".txt"', 'say "hi".txt'),
     (r'"back\\slash.txt"', "back\\slash.txt"),
+    # Valid octal that is not UTF-8 decodes to the REAL bytes, surrogate-escaped
+    # — the spelling os/pathlib resolve and git takes back as a pathspec.
+    # Returned as git printed it (as it used to be), it matched nothing.
+    (r'"\377\376.txt"', "\udcff\udcfe.txt"),
 ])
 def test_unquote_path_decodes_gits_c_quoting(raw, expected):
     assert gitutil._unquote_path(raw) == expected
 
 
 @pytest.mark.parametrize("raw", [
-    r'"\377\376.txt"',      # valid octal, not valid UTF-8
     '"dangling\\"',         # a lone backslash with nothing after it
     r'"\q.txt"',            # not an escape git emits
     r'"\77.txt"',           # a short octal run
@@ -702,7 +713,7 @@ def test_unquote_path_leaves_anything_it_cannot_decode_alone(raw):
     assert gitutil._unquote_path(raw) == raw
 
 
-# ── MEDIUM-2: the supervisor's status reader is pinned too ───────────────────
+# ── the supervisor's status reader is pinned too ─────────────────────────────
 
 
 def test_supervisor_status_dirty_sees_debris_under_show_untracked_files_no(tmp_path):
@@ -739,7 +750,7 @@ def test_supervisor_status_dirty_still_reports_unreadable_as_none(tmp_path):
     assert count is None and "could not read" in why
 
 
-# ── LOW-2: "Commit them" is not advice you can follow for unstageable dirt ───
+# ── "Commit them" is not advice you can follow for unstageable dirt ──────────
 
 
 def test_worktree_removal_refusal_says_the_dirt_cannot_be_committed(tmp_path):
@@ -756,9 +767,16 @@ def test_worktree_removal_refusal_says_the_dirt_cannot_be_committed(tmp_path):
         wm.remove("t", allow_unlanded=True)
 
     detail = str(excinfo.value)
-    assert "CANNOT be committed" in detail and "sub" in detail
+    # Dirt INSIDE a submodule is named as the submodule refusal names it — and
+    # allow_dirty, which no longer discards a submodule's untracked content, is
+    # not offered either.
+    assert "sub (it holds 1 uncommitted change(s) (build.artifact))" in detail
     assert "Commit them" not in detail            # the impossible advice, gone
+    assert "allow_dirty=True does not override this" in detail
     assert wt.path.is_dir()                       # still fail-CLOSED
+    with pytest.raises(WorktreeInUse):
+        wm.remove("t", allow_unlanded=True, allow_dirty=True)
+    assert (wt.path / "sub" / "build.artifact").read_text() == "build output\n"
 
 
 def test_worktree_removal_refusal_keeps_the_plain_message_for_normal_dirt(tmp_path):
@@ -775,7 +793,7 @@ def test_worktree_removal_refusal_keeps_the_plain_message_for_normal_dirt(tmp_pa
     assert "Commit them" in str(excinfo.value)    # ordinary dirt: unchanged
 
 
-# ── LOW-7: the same index-not-status rule at the review and PR commit sites ──
+# ── the same index-not-status rule at the review and PR commit sites ─────────
 
 
 def test_review_commit_sweep_does_not_warn_about_an_unstageable_no_op(tmp_path, caplog):

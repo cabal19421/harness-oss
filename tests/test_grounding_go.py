@@ -475,7 +475,7 @@ def test_unexported_member_cross_package_is_ungrounded(tmp_path):
 
 
 def test_outdated_toolchain_warns_but_still_merges_the_live_package_set(monkeypatch):
-    """The go floors (GO-2026-4984 & co.) are build-time RCE in `cmd/go`, and
+    """The go floors (GO-2026-6601/6602, GO-2026-4984 & co.) are in `cmd/go`, and
     harness runs `go` inside repos it does not own — but a stale toolchain is a
     WARNING only: it must never cost the operator the live std package set."""
     import logging
@@ -511,7 +511,7 @@ def test_outdated_toolchain_warns_but_still_merges_the_live_package_set(monkeypa
         go_stdlib.stdlib_packages.cache_clear()
         config.tool_version.cache_clear()
 
-    # 1.26.0 is NEWER than the 1.25.10 floor yet misses the backports.
+    # 1.26.0 is on a live release branch yet misses its 1.26.9 fixes.
     warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
     assert any("1.26.0" in m for m in warnings), warnings
     assert "crypto/brandnew" in pkgs and "fmt" in pkgs

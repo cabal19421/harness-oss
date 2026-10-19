@@ -51,13 +51,14 @@ import math
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from harness.log import get_logger, redact, trunc
 
 from . import gitutil, procutil, store
+from .mutation import MutantRestoreError, record_path, restore_pending
 from .notes import Heartbeat, RunLog, TaskClaim
 from .spec import PipelineConfig, Plan, Task
 from .trace import Tracer, new_run_id
@@ -66,6 +67,13 @@ logger = get_logger(__name__)
 
 # Statuses that mean "a process should be actively working this task right now".
 _ACTIVE = ("implementing", "review")
+
+#: The last heartbeat of a run that left a task at ``review`` and exited cleanly
+#: — its review was interrupted, or its PR could not be opened. A ``review``
+#: task whose heartbeat says this, with that pid dead, was PARKED, not crashed:
+#: there is nothing to roll back, and ``pipeline run`` resumes it review-only.
+#: The one heartbeat status liveness reads (``RunLog.beat``), and only for this.
+PARKED = "parked"
 
 # How many times an unacknowledged recovery event is re-announced across
 # restarts before we stop retrying it (it stays on disk either way).
@@ -140,11 +148,33 @@ class WorktreeClean:
     #               directory gone, no uncommitted changes): clean, but no
     #               reset happened
     #   "failed"  — a reset was attempted and the tree is still dirty
-    #   "unknown" — the tree could not be read, or is not provably its own
-    #               repository, so nothing was attempted and nothing about its
-    #               state is claimed (``reset_ok`` is false because an
-    #               unprovable read-back never counts as clean)
+    #   "unknown" — the tree could not be read, is not provably its own
+    #               repository, or hides edits behind index flags that could
+    #               not be cleared (edits no stash can park), so nothing was
+    #               attempted and nothing about its state is claimed
+    #               (``reset_ok`` is false because an unprovable read-back
+    #               never counts as clean)
     outcome: str = "reset"
+    # Submodules: ``git stash`` in the superproject never covers one, and the
+    # recursing reset DISCARDS tracked edits inside a populated one. So each
+    # one's edits are parked on ITS OWN stash first — path → stash commit.
+    sub_stashes: dict[str, str] = field(default_factory=dict)
+    # Submodules the reset did NOT reset — path → why, read back after it:
+    # held out because their edits could not be parked (or index flags hide
+    # edits nobody could clear; "*": the submodules could not even be
+    # listed, so none was recursed into), their edits left in place, never
+    # discarded; or checkouts it could not move, whose pointers are then held
+    # at the recorded commit by the next catch-all.
+    not_reset: dict[str, str] = field(default_factory=dict)
+    # Checkouts the reset moved back to their recorded commit, READ BACK
+    # afterwards — path → the commit they held (still in that submodule's
+    # reflog), named so nobody has to dig for it.
+    moved: dict[str, str] = field(default_factory=dict)
+    # ``stash`` is a stash git saved EMPTY (gitutil.stash_holds_nothing): the
+    # only dirt was untracked nested repositories, which no stash can hold
+    # ("Ignoring path …") and recovery's `clean -fd` never removes. The note
+    # must not call that work "preserved on the stash".
+    stash_empty: bool = False
 
 
 #: The :attr:`WorktreeClean.outcome` values that leave a tree whose state was
@@ -166,6 +196,17 @@ class Supervisor:
         #: *attempted*; only this says what it did, which is what an
         #: operator-facing "recovered N task(s)" line has to be built from.
         self.recovered_outcomes: dict[str, str] = {}
+        #: Task id → ``recovery_skipped`` reason for every task the last
+        #: :meth:`recover` pass deferred (:meth:`_skip_pass`). What a caller
+        #: does with it is the caller's policy: ``pipeline run`` holds the
+        #: deferrals that are positive evidence of a live writer or owner out
+        #: of that run (``orchestrator._HOLD_OUT_DEFERRALS``), and lets a
+        #: ``recent-writes`` or ``unverified-scan`` one resume through its
+        #: relaunch gate.
+        #: ``unknown-liveness`` is reported but never recorded here.
+        self.deferred: dict[str, str] = {}
+        #: The same deferrals' details (pids, path), for the run report.
+        self.deferred_detail: dict[str, str] = {}
 
     # ── reporting ─────────────────────────────────────────────────────────────
 
@@ -217,6 +258,15 @@ class Supervisor:
                          "(age %.0fs, pid %d %s)", task.id, task.status, age, hb.pid, alive)
             return TaskLiveness(task.id, task.status, "idle", age,
                                 iteration=hb.iteration, detail=f"pid {hb.pid} {alive}")
+        if task.status == "review" and hb.status == PARKED and alive == "dead":
+            # Parked by a run that exited cleanly, not left by one that crashed:
+            # rolling it back would stash and reset a tree nobody abandoned, and
+            # report a crash that never happened.
+            logger.debug("liveness %s: parked at review by pid %d, which exited "
+                         "cleanly → idle (nothing to recover)", task.id, hb.pid)
+            return TaskLiveness(task.id, task.status, "idle", age,
+                                iteration=hb.iteration,
+                                detail=f"parked at review by pid {hb.pid} (exited cleanly)")
         fresh = hb.freshness(max_age=self.config.worktree_stale_seconds)
         if alive == "dead":
             state = "stale"                          # positive proof of death
@@ -293,9 +343,12 @@ class Supervisor:
         record it was about to publish, nor abort the tasks behind it.
 
         The returned ids say a rollback ran, not that it worked;
-        :attr:`recovered_outcomes` carries what each one actually did.
+        :attr:`recovered_outcomes` carries what each one actually did, and
+        :attr:`deferred` names the tasks this pass deferred.
         """
         self.recovered_outcomes = {}
+        self.deferred = {}
+        self.deferred_detail = {}
         plan = plan or store.load_plan(self.config)
         if plan is None:
             logger.debug("recovery scan: no plan on disk — nothing to recover")
@@ -446,7 +499,9 @@ class Supervisor:
     # ── destruction gates (positive proof the worktree is safe to reset) ──────
 
     def _skip_pass(self, task: Task, reason: str, detail: str) -> None:
-        """Record one 'not recovering this pass' decision (span + log)."""
+        """Record one 'not recovering this pass' decision (span + :attr:`deferred`)."""
+        self.deferred[task.id] = reason
+        self.deferred_detail[task.id] = detail
         Tracer(self.config.state_dir, run_id=new_run_id(), task_id=task.id,
                enabled=self.config.trace).span(
             "recovery_skipped", reason=reason, detail=detail)
@@ -483,7 +538,7 @@ class Supervisor:
             self.log(f"  ⚠️  {task.id}: {len(pids)} process(es) still running in "
                      f"{wt} — not recovering (kill_worktree_procs is off)")
             self._skip_pass(task, "worktree-busy",
-                            f"{len(pids)} live process(es) in {wt}")
+                            f"{len(pids)} live process(es) in {wt}: {pids}")
             return False
         term = procutil.terminate_in_dir(wt)
         if term.unverified:
@@ -842,6 +897,20 @@ class Supervisor:
         it resolves the repository that encloses it, and the stash and reset
         would sweep up THAT repository's uncommitted work. Its outcome is
         ``unknown`` — its state was not read, nothing was attempted.
+
+        Edits hidden behind index flags (assume-unchanged / skip-worktree) are
+        exposed before anything is read, so the stash parks them with the rest
+        and the read-back cannot certify a reset that left one behind. Flags
+        that cannot be cleared also make the outcome ``unknown``: the stash
+        could not preserve what they hide, so nothing is attempted.
+
+        A mutant record a run killed mid-mutation left is settled before the
+        stash (:func:`~harness.pipeline.mutation.restore_pending`): the exact
+        mutant goes back to its original, so the stash parks the crashed
+        iteration's real edits, never a mutant. A record that cannot be settled
+        — the file was edited since, its exact mutant sits where the record
+        cannot apply, or the record or the file cannot be read or even looked
+        up — makes the outcome ``unknown``, with nothing stashed or reset.
         """
         if not task.worktree:
             logger.debug("clean worktree %s: task has no worktree recorded — nothing to clean",
@@ -861,6 +930,46 @@ class Supervisor:
             self.log(f"  ⚠️  {task.id}: worktree {wt} is not provably its own "
                      "repository — nothing was stashed or reset")
             return WorktreeClean(outcome="unknown", reset_ok=False, reason=reason)
+        # A run killed mid-mutation left a mutant on disk: the stash below would
+        # park it as the crashed iteration's own work — and after a review that
+        # committed nothing first (--no-pr) the record would then hold the only
+        # copy of the edit it replaced. So the record is settled first, as a
+        # launch or a review settles it (mutation.restore_pending: only the
+        # exact mutant is ever overwritten). One that cannot be settled leaves
+        # the tree alone; the next launch refuses on the same record.
+        try:
+            restore_pending(record_path(self.config.state_dir, task.id), wt)
+        except MutantRestoreError as exc:
+            reason = str(exc)
+            logger.warning("clean worktree %s: %s — nothing was stashed and "
+                           "nothing was reset", task.id, reason)
+            self.log(f"  ⚠️  {task.id}: worktree {wt} may hold a mutant the "
+                     "mutation gate's record cannot settle — nothing was stashed "
+                     "or reset")
+            return WorktreeClean(outcome="unknown", reset_ok=False, reason=reason)
+        # Index flags (`update-index --assume-unchanged/--skip-worktree`, or
+        # core.ignoreStat marking every entry) hide edits from `git status` AND
+        # from `git stash -u`, while `reset --hard` destroys an assume-unchanged
+        # edit and leaves a skip-worktree one in place. Cleared FIRST, so the
+        # gate below reads the real dirt and the stash parks those edits with
+        # the rest. Flags that will not clear guard edits no stash can park:
+        # nothing is stashed or reset, exactly as for a tree that cannot be read.
+        try:
+            gitutil.expose_hidden_edits(wt, confine=True)
+        except gitutil.HiddenIndexError as exc:
+            reason = str(exc)
+            logger.warning("clean worktree %s: %s — nothing was stashed and "
+                           "nothing was reset: the stash cannot preserve edits "
+                           "git will not look at", task.id, reason)
+            self.log(f"  ⚠️  {task.id}: worktree {wt} hides edits behind index "
+                     "flags that could not be cleared — nothing was stashed or reset")
+            return WorktreeClean(outcome="unknown", reset_ok=False, reason=reason)
+        # Flags set in a SUBMODULE's own index are invisible to the
+        # superproject's expose_hidden_edits and to `git status`, and a hidden
+        # edit there is still one the recursing reset rewrites. Cleared before
+        # the entry gate, so the gate sees those edits; a submodule whose
+        # flags will not clear is held out of the reset and never certified.
+        flagged = gitutil.expose_submodule_hidden_edits(wt)
         dirty, unreadable = _status_dirty(wt)
         if dirty is None:
             # The entry gate answers the same question as the exit gate and must
@@ -875,35 +984,85 @@ class Supervisor:
             self.log(f"  ⚠️  {task.id}: worktree {wt} could not be read ({unreadable}) "
                      "— nothing was stashed or reset")
             return WorktreeClean(outcome="unknown", reset_ok=False, reason=unreadable)
-        if not dirty:
+        if not dirty and not flagged:
             logger.debug("clean worktree %s: %s has no uncommitted changes — nothing to discard",
                          task.id, wt)
             return WorktreeClean(outcome="no-op", reason="no uncommitted changes to discard")
+        message = f"harness recovery: {task.id} @ {datetime.now(timezone.utc).isoformat()}"
         stash: str | None = None
         try:
-            stash = gitutil.stash_push(
-                wt, f"harness recovery: {task.id} @ {datetime.now(timezone.utc).isoformat()}")
+            stash = gitutil.stash_push(wt, message)
         except Exception as exc:  # noqa: BLE001 - preserving is best-effort
             logger.warning("clean worktree %s: could not stash the crashed iteration's "
                            "uncommitted edits in %s (%s: %s) — continuing",
                            task.id, wt, type(exc).__name__, exc)
-        if stash:
+        # `git stash` never covers a submodule, so a tree whose only dirt is
+        # inside one stashes nothing, legitimately: only dirt of the
+        # superproject's OWN makes an empty stash a failure (unreadable counts).
+        attempted = bool(stash) or gitutil.dirty_outside_submodules(wt) is not False
+        # An untracked nested repository is dirt `git stash` cannot hold
+        # ("Ignoring path …"). When it is the only dirt, git still saves a
+        # stash — an EMPTY one — and its sha proves nothing was kept.
+        empty = bool(stash) and gitutil.stash_holds_nothing(wt, stash or "") is True
+        if stash and not empty:
             self.log(f"  📦 {task.id}: uncommitted work preserved on the stash "
                      f"({stash[:12]}) — `git stash apply {stash[:12]}` in {wt}")
-        else:
+        elif empty:
+            logger.warning("clean worktree %s: git saved an EMPTY stash (%s) in %s "
+                           "— nothing the stash could hold was dirty; what it "
+                           "skipped (untracked nested git repositories, which no "
+                           "stash can hold) is left in place by the reset",
+                           task.id, (stash or "")[:12], wt)
+        elif attempted:
             logger.warning("clean worktree %s: uncommitted edits in %s could NOT be "
                            "stashed — the reset below will destroy them",
                            task.id, wt)
+        # The reset recurses into populated submodules, which DISCARDS tracked
+        # edits inside one — the loop's contract for a failed attempt, never
+        # recovery's. So each submodule's edits go on its OWN stash first, and
+        # one whose edits could not be parked is kept out of the recursion:
+        # its edits stay in place and only its pointer may stay stale. When
+        # the submodules cannot even be listed, none is recursed into.
         try:
-            gitutil.discard_changes(wt, "HEAD")
+            subs = gitutil.stash_submodules(wt, message)
+        except Exception as exc:  # noqa: BLE001 - preserving is best-effort
+            subs = gitutil.SubmoduleStash(unreadable=f"{type(exc).__name__}: {exc}")
+        unlisted = subs.unreadable or flagged.get("*", "")
+        held = {**{p: why for p, why in flagged.items() if p != "*"}, **subs.held}
+        for path, sha in sorted(subs.stashed.items()):
+            self.log(f"  📦 {task.id}: submodule {path}'s uncommitted work preserved on "
+                     f"its own stash ({sha[:12]}) — `git -C {path} stash apply "
+                     f"{sha[:12]}` in {wt}")
+        try:
+            gitutil.discard_changes(wt, "HEAD",
+                                    hold_submodules=None if unlisted else sorted(held))
         except Exception as exc:  # noqa: BLE001 - recovery is best-effort
             logger.warning("clean worktree %s: failed to discard uncommitted crash debris "
                            "in %s (%s: %s) — continuing recovery with a dirty tree; the "
                            "resumed run may see the crashed iteration's half-written edits",
                            task.id, wt, type(exc).__name__, exc)
-            return WorktreeClean(stash, True, False, f"{type(exc).__name__}: {exc}",
-                                 outcome="failed")
+            return WorktreeClean(stash, attempted, False, f"{type(exc).__name__}: {exc}",
+                                 outcome="failed", sub_stashes=dict(subs.stashed),
+                                 not_reset=_held_report(held, subs.nested_held, unlisted),
+                                 stash_empty=empty)
         reset_ok, reason = _reset_verified(wt)
+        # What the reset DID to each submodule — read back, never inferred
+        # from what it was asked to do (a failed or withheld recursion moves
+        # nothing, and the note must not say "moved back").
+        moved, not_reset = _submodule_readback(wt, subs, held, unlisted)
+        if reset_ok and (flagged or unlisted):
+            # Edits hidden by flags nobody could clear, or submodules nobody
+            # could list: a clean status read proves nothing about them.
+            reset_ok = False
+            reason = ("submodule state cannot be certified: "
+                      + "; ".join(f"{_submodule_label(p)} ({why})"
+                                  for p, why in sorted(flagged.items()))
+                      if flagged else f"the submodules could not be listed ({unlisted})")
+        elif not reset_ok and held:
+            # Honest about WHY it is not clean: those were kept, on purpose.
+            reason += ("; submodule(s) deliberately NOT reset, their edits left in "
+                       "place: " + "; ".join(f"{_submodule_label(p)} ({why})"
+                                             for p, why in sorted(held.items())))
         if reset_ok:
             logger.debug("clean worktree %s: discarded uncommitted crash debris in %s "
                          "(reset to HEAD — committed work preserved, stash=%s)",
@@ -917,8 +1076,64 @@ class Supervisor:
                            task.id, wt, reason)
             self.log(f"  ⚠️  {task.id}: worktree {wt} is STILL dirty after the "
                      f"recovery reset ({reason})")
-        return WorktreeClean(stash, True, reset_ok, reason,
-                             outcome="reset" if reset_ok else "failed")
+        return WorktreeClean(stash, attempted, reset_ok, reason,
+                             outcome="reset" if reset_ok else "failed",
+                             sub_stashes=dict(subs.stashed), not_reset=not_reset,
+                             moved=moved, stash_empty=empty)
+
+
+def _held_report(held: dict[str, str], nested: dict[str, str],
+                 unlisted: str) -> dict[str, str]:
+    """The ``not_reset`` entries for submodules the reset was told to leave alone."""
+    report = {p: f"held out of the reset, its edits left in place — {why}"
+              for p, why in held.items()}
+    for p, why in nested.items():
+        report.setdefault(p, f"held out of the reset with its parent — {why}")
+    if unlisted:
+        report["*"] = (f"the submodules could not be listed ({unlisted}), so the "
+                       "reset did not recurse into any")
+    return report
+
+
+def _submodule_readback(wt: Path, subs: gitutil.SubmoduleStash,
+                        held: dict[str, str],
+                        unlisted: str) -> tuple[dict[str, str], dict[str, str]]:
+    """``(moved, not_reset)`` for a recovery, from the tree AFTER its reset.
+
+    *moved*: checkouts that were away from their recorded commit and now are
+    at it — the commit each was moved off. *not_reset*: every submodule the
+    reset left alone, with why — held ones, and any checkout still away
+    afterwards. A checkout KNOWN to be left behind
+    (:func:`~harness.pipeline.gitutil.known_stale_gitlinks`) is reported as
+    such: not dirt, its pointer held at the recorded commit.
+    """
+    not_reset = _held_report(held, subs.nested_held, unlisted)
+    moved: dict[str, str] = {}
+    for disp, (parent, rel, commit) in subs.away.items():
+        if gitutil.checkout_at_recorded(wt / parent if parent else wt, rel):
+            moved[disp] = commit
+    after = gitutil.submodule_checkouts_away(wt)
+    if after is None:
+        not_reset.setdefault("*", "the submodule checkouts could not be read back "
+                                  "after the reset")
+        return moved, not_reset
+    known = gitutil.known_stale_gitlinks(wt)
+    for path, (recorded, head) in sorted(after.items()):
+        if path in not_reset:
+            continue
+        not_reset[path] = (
+            f"checkout stale at {head[:7]}, expected {recorded[:7]} — the reset "
+            "could not move it; the recorded pointer is held at the catch-all"
+            if path in known else
+            f"checkout left at {head[:7]}, recorded {recorded[:7]}")
+    for disp, (_parent, _rel, commit) in subs.away.items():
+        if disp not in moved and disp not in not_reset:
+            not_reset[disp] = f"checkout left at {commit[:7]} — the reset did not move it"
+    return moved, not_reset
+
+
+def _submodule_label(path: str) -> str:
+    return "every submodule" if path == "*" else repr(path)
 
 
 def _status_dirty(wt: Path) -> tuple[int | None, str]:
@@ -933,24 +1148,52 @@ def _status_dirty(wt: Path) -> tuple[int | None, str]:
     reported a VERIFIED-CLEAN recovery over a worktree still holding untracked
     crash debris.
 
-    What it adds over ``working_tree_dirty`` is the third answer: that one is
-    ``bool(out)``, which reads a ``git status`` that FAILED (a corrupt index, a
-    severed worktree link) as a tree with nothing in it — and "cannot tell" must
-    never collapse into "clean" on a path that then reports a reset. The second
-    element is the reason, non-empty only for the unreadable case.
+    Both answer "cannot tell" for a ``git status`` that FAILED (a corrupt
+    index, a severed worktree link) — ``working_tree_dirty`` with ``None`` —
+    because "cannot tell" must never collapse into "clean" on a path that then
+    reports a reset. What this adds is the COUNT, the hidden-index entries
+    counted as dirt (below), and the reason: the second element, non-empty
+    only for the unreadable case.
 
     Discovery is confined to *wt* itself: a tree that loses its ``.git``
     marker after the ownership proof reads as unreadable, never as the clean
     or dirty state of the repository that encloses it.
+
+    Paths hidden by index flags count as dirty
+    (:func:`~harness.pipeline.gitutil.hidden_index_entries`): ``git status``
+    cannot see a skip-worktree edit and ``reset --hard`` leaves one in place,
+    so a read-back that asked status alone certified a reset that left the
+    edit behind. An index whose flags cannot be listed is unreadable, never
+    clean. See :func:`_tree_dirt`, which both counts come from.
+    """
+    shown, hidden, unreadable = _tree_dirt(wt)
+    if shown is None:
+        return None, unreadable
+    return shown + len(hidden), ""
+
+
+def _tree_dirt(wt: Path) -> tuple[int | None, list[str], str]:
+    """``(paths git status reports, paths index flags hide, why unreadable)``.
+
+    The single reader under :func:`_status_dirty` and :func:`_reset_verified`,
+    so the entry gate and the read-back cannot disagree about what dirty
+    means. The first element is ``None`` when either read failed, and the
+    third then says which. Both reads are confined to *wt* (see above).
     """
     res = gitutil.status_porcelain(wt, confine=True)
     if not res.ok:
         # git's own diagnosis is worth carrying: it is what tells an operator a
         # corrupt index apart from a worktree whose repo has gone.
         detail = " ".join(trunc(redact(res.err or res.out), 120).split())
-        return None, (f"git status could not read {wt} (rc={res.code})"
-                      + (f": {detail}" if detail else ""))
-    return len([ln for ln in res.out.splitlines() if ln.strip()]), ""
+        return None, [], (f"git status could not read {wt} (rc={res.code})"
+                          + (f": {detail}" if detail else ""))
+    hidden = gitutil.hidden_index_entries(wt, confine=True)
+    if hidden is None:
+        return None, [], gitutil.hidden_index_reason(wt, None)
+    # A submodule checkout KNOWN to be left behind is not dirt (its pointer is
+    # held at the recorded commit): counting it made every later recovery a
+    # RESET FAILED over a tree nobody could clean.
+    return len(gitutil.drop_known_stale(wt, res.out)), hidden, ""
 
 
 def _reset_verified(wt: Path) -> tuple[bool, str]:
@@ -960,13 +1203,18 @@ def _reset_verified(wt: Path) -> tuple[bool, str]:
     --hard``/``clean`` and returns nothing, so the tree itself is the only
     honest witness. A status that cannot be read is reported as NOT clean: an
     unprovable read-back is the absence of evidence, and the note built from it
-    would otherwise claim an outcome nobody verified.
+    would otherwise claim an outcome nobody verified. Neither is a tree whose
+    index flags still hide an edit — ``git status`` reads it clean, which is
+    exactly the reading this read-back exists not to take on trust.
     """
-    dirty, unreadable = _status_dirty(wt)
-    if dirty is None:
+    shown, hidden, unreadable = _tree_dirt(wt)
+    if shown is None:
         return False, unreadable
-    if dirty:
-        return False, f"{dirty} path(s) still uncommitted in {wt}"
+    if hidden:
+        return False, (f"{shown} path(s) still uncommitted in {wt}, and "
+                       if shown else "") + gitutil.hidden_index_reason(wt, hidden)
+    if shown:
+        return False, f"{shown} path(s) still uncommitted in {wt}"
     return True, ""
 
 
@@ -991,10 +1239,28 @@ def _recovery_note(detail: str, clean: WorktreeClean) -> str:
     else:
         note += (f"RESET FAILED ({clean.reason}) — the worktree is still dirty "
                  "and the resumed run will see the crashed iteration's edits")
-    if clean.stash:
+    if clean.stash and clean.stash_empty:
+        note += (f"; git saved an EMPTY stash ({clean.stash[:12]}) — nothing was "
+                 "preserved on it: git saves one even when all it finds are "
+                 "untracked nested git repositories, which no stash can hold "
+                 "and recovery never removes, so they were left in place")
+    elif clean.stash:
         note += f"; uncommitted work preserved on the stash as {clean.stash[:12]}"
     elif clean.stash_attempted:
         note += "; uncommitted work could NOT be preserved on the stash"
+    if clean.sub_stashes:
+        note += ("; submodule work preserved on each submodule's own stash: "
+                 + ", ".join(f"{p} as {sha[:12]}"
+                             for p, sha in sorted(clean.sub_stashes.items()))
+                 + " (`git -C <submodule> stash apply <id>`)")
+    if clean.not_reset:
+        note += ("; submodule(s) NOT reset: "
+                 + "; ".join(f"{_submodule_label(p)} ({why})"
+                             for p, why in sorted(clean.not_reset.items())))
+    if clean.moved:
+        note += ("; submodule checkout(s) moved back to their recorded commit, off "
+                 + ", ".join(f"{p} at {c[:12]}" for p, c in sorted(clean.moved.items()))
+                 + " (still in each submodule's reflog)")
     return note
 
 

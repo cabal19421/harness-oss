@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from harness.log import fmt_cmd, get_logger, redact, step, trunc
 
@@ -107,6 +108,72 @@ def attestation_intact(body: str) -> bool | None:
     if m is None or m.group("digest") is None:
         return None
     return _body_digest("\n".join(lines[:-1])) == m.group("digest")
+
+
+# The caret notation gh's read path renders a control character in: every
+# JSON response passes through gh's ASCII sanitizer, which shows a C0/C1
+# control character — and a literal ``\u00XX`` escape for one, its backslash
+# kept — as ``^@`` … ``^_`` (``^[`` for ESC). A body harness published with
+# one never reads back as published, so its digest can never match.
+# Diagnostic only: a regex like ``^ABC`` in prose matches too.
+_GH_CARET_RE = re.compile(r"\^[@-_]")
+
+
+def _gh_carets(live_body: str, body: str) -> list[str]:
+    """The caret pairs above *live_body*'s trailer that *body* does not hold (at most 3).
+
+    Such a pair is how gh writes a control character, and it is also ordinary
+    text (``grep '^ERROR'``): the two cannot be told apart. A pair the body
+    harness is about to publish holds as well was published as written — by
+    the design text both bodies carry — so it is not counted; only a pair
+    harness would not write itself points at gh.
+    """
+    lines = live_body.replace("\r\n", "\n").rstrip().split("\n")
+    found = dict.fromkeys(_GH_CARET_RE.findall("\n".join(lines[:-1])))
+    return [pair for pair in found if pair not in body][:3]
+
+
+# A PR URL as ``gh pr list`` reports it: ``https://<host>/<owner>/<repo>/pull/<n>``.
+_PULL_PATH_RE = re.compile(r"/(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)"
+                           r"/pull/(?P<number>[1-9][0-9]*)/?")
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
+# The whole URL, before it is parsed: printable ASCII, nothing else.
+_PULL_URL_CHARS_RE = re.compile(r"[!-~]+")
+
+
+def _pull_endpoint(url: str) -> tuple[str, str] | None:
+    """``(host, "repos/<owner>/<repo>/pulls/<n>")`` for PR *url* — ``None`` unless exactly that.
+
+    What ``gh api`` is pointed at to rewrite an adopted PR's body. Strict on
+    purpose: ``gh api`` sends the path as given, unescaped, so an owner or a
+    repository spelled ``..`` — or anything after the number, like
+    ``/pull/1/files`` — would address some other endpoint. No userinfo, query
+    or fragment either — not even an empty ``?`` or ``#`` — and no number with
+    a leading zero; the port is dropped, as gh drops it from a PR URL.
+
+    The URL is taken exactly as ``gh pr view`` was given it, so anything but
+    printable ASCII is refused before it is parsed: urlsplit deletes a tab, CR
+    or LF anywhere and strips leading control characters and spaces, and
+    ``…/pu<TAB>ll/1`` named ``pulls/1`` while gh had read another URL.
+
+    The host is ALWAYS passed (``--hostname``): without it gh picks its
+    default host — ``GH_HOST`` included — not the one the PR lives on.
+    """
+    if not _PULL_URL_CHARS_RE.fullmatch(url) or "?" in url or "#" in url:
+        return None
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        _ = parts.port                    # a malformed port raises ValueError
+    except ValueError:
+        return None
+    m = _PULL_PATH_RE.fullmatch(parts.path)
+    if (parts.scheme not in ("https", "http") or not _HOSTNAME_RE.fullmatch(host)
+            or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment or m is None
+            or any(set(m[name]) == {"."} for name in ("owner", "repo"))):
+        return None
+    return host, f"repos/{m['owner']}/{m['repo']}/pulls/{m['number']}"
 
 
 def _unowned_push(worktree: Path, branch: str) -> PrResult | None:
@@ -208,10 +275,13 @@ class LocalBranchPR(PrCreator):
     def open(self, *, repo: Path, worktree: Path, branch: str, base: str,
              title: str, body: str, reviewed_sha: str = "",
              protected_paths: Sequence[str] = ()) -> PrResult:
-        # Commit any leftover work in the worktree so the branch is the PR.
-        if gitutil.working_tree_dirty(worktree):
-            logger.debug("local PR: worktree %s dirty — committing leftover "
-                         "work so branch %r carries it", worktree, branch)
+        # Commit any leftover work in the worktree so the branch is the PR. A
+        # `git status` that fails (None) is not clean: the stage runs, and one
+        # git cannot complete is refused (StageFailedError) — never read as
+        # "nothing to commit" while the leftover stays out of the branch.
+        if gitutil.working_tree_dirty(worktree) is not False:
+            logger.debug("local PR: worktree %s dirty (or unreadable) — committing "
+                         "leftover work so branch %r carries it", worktree, branch)
             try:
                 gitutil.add_all_guarded(worktree, protected_paths)
             except gitutil.ProtectedPathError as exc:
@@ -285,9 +355,10 @@ class GitHubPR(PrCreator):
                            "the remote", why)
             return PrResult(ok=False, detail=f"`gh` is not authenticated ({why}) — run `gh auth login`.")
 
-        if gitutil.working_tree_dirty(worktree):
-            logger.debug("github PR: worktree %s dirty — committing leftover "
-                         "work so the push carries it", worktree)
+        # Unreadable (None) is not clean — the same rule as LocalBranchPR.
+        if gitutil.working_tree_dirty(worktree) is not False:
+            logger.debug("github PR: worktree %s dirty (or unreadable) — committing "
+                         "leftover work so the push carries it", worktree)
             try:
                 gitutil.add_all_guarded(worktree, protected_paths)
             except gitutil.ProtectedPathError as exc:
@@ -365,6 +436,10 @@ class GitHubPR(PrCreator):
                      "--title", title, "--body-file", "-"],
                     cwd=str(repo), input=body, text=True,
                     capture_output=True, timeout=120, check=False,
+                    # gh runs git in *repo* to find the remote: an inherited
+                    # GIT_DIR would hand it another repository's (see
+                    # gitutil.REPO_LOCATION_ENV) — so on every gh call here.
+                    env=gitutil.inherited_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("gh pr create failed to execute (%s: %s) — PR not "
@@ -484,7 +559,7 @@ class GitHubPR(PrCreator):
                 proc = subprocess.run(
                     ["gh", "auth", "status", "--json", "hosts"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False,
+                    check=False, env=gitutil.inherited_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("gh auth preflight swallowed %s: %s — proceeding "
@@ -541,7 +616,7 @@ class GitHubPR(PrCreator):
             try:
                 plain = subprocess.run(["gh", "auth", "status"], cwd=str(repo),
                                        capture_output=True, text=True, timeout=60,
-                                       check=False)
+                                       check=False, env=gitutil.inherited_env())
             except (OSError, subprocess.TimeoutExpired) as exc:
                 logger.warning("plain gh auth preflight swallowed %s: %s — "
                                "proceeding (fail-open)", type(exc).__name__, exc)
@@ -583,7 +658,7 @@ class GitHubPR(PrCreator):
                     ["gh", "pr", "list", "--head", branch, "--state", "open",
                      "--json", "url,headRefName,isCrossRepository,headRepositoryOwner"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False,
+                    check=False, env=gitutil.inherited_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("existing-PR probe for %r swallowed %s: %s — "
@@ -654,10 +729,19 @@ class GitHubPR(PrCreator):
         added to harness's — is reported, never clobbered. The title is never
         re-published: it attests nothing, and whoever set it last keeps it.
 
+        The body is rewritten over REST — ``gh api --hostname <host> --method
+        PATCH repos/<owner>/<repo>/pulls/<n> --input -`` with ``{"body": …}``
+        on stdin — not with ``gh pr edit``, whose lookup query selects the
+        PR's team reviewers whatever is edited and so needs the ``read:org``
+        scope that ``gh auth status`` does not require. Host, owner, repository
+        and number come from the adopted PR's own URL (:func:`_pull_endpoint`);
+        a URL not of exactly that shape is reported, never guessed at, and
+        there is no fallback to ``gh pr edit``.
+
         Every outcome that cannot prove the refresh — a live PR that cannot be
-        read, is not ours or was edited, or an edit that fails — returns
-        ``ok=False`` WITH the URL, which the orchestrator records as
-        ``review``, never ``done``.
+        read, is not ours or was edited, a URL that cannot be addressed, or a
+        write that fails — returns ``ok=False`` WITH the URL, which the
+        orchestrator records as ``review``, never ``done``.
         """
         stale = "it still attests an earlier head"
         ours = attested_task(body)
@@ -697,38 +781,61 @@ class GitHubPR(PrCreator):
                    if intact is False else
                    "its trailer predates body digests, so harness cannot prove "
                    "nobody has edited it")
+            carets = _gh_carets(live_body, body) if intact is False else []
+            if carets:
+                # Diagnostic only — the refusal stands either way: the digest
+                # cannot tell gh's rewriting from a human's edit. The pairs are
+                # named, so one that is really prose reads as prose.
+                why += (", or gh altered it on reading: the live text holds "
+                        f"{', '.join(carets)}, the caret notation gh shows a "
+                        "control character or a literal \\u00XX escape in, so "
+                        "a body published with one by an earlier harness never "
+                        "reads back as published")
             detail = (f"open PR {url} on {branch!r} is task {ours}'s, but {why} "
                       f"— not overwritten; {stale}. Review it by hand, or close "
                       "it and re-run.")
             logger.error("adopted PR %s NOT refreshed: %s", url, detail)
             return PrResult(ok=False, url=url, detail=detail)
+        endpoint = _pull_endpoint(url)
+        if endpoint is None:
+            detail = (f"open PR {url} was adopted but its URL is not "
+                      "http(s)://<host>/<owner>/<repo>/pull/<number>, so harness "
+                      f"cannot address its body — not overwritten; {stale}")
+            logger.error("adopted PR %s NOT refreshed: %s", url, detail)
+            return PrResult(ok=False, url=url, detail=detail)
+        host, path = endpoint
 
-        # Body on STDIN for the same reasons as `gh pr create` above. No
-        # `--title`: the live title is kept, whoever set it.
-        argv = ["gh", "pr", "edit", url, "--body-file", "-"]
+        # Body on STDIN, JSON-encoded (ASCII, whatever the locale), for the
+        # same reasons as `gh pr create` above. Only `body` is sent: the live
+        # title is kept, whoever set it. `--silent`: the response is the
+        # whole PR, and nothing here reads it — the exit code is the verdict.
+        argv = ["gh", "api", "--hostname", host, "--method", "PATCH", path,
+                "--input", "-", "--silent"]
         logger.debug("%s", redact(fmt_cmd(argv, cwd=repo))
-                     + f"  <body elided: {len(body)} chars on stdin>")
+                     + f"  <body elided: {len(body)} chars on stdin as JSON>")
         try:
-            with step(logger, "gh pr edit (refresh adopted PR)", url=url):
-                proc = subprocess.run(argv, cwd=str(repo), input=body, text=True,
-                                      capture_output=True, timeout=120, check=False)
+            with step(logger, "gh api PATCH (refresh adopted PR)", url=url):
+                proc = subprocess.run(argv, cwd=str(repo),
+                                      input=json.dumps({"body": body}), text=True,
+                                      capture_output=True, timeout=120, check=False,
+                                      env=gitutil.inherited_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("gh pr edit failed to execute (%s: %s) — adopted PR %s "
-                           "NOT refreshed; failing closed", type(exc).__name__,
+            logger.warning("gh api PATCH failed to execute (%s: %s) — adopted PR "
+                           "%s NOT refreshed; failing closed", type(exc).__name__,
                            exc, url)
             return PrResult(ok=False, url=url, detail=(
                 f"open PR {url} was adopted but its body could not be refreshed "
-                f"for the reviewed head (gh pr edit: {type(exc).__name__}: "
+                f"for the reviewed head (gh api PATCH: {type(exc).__name__}: "
                 f"{trunc(redact(str(exc)), 160)}); {stale}"))
-        logger.debug("gh pr edit rc=%d", proc.returncode)
+        logger.debug("gh api PATCH rc=%d", proc.returncode)
         if proc.returncode != 0:
             err = trunc(redact((proc.stderr or proc.stdout or "").strip()), 200)
-            logger.warning("gh pr edit failed (rc=%d): %s — adopted PR %s NOT "
+            logger.warning("gh api PATCH failed (rc=%d): %s — adopted PR %s NOT "
                            "refreshed; failing closed", proc.returncode, err, url)
             return PrResult(ok=False, url=url, detail=(
                 f"open PR {url} was adopted but its body could not be refreshed "
-                f"for the reviewed head (gh pr edit rc={proc.returncode}: {err}); "
-                f"{stale}"))
+                f"for the reviewed head (gh api PATCH rc={proc.returncode}: "
+                f"{err}); {stale}"))
         logger.info("PR adopted (mode=github): %s — body refreshed to attest "
                     "the reviewed head", url)
         return PrResult(ok=True, url=url, detail="PR already exists for branch; "
@@ -742,7 +849,7 @@ class GitHubPR(PrCreator):
                 view = subprocess.run(
                     ["gh", "pr", "view", url, "--json", "title,body"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False,
+                    check=False, env=gitutil.inherited_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("adopted-PR probe for %s swallowed %s: %s — live body "

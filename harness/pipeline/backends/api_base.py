@@ -77,6 +77,34 @@ class ResponseIssue:
     feedback: str = ""
 
 
+def _sweep_nested_repos(ctx: ImplementContext, before: gitutil.NestedRepoIds | None,
+                        iteration: int) -> None:
+    """After a discard the loop owns: remove what the attempt created, report what survives.
+
+    The CLI backend's sweep of the same name, minus the note to the next
+    attempt: an API model writes one file and can do nothing
+    about a nested repository — here one comes from the VALIDATION run (a test
+    that leaves a ``git init`` fixture), and without the sweep the green
+    iteration after it could never commit. Survivors and removals alike are a
+    console line and a ``git`` span (``op="discard-readback"``) for the
+    operator: a removal is a directory harness deleted.
+    """
+    sweep = gitutil.sweep_attempt_nested_repos(ctx.worktree, before)
+    said = sweep.summary()
+    if said:
+        ctx.trace.span(
+            "git", op="discard-readback", iteration=iteration,
+            ok=not (sweep.survivors or sweep.unknown),
+            removed=", ".join(gitutil.display_path(p) for p in sweep.removed)[:200],
+            survivors=", ".join(gitutil.display_path(p) for p in sweep.survivors)[:200],
+            kept=", ".join(gitutil.display_path(p) for p in sweep.kept)[:200],
+            detail=(sweep.unknown or sweep.kept_reasons())[:200])
+    if sweep.survivors or sweep.unknown:
+        ctx.log(f"    ⚠ {said}")
+    elif said:
+        ctx.log(f"    ✂ {said}")
+
+
 class ApiBackend(CodingBackend):
     name = "api"
 
@@ -223,6 +251,11 @@ class ApiBackend(CodingBackend):
                         budget.summary())
             runlog.beat("implementing", iteration=i)
 
+            # The untracked nested repositories there before this attempt (its
+            # validation run is what can add one) — LOCAL, never on self: one
+            # backend instance serves every worker thread.
+            nested = (gitutil.untracked_nested_repos(ctx.worktree)
+                      if cfg.reset_on_failure else None)
             t_it = ctx.trace.timed()
             try:
                 self._reset_call_state()
@@ -440,6 +473,39 @@ class ApiBackend(CodingBackend):
             target.write_text(code, encoding="utf-8")
 
             oracle = self.run_oracle(ctx)
+            if oracle.validation_left_running and not shutdown.requested():
+                # No verdict (a clean exit is not a finished tree): a validation
+                # command — this backend's only process launcher — left
+                # processes in the worktree that the sweep after it could not
+                # reclaim. Nothing is recorded as a failure, and nothing races
+                # the writer: no commit, no retry, no reset. The model's write
+                # stays where it is.
+                detail = f"stopped — {oracle.validation_left_running}"
+                logger.error("%s stopping %s on iteration %d without a retry or a "
+                             "reset — %s", self.name, ctx.task.id, i,
+                             trunc(redact(detail), 300))
+                runlog.append("abort", "live processes left in the worktree",
+                              detail=detail, iteration=i)
+                ctx.log(f"  ⚠️  stopped without a retry or a reset — "
+                        f"{trunc(detail, 200)}")
+                runlog.beat("failed", iteration=i)
+                return ImplementOutcome(
+                    status="failed", iterations=i, detail=detail,
+                    grounding_ok=(last.grounding_ok if last else True),
+                    grounding_summary=(last.grounding.summary if last else ""))
+            if oracle.validation_interrupted or shutdown.requested():
+                # No verdict (the rule: a validation run the signal cut short
+                # has no verdict): the handler terminated the validation group,
+                # so its exit status is the signal's, not the code's. Nothing of
+                # it is recorded — no `fail` note, no feedback, no failure
+                # count, no no-progress signature — and the interruption exit
+                # gets the PREVIOUS oracle. The model's write stays: a
+                # validation process that left its group (setsid) may still be
+                # writing the tree — the sweep after each command never ran for
+                # the one the shutdown cut short — and the resumed loop rewrites
+                # the file anyway.
+                return self._interrupted(ctx, i, last, runlog,
+                                         stage="validation")
             last = oracle
             if oracle.passed:
                 consecutive_failures = 0          # reaching green breaks the streak
@@ -465,22 +531,27 @@ class ApiBackend(CodingBackend):
                         return ImplementOutcome(
                             status="failed", iterations=i, oracle_passed=True,
                             grounding_ok=oracle.grounding_ok,
-                            detail=f"oracle green but commit kept failing ({commit_failures}×): {detail[:300]}",
+                            detail=f"{oracle.green_summary} but commit kept failing ({commit_failures}×): {detail[:300]}",
                             grounding_summary=oracle.grounding.summary)
                     continue
                 commit_failures = 0
                 if ctx.own_commits_ahead() > 0:
-                    logger.info("%s: %s implementing → done (oracle green after "
+                    logger.info("%s: %s implementing → done (%s after "
                                 "%d iteration(s), %s — %s)",
-                                self.name, ctx.task.id, i, budget.summary(),
-                                oracle.grounding.summary)
-                    runlog.append("ok", f"green after {i} iteration(s)",
+                                self.name, ctx.task.id, oracle.green_summary, i,
+                                budget.summary(), oracle.grounding.summary)
+                    # An empty oracle validated nothing: the run log and the
+                    # outcome detail (the `agent` span's) say so, as the console does.
+                    runlog.append("ok", (f"{oracle.green_summary} after {i} iteration(s)"
+                                         if oracle.validation_vacuous
+                                         else f"green after {i} iteration(s)"),
                                   detail=oracle.grounding.summary, iteration=i)
                     runlog.beat("done", iteration=i)
-                    ctx.log(f"  ✓ oracle green after {i} iteration(s) — {oracle.grounding.summary}")
+                    ctx.log(f"  ✓ {oracle.green_summary} after {i} iteration(s) — "
+                            f"{oracle.grounding.summary}")
                     return ImplementOutcome(
                         status="implemented", iterations=i, oracle_passed=True,
-                        grounding_ok=oracle.grounding_ok, detail="validation + grounding green",
+                        grounding_ok=oracle.grounding_ok, detail=oracle.done_detail,
                         grounding_summary=oracle.grounding.summary,
                     )
                 # green but nothing committed ahead of base → can't make progress.
@@ -488,9 +559,10 @@ class ApiBackend(CodingBackend):
                 # "validation may be too weak" reading names the wrong cause; say
                 # what actually happened (same treatment as the CLI loop).
                 unstageable = gitutil.unstageable_dirt_reason(ctx.worktree)
-                logger.warning("%s failing %s: oracle green but no commit ahead "
+                logger.warning("%s failing %s: %s but no commit ahead "
                                "of %r — %s (validation=%s)",
-                               self.name, ctx.task.id, ctx.diff_base,
+                               self.name, ctx.task.id, oracle.green_summary,
+                               ctx.diff_base,
                                unstageable or "validation may be too weak to "
                                "force a change", ctx.validation or "none")
                 runlog.append("noop", "green but nothing committed ahead of base",
@@ -498,9 +570,9 @@ class ApiBackend(CodingBackend):
                 return ImplementOutcome(
                     status="failed", iterations=i, oracle_passed=True,
                     grounding_ok=oracle.grounding_ok,
-                    detail=(f"oracle green but no change ahead of "
+                    detail=(f"{oracle.green_summary} but no change ahead of "
                             f"'{ctx.diff_base}' — {unstageable}" if unstageable else
-                            f"oracle green but no change ahead of '{ctx.diff_base}' "
+                            f"{oracle.green_summary} but no change ahead of '{ctx.diff_base}' "
                             f"(validation={ctx.validation or 'none'} may be too weak)"),
                     grounding_summary=oracle.grounding.summary,
                 )
@@ -522,13 +594,16 @@ class ApiBackend(CodingBackend):
                               detail=why, iteration=i)
                 return self._abstained(
                     ctx, i, f"no progress — {why}. Last oracle: "
-                    f"{oracle.grounding.summary}", runlog, last_oracle=oracle)
+                    f"{oracle.grounding.summary}", runlog, last_oracle=oracle,
+                    nested=nested)
             if cfg.reset_on_failure:
                 # Discard the rejected file write so the next attempt starts clean.
                 logger.debug("reset_on_failure: discarding rejected changes in "
                              "%s back to %r", ctx.worktree,
                              ctx.diff_base or "HEAD")
                 gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+                # `clean -fd` keeps a nested repository the validation run made.
+                _sweep_nested_repos(ctx, nested, i)
             if consecutive_failures >= cfg.max_consecutive_failures:
                 logger.error("%s aborting %s after %d consecutive non-green "
                              "iterations (last grounding: %s)",
@@ -655,18 +730,37 @@ class ApiBackend(CodingBackend):
         index-not-status commit decision: ``git status`` can report dirt that
         ``git add -A`` cannot stage (a dirty submodule), and the resulting
         ``git commit`` rc=1 with an unmoved HEAD must read as "nothing to
-        commit", not as the commit failure that drives the repair loop.
+        commit", not as the commit failure that drives the repair loop. And
+        the hidden-edit exposure in front of it: index flags that hide an edit
+        are cleared first, and ones that will not clear fail the commit. And
+        the unread tree: a ``git status`` that fails is staged anyway, and a
+        stage git cannot complete is a failed commit carrying git's error
+        (:class:`~harness.pipeline.gitutil.StageFailedError`), never "nothing
+        to commit".
         """
-        if gitutil.working_tree_dirty(ctx.worktree):
-            logger.debug("worktree %s dirty — committing the model's file write",
-                         ctx.worktree)
+        try:
+            gitutil.expose_hidden_edits(ctx.worktree)
+        except gitutil.ProtectedPathError as exc:
+            # Same route as the refusal below: the commit-repair path.
+            logger.error("%s: refusing the automatic commit for %s — %s",
+                         self.name, ctx.task.id, exc)
+            return gitutil.GitResult(1, "", str(exc))
+        dirty = gitutil.working_tree_dirty(ctx.worktree)
+        if dirty is not False:
+            # None (`git status` failed) is unknown, never clean — see the CLI loop.
+            logger.debug("worktree %s %s — committing the model's file write",
+                         ctx.worktree,
+                         "dirty" if dirty else "unreadable by `git status`")
             try:
                 gitutil.add_all_guarded(ctx.worktree, ctx.config.protected_paths)
             except gitutil.ProtectedPathError as exc:
                 # Reported as a failed commit on purpose: the caller already has
                 # the repair path for "oracle green but the commit did not
                 # happen", which re-prompts with this detail and never resets the
-                # worktree. Nothing was staged, so index and worktree are intact.
+                # worktree. Nothing was staged for a protected path or a stage
+                # git could not complete (StageFailedError); for an unregistered
+                # gitlink only that gitlink was unstaged again — the worktree is
+                # intact either way.
                 logger.error("%s: refusing the automatic commit for %s — %s",
                              self.name, ctx.task.id, exc)
                 return gitutil.GitResult(1, "", str(exc))
@@ -682,7 +776,7 @@ class ApiBackend(CodingBackend):
         return None
 
     def _interrupted(self, ctx: ImplementContext, iterations: int, last_oracle,
-                     runlog: RunLog) -> ImplementOutcome:
+                     runlog: RunLog, *, stage: str = "agent") -> ImplementOutcome:
         """Stop cleanly on Ctrl-C / SIGTERM, leaving the task resumable.
 
         Records the interruption in the audit log (which would otherwise end
@@ -690,18 +784,28 @@ class ApiBackend(CodingBackend):
         the :class:`~harness.pipeline.notes.TaskClaim` rather than leaving it to
         the OS's flock release. ``failed`` is the resumable status: the next run
         picks the task back up.
+
+        ``stage="validation"`` is the oracle's interruption: that run has no
+        verdict, *last_oracle* is the one before it, and the worktree is left
+        as it is (see the call site) instead of being reset.
         """
         signame = shutdown.signame() or "SIGINT"
         detail = (f"interrupted by {signame} after {iterations} iteration(s) — "
                   f"the task was left resumable")
+        preserve = stage == "validation"
+        if preserve:
+            detail += (" (its validation run was terminated: no verdict, not "
+                       "recorded as a failure)")
         logger.warning("%s task %s: %s", self.name, ctx.task.id, detail)
         ctx.log(f"  ⏹ interrupted by {signame} after {iterations} iteration(s) — "
                 f"stopping cleanly; the task stays resumable")
         runlog.append("abort", f"interrupted by {signame}", detail=detail,
                       iteration=iterations)
         ctx.trace.span("shutdown", backend=self.name, signal=signame,
-                       iteration=iterations, worktree_preserved=False)
-        if ctx.config.reset_on_failure and gitutil.working_tree_dirty(ctx.worktree):
+                       iteration=iterations, worktree_preserved=preserve,
+                       stage=stage)
+        if (not preserve and ctx.config.reset_on_failure
+                and gitutil.working_tree_dirty(ctx.worktree)):
             # Same rule as every other non-green exit: a half-written file must
             # not bleed into the next fresh attempt when the task resumes.
             gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
@@ -712,10 +816,18 @@ class ApiBackend(CodingBackend):
             grounding_summary=(last_oracle.grounding.summary if last_oracle else ""))
 
     def _abstained(self, ctx: ImplementContext, iterations: int, reason: str,
-                   runlog: RunLog, *, last_oracle=None) -> ImplementOutcome:
-        """Escalate to a human as an abstention, leaving the worktree clean."""
+                   runlog: RunLog, *, last_oracle=None,
+                   nested: gitutil.NestedRepoIds | None = None) -> ImplementOutcome:
+        """Escalate to a human as an abstention, leaving the worktree clean.
+
+        *nested*: the iteration's snapshot of untracked nested repositories,
+        so the discard also removes the ones that iteration created (``None``
+        removes none). A tree ``git status`` cannot read is not discarded.
+        """
         if ctx.config.reset_on_failure and gitutil.working_tree_dirty(ctx.worktree):
             gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+            if nested is not None:
+                _sweep_nested_repos(ctx, nested, iterations)
         runlog.beat("awaiting-human", iteration=iterations)
         logger.info("%s: %s implementing → awaiting-human (abstained after %d "
                     "iteration(s)): %s", self.name, ctx.task.id, iterations,

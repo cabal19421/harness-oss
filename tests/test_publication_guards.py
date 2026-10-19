@@ -29,9 +29,27 @@ from harness.pipeline.sanitize import neutralize_markers, sanitize_publication
 _FAKE_KEY = "sk-" + "A1b2C3d4E5f6G7h8J9k0LmNo"
 
 
+# The fixtures' own git calls, pinned against the global/system config of
+# whoever runs the suite. The hostile-config gate (GIT_CONFIG_GLOBAL and
+# GIT_CONFIG_SYSTEM at core.ignoreStat=true, status.showUntrackedFiles=no, …)
+# proves HARNESS's own calls survive such a config; it must not rewrite the
+# repos the tests build. Unpinned, core.ignoreStat=true made every entry these
+# helpers' `git add`/`git commit` wrote assume-unchanged — a test's later edits
+# vanished from `git status` and `commit -a`, and harness rightly refused trees
+# whose index hid paths — and showUntrackedFiles=no hid the untracked files a
+# test reads back. Only the fixtures are pinned: harness's calls still face the
+# run's config. (diff.external has no `-c` off-switch; no call here asks
+# `git diff` for a patch.)
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never")
+
+
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
+                          capture_output=True, text=True, check=False)
 
 
 def _repo(path: Path, *, tracked: dict[str, str] | None = None) -> Path:

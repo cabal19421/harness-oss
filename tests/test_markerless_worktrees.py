@@ -521,13 +521,14 @@ def test_f_prune_reports_the_markerless_worktree_as_an_unverified_skip(tmp_path)
 
 
 def test_f_not_a_working_tree_is_no_success_while_the_directory_is_on_disk(tmp_path):
-    """A sibling's removal prunes t1's registration, after which git answers
-    "is not a working tree" — which used to read as "already gone" while the
-    directory, uncommitted work and all, was still there."""
+    """Once t1's registration is pruned, git answers "is not a working tree" —
+    which used to read as "already gone" while the directory, uncommitted work
+    and all, was still there. A sibling's removal used to do that pruning (a
+    repository-wide `git worktree prune`); harness runs none any more, so the
+    operator's own prune stands in for it here."""
     lay = _standalone_layout(tmp_path)
     content = _strip_marker(lay)
-    lay.wm.ensure("t2")
-    lay.wm.remove("t2")                              # runs `git worktree prune`
+    _git(["worktree", "prune"], lay.wm.repo)          # the operator's, not harness's
     assert not lay.wm._is_registered(lay.wt)
 
     refused = _refusal(lambda: lay.wm.remove("t1", delete_branch=True,

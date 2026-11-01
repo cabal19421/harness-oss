@@ -188,14 +188,22 @@ def _git(args, cwd):
 
 
 def _dirty_worktree(path: Path) -> Path:
-    """A git repo with one commit plus an uncommitted, half-written iteration."""
-    path.mkdir(parents=True, exist_ok=True)
-    _git(["init", "-q", "-b", "main"], path)
-    _git(["config", "user.email", "t@t"], path)
-    _git(["config", "user.name", "t"], path)
-    (path / "README.md").write_text("# r\n")
-    _git(["add", "-A"], path)
-    _git(["commit", "-q", "-m", "init"], path)
+    """A linked worktree with one commit plus an uncommitted, half-written iteration.
+
+    Made by ``git worktree add``, as every task tree is: recovery stashes and
+    resets only a tree that passes the strict owner proof
+    (``worktree_owner_proof(wt, linked=True)``), which refuses a standalone
+    checkout's ``.git`` directory.
+    """
+    main = path.parent / f"{path.name}-main"
+    main.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", "-b", "main"], main)
+    _git(["config", "user.email", "t@t"], main)
+    _git(["config", "user.name", "t"], main)
+    (main / "README.md").write_text("# r\n")
+    _git(["add", "-A"], main)
+    _git(["commit", "-q", "-m", "init"], main)
+    _git(["worktree", "add", "-q", "-b", f"agent/{path.name}", str(path)], main)
     (path / "work.py").write_text("print('half written')\n")     # uncommitted
     # Backdate every mtime past any test's worktree_stale_seconds window: the
     # recent-write probe must read these as OLD writes, not a live writer, or

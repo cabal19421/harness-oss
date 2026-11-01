@@ -2,25 +2,38 @@
 
 Gemini CLI prints its result envelope on stdout (``response``, ``stats``) and its
 error object on STDERR, and its exit status decides before any text does: its
-fatal exit codes, an HTTP status mod 256, and a quota refusal — exit 173 with
-error code 429 — that is a quota window or transient, never permanent, although
-Google's 429 wording matches the classifier's permanent patterns. Driven through
-the Gemini CLI stand-in of ``tests/test_gemini_cli_flags.py``, launched for real.
+fatal exit codes, its session-turn limit (exit 53: a call ended at its cap and
+judged in place, never a failure), an HTTP status mod 256, and a quota refusal
+— exit 173 with error code 429 — that is a quota window or transient, never
+permanent, although Google's 429 wording matches the classifier's permanent
+patterns. Driven through the Gemini CLI stand-in of
+``tests/test_gemini_cli_flags.py``, launched for real.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
 import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import harness.pipeline.backends.agent_cli as ac
 from harness.pipeline import looptools
-from harness.pipeline.looptools import classify_invocation_failure, quota_reset_seconds
+from harness.pipeline.backends.base import ImplementContext, OracleResult
+from harness.pipeline.grounding_gate import GateResult
+from harness.pipeline.looptools import (
+    LoopBudget,
+    classify_invocation_failure,
+    quota_reset_seconds,
+)
 from harness.pipeline.notes import RunLog
+from harness.pipeline.worktree import WorktreeManager
 from tests.test_gemini_cli_flags import (
     ENVELOPE,
     HELP_MODERN,
@@ -360,14 +373,10 @@ def test_exit_55_is_permanent_names_the_variable_and_launches_once(gem, tmp_path
     (54, error_object("No space left on device", code="no_space_left",
                       kind="FatalToolExecutionError"),
      True, "Gemini CLI stopped on a fatal tool error (exit 54)"),
-    (53, error_object("Reached max session turns for this session. Increase the number "
-                      "of turns by specifying maxSessionTurns in settings.json.",
-                      code=53, kind="FatalTurnLimitedError"),
-     False, "Gemini CLI stopped at its session turn limit (exit 53)"),
 ])
-def test_fatal_exits_are_permanent_and_the_turn_limit_is_transient(gem, tmp_path, rc,
-                                                                   stderr, permanent,
-                                                                   prefix):
+def test_fatal_exits_are_permanent(gem, tmp_path, rc, stderr, permanent, prefix):
+    """Its session-turn limit, exit 53, is no failure at all: see
+    test_exit_53_is_a_call_ended_at_its_cap_never_a_failure."""
     cli = gem.stand_in()
     cli.serve_error("x", DEPRECATION + stderr, rc)
     cli.modes("x")
@@ -378,8 +387,6 @@ def test_fatal_exits_are_permanent_and_the_turn_limit_is_transient(gem, tmp_path
     assert not run.ok and run.permanent is permanent
     assert run.detail.startswith(prefix), run.detail
     assert "\x1b" not in run.detail
-    if not permanent:
-        assert run.limit_kind == "transient"         # decided by the exit status
     if stderr.startswith("{"):
         assert "stderr: Warning: --allowed-tools" in run.detail
         assert run.detail.count('"error"') == 0      # never the object twice
@@ -576,6 +583,250 @@ def test_denials_are_never_parsed_on_gemini_cli(gem, tmp_path, caplog):
     assert "permission_denials" in run.detail       # quoted as stdout, never parsed
     assert "permission denied" not in run.detail
     assert not warnings_matching(caplog, "widen PipelineConfig.allowed_tools")
+
+
+# ── its session-turn limit: exit 53 ─────────────────────────────────────────────
+
+#: Gemini CLI at its own session-turn limit (``model.maxSessionTurns`` in its
+#: settings): its FatalTurnLimitedError object on stderr, nothing on stdout, exit 53.
+TURN_LIMIT_STDERR = DEPRECATION + error_object(
+    "Reached max session turns for this session. Increase the number of turns by "
+    "specifying maxSessionTurns in settings.json.", code=53, kind="FatalTurnLimitedError")
+#: What the next agent is told after a red verdict on a call ended at its cap.
+CAP_NOTE = ("Note: the previous attempt was ended by its per-call cap before it "
+            "finished ({}); what it had done was judged as it stood, and it is "
+            "still in the worktree — continue from it.")
+
+
+def test_exit_53_is_a_call_ended_at_its_cap_never_a_failure(gem, tmp_path, monkeypatch):
+    """Gemini CLI ended the call at its own session-turn limit: over, not failed.
+    One launch, never retried; swept as after a clean exit, not as a terminated
+    call; charged only what the call reported, since no balance was handed over
+    to charge. Read from the exit status alone, whatever the argv carried —
+    harness handed it no turn cap — and never for a call a shutdown ended,
+    which belongs to the interruption. Named in fixed words, since the name
+    reaches the next prompt: what Gemini CLI said, which tells how to raise the
+    limit, is the operator's alone, redacted and bounded in the detail. PRE-FIX
+    it was an ordinary transient failure, retried on the ladder."""
+    terminated = _sweep_recorder(monkeypatch)
+    swept: list[str] = []
+    real_sweep = ac.sweep_after_return
+    monkeypatch.setattr(ac, "sweep_after_return",
+                        lambda c, **kw: swept.append(kw["after"]) or real_sweep(c, **kw))
+    cli = gem.stand_in()
+    cli.serve_error("cap", TURN_LIMIT_STDERR, 53)
+    cli.modes("cap")
+    ctx = make_ctx(tmp_path, max_agent_retries=3)
+
+    run = cli.backend()._run_with_retries(ctx, "", None, RunLog(ctx.config.state_dir, "t"),
+                                          1, budget=LoopBudget(max_cost_usd=1.0))
+
+    assert run.ok and not run.permanent, run.detail
+    assert run.capped == "Gemini CLI's own session-turn limit (exit 53)", run.capped
+    assert run.detail == (
+        f"the CLI ended the call at its cap ({run.capped}): FatalTurnLimitedError: "
+        f"Reached max session turns for this session. Increase the number of turns "
+        f"by specifying maxSessionTurns in settings.json"), run.detail
+    assert run.limit_kind is None and run.text == ""
+    assert (run.tokens, run.cost) == (0, 0.0)       # never the $1.00 balance
+    assert run.usage_unreported                     # Gemini CLI printed no stats
+    [launch] = cli.launches()                       # never retried
+    assert "--max-turns" not in launch["argv"]
+    assert swept == ["the CLI ended the call at its cap"] and terminated == []
+
+    # The exit status alone decides: no error object is needed, and the same
+    # object on any other exit is no cap.
+    cli.serve_error("bare", "", 53)
+    cli.serve_error("other", TURN_LIMIT_STDERR, 1)
+    cli.modes("bare")
+    run = cli.backend()._run_agent(ctx, "")
+    assert run.ok and run.capped == ac._GEMINI_TURN_LIMIT, run.detail
+    assert run.detail.endswith(f"({run.capped}): (no error text)"), run.detail
+    cli.modes("other")
+    run = cli.backend()._run_agent(ctx, "")
+    assert not run.ok and not run.capped, run.detail
+
+    # What Gemini CLI said is redacted and bounded, from its error object or
+    # from bare stderr lines.
+    key = "AIza" + "B" * 35
+    cli.serve_error("keyed", DEPRECATION + error_object(
+        f"Reached max session turns (key {key}).", code=53,
+        kind="FatalTurnLimitedError"), 53)
+    cli.serve_error("keyed-lines", f"Reached max session turns for this session; "
+                                   f"api_key={key}\n", 53)
+    cli.serve_error("long", "x" * 3000 + "\n", 53)
+    head = f"the CLI ended the call at its cap ({ac._GEMINI_TURN_LIMIT}): "
+    for mode in ("keyed", "keyed-lines", "long"):
+        cli.modes(mode)
+        run = cli.backend()._run_agent(ctx, "")
+        assert run.ok and run.capped == ac._GEMINI_TURN_LIMIT, run.detail
+        assert run.detail.startswith(head) and key not in run.detail, run.detail
+        assert len(run.detail) - len(head) <= 320, len(run.detail)
+        assert mode == "long" or "[REDACTED]" in run.detail, run.detail
+
+    # A call a shutdown ended is the interruption's: swept as a terminated call,
+    # and its row's transient regime rides with it.
+    monkeypatch.setattr(ac.shutdown, "requested", lambda: True)
+    cli.modes("cap")
+    run = cli.backend()._run_agent(ctx, "")
+    assert not run.ok and not run.capped and run.limit_kind == "transient", run.detail
+    assert run.detail.startswith(
+        "Gemini CLI stopped at its session turn limit (exit 53): "), run.detail
+    assert len(terminated) == 1
+
+
+def test_a_call_at_the_turn_limit_is_proven_quiet_before_it_is_judged(gem, tmp_path,
+                                                                     monkeypatch):
+    """As after a clean exit: what the sweep cannot stop ends the task, the tree
+    left exactly as it is and nothing judged, and what it reclaimed is named in
+    the call's detail."""
+    cli = gem.stand_in()
+    cli.serve_error("cap", TURN_LIMIT_STDERR, 53)
+    cli.modes("cap")
+    ctx = make_ctx(tmp_path)
+
+    monkeypatch.setattr(ac, "sweep_after_return", lambda _ctx, **_kw: BUSY)
+    run = cli.backend()._run_agent(ctx, "")
+    assert not run.ok and run.permanent and run.preserve_worktree, run.detail
+    assert run.detail.startswith("the CLI ended the call at its cap, and "), run.detail
+    assert "4242" in run.detail and not run.capped
+
+    monkeypatch.setattr(ac, "sweep_after_return",
+                        lambda _ctx, **_kw: ac._Sweep(reclaimed=(4243,)))
+    run = cli.backend()._run_agent(ctx, "")
+    assert run.ok and run.capped == ac._GEMINI_TURN_LIMIT, run.detail
+    assert run.detail.endswith(" (terminated 1 leftover process(es) in the worktree: "
+                               "pids 4243)"), run.detail
+
+
+def _managed_ctx(tmp_path: Path, monkeypatch, **cfg_kw) -> ImplementContext:
+    """The task in a managed worktree of its own, as the pipeline runs one — so the
+    run log under the repository's .harness/ outlives the terminal discard."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ctx = make_ctx(tmp_path, **cfg_kw)
+    wt = WorktreeManager(ctx.config.repo, tmp_path / "wt", base_branch="main").ensure("t")
+    ctx.task.branch = wt.branch
+    return ImplementContext(task=ctx.task, worktree=wt.path, base_branch="main",
+                            config=ctx.config)
+
+
+class _Judged(ac.AgentCliBackend):
+    """The real loop and the real stand-in, with canned oracle verdicts: each call
+    first appends a line to agent_work.txt in the worktree — the agent's work —
+    and each verdict records what the tree held when it was given."""
+
+    def __init__(self, cli: str, verdicts: list[bool]) -> None:
+        super().__init__(cli=cli)
+        self.verdicts = verdicts
+        self.calls = 0
+        self.judged: list[str | None] = []
+
+    def _run_agent(self, ctx, feedback, pending_commit_failure=None, *, budget=None):
+        self.calls += 1
+        with (Path(ctx.worktree) / "agent_work.txt").open("a", encoding="utf-8") as fh:
+            fh.write(f"work of call {self.calls}\n")
+        return super()._run_agent(ctx, feedback, pending_commit_failure, budget=budget)
+
+    def run_oracle(self, ctx):
+        work = Path(ctx.worktree) / "agent_work.txt"
+        self.judged.append(work.read_text(encoding="utf-8") if work.exists() else None)
+        n = len(self.judged)
+        passed = self.verdicts[min(n, len(self.verdicts)) - 1]
+        # A different red each time keeps the no-progress guard out of it.
+        red = f"FAILED test_{'abcdefghij'[n - 1] * 3} - assert {'klmnopqrst'[n - 1] * 4}"
+        return OracleResult(passed=passed, validation_ok=passed,
+                            grounding=GateResult(ok=True, summary="ok"),
+                            output="" if passed else red)
+
+
+def test_a_red_call_at_the_turn_limit_is_kept_and_never_counted(gem, tmp_path,
+                                                                monkeypatch, caplog):
+    """max_consecutive_failures=1 and a cost budget: three calls Gemini CLI ends at
+    its session-turn limit, each judged red. Each is launched once, judged with the
+    work before it still in the tree (reset_on_failure on), noted as `cap`, never
+    counted toward max_consecutive_failures and never charged a balance — the
+    loop runs to max_iters — and each next prompt carries the cap note. The cap
+    is named there in fixed words: Gemini CLI's own message, which says how to
+    raise the limit, reaches the note's detail and never a prompt. No stats came
+    back, which is said once per run at WARNING — never the drift alarm, never a
+    `warn` note the next prompt would carry. PRE-FIX the first call was retried,
+    its work discarded, and the task aborted after one consecutive failure."""
+    cli = gem.stand_in()
+    cli.serve_error("cap", TURN_LIMIT_STDERR, 53)
+    cli.modes("cap")
+    ctx = _managed_ctx(tmp_path, monkeypatch, max_iters=3, max_consecutive_failures=1,
+                       max_agent_retries=1, max_cost_usd=0.5)
+    backend = _Judged(cli.cli, [False])
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert ctx.config.reset_on_failure
+    assert out.status == "failed" and out.iterations == 3, out.detail
+    assert out.detail.startswith("did not converge"), out.detail
+    launches = cli.launches()
+    assert len(launches) == 3                       # one per iteration, none retried
+    work = [f"work of call {n}\n" for n in (1, 2, 3)]
+    assert backend.judged == ["".join(work[:n]) for n in (1, 2, 3)]
+    notes = RunLog(ctx.config.state_dir, "t").records()
+    caps = [n for n in notes if n["kind"] == "cap"]
+    assert [n["iteration"] for n in caps] == [1, 2, 3]
+    assert not [n for n in notes
+                if n["kind"] in ("error", "retry", "budget", "abort", "warn")]
+    capped = caps[0]["summary"].removeprefix("the agent call ended at its cap: ")
+    assert capped == ac._GEMINI_TURN_LIMIT
+    assert "Increase the number of turns" in caps[0]["detail"]
+    prompts = [launch["argv"][launch["argv"].index("-p") + 1] for launch in launches]
+    assert "per-call cap" not in prompts[0]
+    for prompt in prompts[1:]:
+        assert CAP_NOTE.format(capped) in prompt
+        assert "maxSessionTurns" not in prompt
+        assert "Increase the number of turns" not in prompt
+    assert len(warnings_matching(caplog, "printed no stats")) == 1
+    assert not warnings_matching(caplog, "no parseable usage")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="needs a cwd-scannable /proc")
+def test_a_held_pipe_at_the_turn_limit_is_swept_as_after_a_clean_exit(gem, tmp_path,
+                                                                      monkeypatch):
+    """The call Gemini CLI ends at its session-turn limit leaves a process holding
+    its stdout, and the operator's shell was cd'd in the worktree before the call.
+    A capped call is no failed call, so it never gets the failed call's
+    termination sweep (_reclaim_worktree), which signals every process in the
+    tree, the operator's shell with it. The differential sweep after a clean exit
+    never signals what was there before: the leftover beside that shell stops the
+    run, the tree preserved and nothing judged."""
+    monkeypatch.setattr(ac, "_SWEEP_SETTLE_SECONDS", 0.3)
+    terminated = _sweep_recorder(monkeypatch)
+    cli = gem.stand_in()
+    cli.serve_error("cap", TURN_LIMIT_STDERR, 53)
+    cli.hold("cap")
+    cli.modes("cap")
+    ctx = _managed_ctx(tmp_path, monkeypatch)
+    backend = _Judged(cli.cli, [True])
+    shell = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(120)"],
+                             cwd=ctx.worktree, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    try:
+        out = backend.implement(ctx)
+
+        assert shell.poll() is None, "the operator's shell was terminated"
+        assert out.status == "failed", out.detail
+        assert out.detail.startswith("stopped — the CLI ended the call at its cap, "
+                                     "and "), out.detail
+        assert terminated == [] and backend.judged == []
+        assert len(cli.launches()) == 1 and len(cli.leftovers()) == 1
+        work = Path(ctx.worktree) / "agent_work.txt"
+        assert work.read_text(encoding="utf-8") == "work of call 1\n"
+    finally:
+        shell.kill()
+        shell.wait()
+        for pid in cli.leftovers():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # ── the verifier ────────────────────────────────────────────────────────────────

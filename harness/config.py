@@ -23,7 +23,8 @@ logger = get_logger(__name__)
 # integrations. ``harness status`` reports them so you can see exactly what to
 # install for a given feature. Required vs optional is documented in INSTALL.md.
 TOOLS: dict[str, str] = {
-    "git": "required for the design-docs → PRs pipeline (worktrees, branches)",
+    "git": "required for the design-docs → PRs pipeline (worktrees, branches) "
+           "— >= 2.39.0 recommended",
     "gh": "`pipeline --pr github` (open real GitHub PRs) — >= 2.97.0 recommended",
     "tmux": "`pipeline tmux` cockpit (watch several features at once) "
             "— needs >= 2.1 (exact `=` session targets)",
@@ -31,7 +32,7 @@ TOOLS: dict[str, str] = {
              "(default binary: gemini) — a hard floor you pin refuses a version "
              "below it, or one it cannot verify",
     "go": "Go grounding: augments the stdlib set via `go list std` (optional) "
-          "— >= 1.26.9 / 1.27.2 recommended",
+          "— >= 1.26.10 / 1.27.3 recommended",
     "npm": "JS/TS repos the pipeline validates via an `npm test` oracle (optional)",
 }
 
@@ -55,9 +56,9 @@ PY_EXTRAS: dict[str, str] = {
 }
 
 # ── Minimum external-CLI versions ─────────────────────────────────────────────
-# harness shells out to CLIs it does not ship, and each of the two below has a
-# dated, security-derived floor. A floor nobody probes is a comment, so the
-# availability probes (GitHubPR.open, AgentCliBackend.available,
+# harness shells out to CLIs it does not ship, and each one below has a dated
+# floor, security-derived but for git's. A floor nobody probes is a comment, so
+# the availability probes (GitHubPR.open, AgentCliBackend.available,
 # go/stdlib.stdlib_packages) run the probe below and say what they found.
 #
 # Policy, deliberately asymmetric: an old CLI is a WARNING, never a blocker —
@@ -73,27 +74,48 @@ PY_EXTRAS: dict[str, str] = {
 #:   CVE-2026-64653 (unescaped URL path components in REST calls). Reachable
 #:   here: harness interpolates design-doc-derived ``agent/<id>`` branch names
 #:   into ``gh pr create --head`` / ``gh pr list --head``.
-#: * go 1.26.9 / 1.27.2 — GO-2026-6601 / CVE-2026-94444 and GO-2026-6602 /
-#:   CVE-2026-94447 (2026-10-08): ``cmd/go`` checksum-database bypasses for the
-#:   golang.org/fips140 module and the golang.org/toolchain download, fixed ONLY
-#:   in 1.26.9 and 1.27.2 — 1.25 is end-of-life and got no fix. 6602 is the class
-#:   of GO-2026-4984 (toolchain download+exec driven by the inspected repo, which
-#:   ``_PROBE_ENV`` and ``_VERSION_PROBE_ENV`` also pin out); the floor also
+#: * go 1.26.10 / 1.27.3 — GO-2026-6809 / CVE-2026-111943 (2026-10-21):
+#:   ``crypto/x509`` now distrusts compromised intermediate certificates in
+#:   ``Certificate.Verify``, which the go command's own HTTPS fetches (GOPROXY,
+#:   sum.golang.org, a toolchain download) run through. Fixed ONLY in 1.26.10
+#:   and 1.27.3; the checksum database still guards module integrity, so an
+#:   older go risks a MITM's read and availability where the system trust
+#:   store lags. The floor's earlier fixes stay below it (1.26.9 / 1.27.2):
+#:   GO-2026-6601 / CVE-2026-94444 and GO-2026-6602 / CVE-2026-94447
+#:   (2026-10-08), ``cmd/go`` checksum-database bypasses for the
+#:   golang.org/fips140 module and the golang.org/toolchain download — 1.25 is
+#:   end-of-life and got no fix. 6602 is the class of GO-2026-4984 (toolchain
+#:   download+exec driven by the inspected repo, which ``_PROBE_ENV`` and
+#:   ``_VERSION_PROBE_ENV`` also pin out); the floor also
 #:   covers the sumdb verification bypasses GO-2026-6179 / GO-2026-6180,
 #:   GO-2026-4871 (SWIG+cgo build-time RCE), GO-2026-4338 and GO-2025-3828
 #:   (untrusted VCS config in a cloned repo). All in ``cmd/go`` — and harness
 #:   runs ``go build`` / ``go vet`` inside repositories it does not own.
+#: * git 2.39.0 — a capability floor, not a security one, and warn-only like
+#:   the rest: every proof an older git cannot run fails CLOSED, so an old git
+#:   loses function, never safety. ``merge-tree --write-tree`` (2.38,
+#:   ``gitutil.MERGE_TREE_WRITE_GIT``) is the squash-landed proof behind prune
+#:   and branch deletion — below it such a branch is kept as unproven — and
+#:   the dependency re-seed; ``patch-id --verbatim`` (2.39,
+#:   ``gitutil.PATCH_ID_VERBATIM_GIT``) is the force-push retry's
+#:   whitespace-exact clobber check — below it every retry refuses.
+#:   ``show-ref --exists`` (2.43) only proves an unborn HEAD, which reads as
+#:   unknown (fail-closed) without it; the floor is not raised for it, which
+#:   would exclude Debian 12's 2.39.5. Probed by ``harness status`` and by
+#:   those refusals, which name the version they found.
 TOOL_MIN_VERSIONS: dict[str, str] = {
     "gh": "2.97.0",
-    "go": "1.26.9",           # or any 1.27.2+ (never 1.25.x); see _meets_floor
+    "go": "1.26.10",          # or any 1.27.3+ (never 1.25.x); see _meets_floor
+    "git": "2.39.0",          # capability floor, warn-only (see the bullet above)
 }
 
 #: How a recommended floor reads in messages when one version cannot say it.
 #: go's fix ships as a point release on each live branch (:func:`_meets_floor`),
-#: so 1.27.1 is NEWER than 1.26.9 and still misses it — "1.27.1 is older than
-#: the recommended 1.26.9" contradicted itself. Keep in step with _meets_floor.
+#: so 1.27.2 is NEWER than 1.26.10 and still misses it — "1.27.2 is older than
+#: the recommended 1.26.10" would contradict itself. Keep in step with
+#: _meets_floor.
 _FLOOR_TEXT: dict[str, str] = {
-    "go": "1.26.9 / 1.27.2",
+    "go": "1.26.10 / 1.27.3",
 }
 
 #: Refuse-to-run floors. None ships by default — a hard floor is an operator
@@ -112,6 +134,7 @@ TOOL_HARD_MIN_VERSIONS: dict[str, str] = {}
 _VERSION_ARGV: dict[str, list[str]] = {
     "gh": ["--version"],
     "go": ["version"],
+    "git": ["--version"],
 }
 
 #: How long one version probe may run before it counts as failed, in seconds.
@@ -135,6 +158,8 @@ _VERSION_LINE: dict[str, tuple[re.Pattern[str], str]] = {
     "gh": (re.compile(r"\bgh version (\d+)\.(\d+)\.(\d+)"), "gh version X.Y.Z"),
     "go": (re.compile(r"\bgo version go(\d+)\.(\d+)(?:\.(\d+))?"),
            "go version goX.Y.Z"),
+    # "git version 2.39.5 (Apple Git-154)", "git version 2.47.1.windows.2"
+    "git": (re.compile(r"\bgit version (\d+)\.(\d+)\.(\d+)"), "git version X.Y.Z"),
 }
 
 #: A free-standing ``X.Y.Z`` (or ``vX.Y.Z``): the fallback for output with no
@@ -253,14 +278,15 @@ def _meets_floor(name: str, found: tuple[int, int, int]) -> bool:
     """Is *found* at or above the recommended floor for *name*?
 
     ``go`` is the awkward one: its fixes ship on two live release branches, so
-    1.26.9 and 1.27.2 are both acceptable while 1.27.0 (newer than 1.26.9 but
-    missing the fix) is not — a plain ``>=`` against a single floor would
-    green-light it. 1.25 is end-of-life and was never fixed: no 1.25.x passes.
+    1.26.10 and 1.27.3 are both acceptable while 1.27.0-1.27.2 (newer than
+    1.26.10 but missing the fix) are not — a plain ``>=`` against a single
+    floor would green-light them. 1.25 is end-of-life and was never fixed: no
+    1.25.x passes.
     """
     if name == "go":
         if found[:2] == (1, 26):
-            return found >= (1, 26, 9)
-        return found >= (1, 27, 2)
+            return found >= (1, 26, 10)
+        return found >= (1, 27, 3)
     floor = _parse_version(TOOL_MIN_VERSIONS.get(name, ""))
     return floor is None or found >= floor
 
@@ -441,8 +467,8 @@ def tool_version(name: str, cli: str = "") -> ToolVersion:
                     f"refusing to run (see INSTALL.md)"),
         )
     if not _meets_floor(name, found):
-        # A two-branch floor is missed, not "older than": go 1.27.1 is newer
-        # than 1.26.9 and still lacks the fix.
+        # A two-branch floor is missed, not "older than": go 1.27.2 is newer
+        # than 1.26.10 and still lacks the fix.
         verdict = (f"misses the fix in the recommended {shown_floor}"
                    if name in _FLOOR_TEXT else
                    f"is older than the recommended {minimum}")

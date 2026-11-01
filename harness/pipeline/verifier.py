@@ -44,7 +44,12 @@ instead of a prose ``VERDICT:`` trailer,
 and an answer that ran but did not conform is a **fail**, not a skip: a gate that
 silently opens on output-format drift is defeated by exactly the drift the schema
 exists to make impossible. Backends with no schema knob (the openai/gemini API
-backends) keep the prose regex and its fail-open behaviour.
+backends) keep the prose regex and its fail-open behaviour. Nor does an exit code
+outrank what the CLI delivered: a validated verdict that arrived before a
+non-zero exit is counted, and the CLI's own report that no answer conformed
+(``error_max_structured_output_retries``) is that blocking fail, not a skip —
+the one-shot reads it so (``OneshotResult``); a terminated call, a usage-limit
+refusal and any other non-zero exit keep their meanings.
 
 Nor does it fail open on a change it was never SHOWN. The caller hands this gate
 a diff *and* ``file_manifest`` — gitutil's authoritative ``<status> <path>``
@@ -876,9 +881,9 @@ def _one_answer(ask: Ask | None, ask_structured: AskStructured | None, prompt: s
     (``OneshotResult.usage_limit`` — the refusal's own text —
     and ``usage_limit_kind``, its regime): the caller launches no further
     sample and the review ends with no verdict. Infrastructure failures (backend
-    unavailable, launch failure, timeout, non-zero exit, an exception) return
-    ``("", None, "", "", None)`` — no vote, no error, gate skips, exactly as
-    before.
+    unavailable, launch failure, timeout, a non-zero exit that delivered no
+    answer, an exception) return ``("", None, "", "", None)`` — no vote, no
+    error, gate skips, exactly as before.
     """
     if ask_structured is not None:
         try:

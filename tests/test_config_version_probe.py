@@ -164,7 +164,7 @@ def test_the_cli_version_line_wins_over_other_version_text(tmp_path, monkeypatch
     ("gh", ("gh version 2.102.0 (2026-09-30)\n"
             "https://github.com/cli/cli/releases/tag/v2.102.0\n"), (2, 102, 0)),
     ("go", "go version go1.27.2 linux/amd64\n", (1, 27, 2)),
-    ("go", "go version go1.27rc2 linux/amd64\n", (1, 27, 0)),   # below 1.27.2
+    ("go", "go version go1.27rc2 linux/amd64\n", (1, 27, 0)),   # below 1.27.3
     ("go", "go version devel go1.28-31c9fb3 Thu Oct 1 2026\n", None),
     ("agent", "0.9.0 (agent-cli)\n0.9.0 (agent-cli)\n", (0, 9, 0)),
     ("agent", "0.9.0 (agent-cli)\n0.4.0 (agent-cli)\n", None),
@@ -253,21 +253,35 @@ def test_the_go_probe_cannot_be_steered_by_the_directory_it_runs_in(tmp_path, mo
 
 
 @pytest.mark.parametrize(("out", "meets"), [
-    ("go version go1.27.1 linux/amd64", False),     # newer than 1.26.9, no fix
+    ("go version go1.27.2 linux/amd64", False),     # newer than 1.26.10, no fix
+    ("go version go1.26.9 linux/amd64", False),     # the old floor: GO-2026-6809
     ("go version go1.25.14 linux/amd64", False),    # end-of-life branch
-    ("go version go1.26.9 linux/amd64", True),
-], ids=["1.27.1", "1.25.14", "1.26.9"])
+    ("go version go1.26.10 linux/amd64", True),
+    ("go version go1.27.3 linux/amd64", True),
+], ids=["1.27.2", "1.26.9", "1.25.14", "1.26.10", "1.27.3"])
 def test_the_go_floor_is_named_by_both_branches(monkeypatch, out, meets):
-    """"`go` 1.27.1 is older than the recommended 1.26.9" contradicted itself:
-    1.27.1 is newer, and misses the fix that 1.27.2 carries."""
+    """"`go` 1.27.2 is older than the recommended 1.26.10" would contradict
+    itself: 1.27.2 is newer, and misses the fix that 1.27.3 carries."""
     monkeypatch.setattr(config.shutil, "which", lambda b: f"/usr/bin/{b}")
     monkeypatch.setattr(config, "_probe_version_text", lambda n, cli: out)
     info = config.tool_version("go")
     assert info.ok is meets and not info.blocked
-    assert info.summary().endswith("(require >= 1.26.9 / 1.27.2)")
+    assert info.summary().endswith("(require >= 1.26.10 / 1.27.3)")
     if not meets:
-        assert "misses the fix in the recommended 1.26.9 / 1.27.2" in info.detail
+        assert "misses the fix in the recommended 1.26.10 / 1.27.3" in info.detail
         assert "older than" not in info.detail
+
+
+def test_each_status_hint_names_the_floor_its_probe_holds():
+    """The `harness status` hints (config.TOOLS) are written by hand beside the
+    floor tables they quote. A floor raised without its hint — go 1.26.9 /
+    1.27.2 → 1.26.10 / 1.27.3 — would tell the operator the old one, and nothing
+    else notices: that mutant passed every other test."""
+    for name, floor in config.TOOL_MIN_VERSIONS.items():
+        shown = config._FLOOR_TEXT.get(name, floor)
+        assert f">= {shown} recommended" in config.TOOLS[name], (name, config.TOOLS[name])
+    for name, floor in config.TOOL_HARD_MIN_VERSIONS.items():
+        assert f"< {floor}" in config.TOOLS[name], (name, config.TOOLS[name])
 
 
 # ── escape sequences around a version ─────────────────────────────────────────

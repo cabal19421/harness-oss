@@ -703,13 +703,19 @@ argv = sys.argv[1:]
 if "--version" in argv:
     print("1.0.0 (stand-in)")
     sys.exit(0)
+# Like some agent CLIs' option parsers: --max-turns is declared but hidden from
+# --help, and an option that takes a value fails the parse when its value is
+# missing, before --help is honoured (harness's flag probe).
+if argv and argv[-1] in ("--max-turns", "--max-budget-usd"):
+    sys.stderr.write("error: option '%s <n>' argument missing\n" % argv[-1])
+    sys.exit(1)
 if "--help" in argv or "-h" in argv:
     print("Options:\n  --allowedTools, --allowed-tools <tools...>  allow\n"
           "  --json-schema <schema>  JSON Schema\n"
           "  --permission-mode <mode>  (choices: \"acceptEdits\", \"dontAsk\", \"plan\")\n"
           "  --tools <tools...>  Use \"\" to disable all tools\n"
           "  --setting-sources <s>  sources\n  --strict-mcp-config  strict\n"
-          "  --max-turns <n>  turns\n  --max-budget-usd <n>  budget")
+          "  --max-budget-usd <n>  budget")
     sys.exit(0)
 state = os.environ["FAKE_STATE"]
 seconds = float(os.environ.get("FAKE_SECONDS", "60"))

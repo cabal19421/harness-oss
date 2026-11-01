@@ -195,10 +195,13 @@ def test_the_ide_packet_is_committed_without_the_designs_home_paths(tmp_path,
     paths would ship as a tracked file in the same push whose title, body and
     commit message were just scrubbed.
 
-    Only the design-derived fragments are redacted: this packet's job is to tell
-    the operator which directory to open, so ``$HOME`` is deliberately the
-    worktree's own parent here — a blanket pass over the assembled packet would
-    take the worktree and ``--repo`` lines with it and fail this test."""
+    harness's own paths are not published either. The packet used to hand the
+    operator its worktree and ``--repo`` lines verbatim — the operator's
+    ``/home/<account>/…`` layout, on every default-layout ide-handoff PR — but
+    the human reading TASK.md is already in that folder, and ``pipeline
+    complete`` run from inside the worktree finds the main checkout itself. So
+    the packet names the folder and says to run the command there. ``$HOME`` is
+    deliberately the worktree's own parent here."""
     from harness.pipeline.backends import get_backend
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -213,9 +216,12 @@ def test_the_ide_packet_is_committed_without_the_designs_home_paths(tmp_path,
     assert committed.startswith("# Task packet — ")   # the packet really is in it
     assert "/home/dev" not in committed
     assert "~/secretproj/x.py" in committed and "~/secretproj/app.py" in committed
-    # harness's own interpolations survive verbatim, home or not.
-    assert f"| **Worktree** | `{repo}` |" in committed
-    assert f'--repo "{repo}"' in committed
+    # No absolute path of harness's own, home or not: no worktree path, no
+    # `--repo` line — the folder by name, and the command to run inside it.
+    assert str(repo) not in committed and "~/repo" not in committed
+    assert '--repo "' not in committed
+    assert f"| **Worktree** | this folder (`{repo.name}`) |" in committed
+    assert f"harness pipeline complete {ctx.task.id}\n" in committed
 
 
 def test_the_packets_oracle_commands_are_scrubbed_like_its_other_fragments(
@@ -861,10 +867,10 @@ def test_a_credential_in_the_validate_line_or_the_title_never_reaches_the_packet
     assert "hunter2hunter2hunter2" not in committed
     assert "/home/otheruser" not in committed and "~/secretproj/prod.yml" in committed
     assert "[REDACTED]" in committed
-    # …and the documented exemption still holds: harness's own interpolations
-    # are what this packet exists to hand the operator, so they stay verbatim.
-    assert f"| **Worktree** | `{repo}` |" in committed
-    assert f'--repo "{repo}"' in committed
+    # …and harness's own paths are not published either: the one scrub runs over
+    # the whole packet, and the packet carries no absolute path to exempt.
+    assert str(repo) not in committed and '--repo "' not in committed
+    assert f"harness pipeline complete {ctx.task.id}\n" in committed
 
 
 def test_the_preflight_fragments_are_scrubbed_for_secrets_too(tmp_path):
@@ -879,3 +885,334 @@ def test_the_preflight_fragments_are_scrubbed_for_secrets_too(tmp_path):
         preflight_findings="- `cfg.py` L2 [call] api_key=" + _FAKE_KEY + " unknown\n")
 
     assert _FAKE_KEY not in packet and packet.count("[REDACTED]") >= 2
+
+
+# ── the packet publishes no path of harness's own ─────────────────────────────
+
+
+def _managed(tmp_path: Path, *, task_id: str = "t1", home: Path | None = None):
+    """A repository OUTSIDE ``$HOME`` with a real managed worktree for *task_id*
+    (the layout where only harness's own paths can carry the operator's layout:
+    the home pass has nothing to rewrite)."""
+    from harness.pipeline import PipelineConfig, Task
+    from harness.pipeline.backends.base import ImplementContext
+    from harness.pipeline.trace import Tracer
+    from harness.pipeline.worktree import WorktreeManager
+
+    repo = tmp_path / "srv" / "proj"
+    repo.mkdir(parents=True)
+    for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"]):
+        _git(args, repo)
+    (repo / "app.py").write_text("x = 1\n")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "init"], repo)
+    root = tmp_path / "srv" / ".harness-wt" / "proj"
+    wt = WorktreeManager(repo, root, base_branch="main").ensure(task_id)
+    cfg = PipelineConfig(repo=repo, designs_dir="designs", pr_mode="local",
+                         worktree_root=root)
+    task = Task(id=task_id, title="Do the thing", design_doc="d.md", branch=wt.branch,
+                description="build it", validation=['python -c "print(1)"'])
+    ctx = ImplementContext(task=task, worktree=Path(wt.path).resolve(), base_branch="main",
+                           config=cfg, trace=Tracer(state_dir=tmp_path / "state",
+                                                    run_id="r1", task_id=task_id))
+    return ctx, repo.resolve(), root.resolve()
+
+
+def test_the_packet_publishes_no_path_of_harness_s_own_outside_home(tmp_path,
+                                                                    monkeypatch):
+    """Outside ``$HOME`` the home pass rewrites nothing, so the worktree row, the
+    ``--repo`` line and any of harness's paths a fragment carried (the grounding
+    findings render resolved paths) published the layout verbatim. One scrub
+    over the whole packet now rewrites the task's worktree, the worktree root
+    and the main checkout to placeholders before the home pass runs."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, repo, root = _managed(tmp_path)
+    wt = ctx.worktree
+
+    packet = IdeHandoffBackend()._render_packet(
+        ctx, preflight_summary=f"1 symbol unresolved under {wt}",
+        preflight_findings=(f"- `{wt}/app.py` L1 [call] nope\n"
+                            f"- `{root}/wt-other/x.py` L2 [call] nope\n"
+                            f"- `{repo}/.venv/lib/site.py` L3 [call] nope\n"))
+
+    for path in (wt, root, repo):
+        assert str(path) not in packet, path
+    assert "{worktree}/app.py" in packet and "{worktrees}/wt-other/x.py" in packet
+    assert "{repo}/.venv/lib/site.py" in packet
+    assert "| **Worktree** | this folder (`wt-t1`) |" in packet
+    assert "harness pipeline complete t1\n" in packet and '--repo "' not in packet
+    assert packet.rstrip().endswith("<!-- harness:task=t1 -->")
+
+
+def test_a_review_round_outside_home_publishes_no_worktree_path(tmp_path, monkeypatch):
+    """The second leak of the same layout: a review round's traceback names the
+    worktree, and the round is appended to the TRACKED packet the next complete
+    pushes. Unfixed: ``File "/…/srv/.harness-wt/proj/wt-t1/check.py"`` reached the
+    origin."""
+    from harness.pipeline.backends.ide_handoff import PACKET_NAME, append_feedback_round
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, repo, root = _managed(tmp_path)
+    wt = ctx.worktree
+    (wt / PACKET_NAME).write_text("# packet\n<!-- harness:task=t1 -->\n")
+
+    assert append_feedback_round(
+        wt,
+        "Traceback (most recent call last):\n"
+        f'  File "{wt}/check.py", line 2, in <module>\n'
+        f'  File "{repo}/.venv/lib/python3.14/site-packages/x.py", line 9\n'
+        f"also touched {root}/wt-dep/shared.py\n",
+        risk="high", summary=f"oracle red in {wt}") == 1
+
+    published = (wt / PACKET_NAME).read_text(encoding="utf-8")
+    for path in (wt, root, repo):
+        assert str(path) not in published, path
+    assert 'File "{worktree}/check.py", line 2' in published
+    assert "{repo}/.venv/lib/python3.14/site-packages/x.py" in published
+    assert "{worktrees}/wt-dep/shared.py" in published
+    assert "oracle red in {worktree}" in published
+
+
+def test_a_task_id_a_loose_secret_pattern_would_eat_survives_the_whole_packet_scrub(
+        tmp_path, monkeypatch):
+    """The scrub now runs over harness's own text too, and the loose ``sk-``
+    shape matches inside an ordinary id (``…fla[sk-app-factory…]``). The id, the
+    branch and the folder are harness's own and must survive it verbatim: the
+    command the packet hands the operator has to run."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    tid = "add-flask-app-factory-with-config-loading"
+    ctx, _repo, _root = _managed(tmp_path, task_id=tid)
+
+    packet = IdeHandoffBackend()._render_packet(ctx, preflight_summary="ok",
+                                                preflight_findings="")
+
+    assert f"| **Task id** | `{tid}` |" in packet
+    assert f"| **Branch** | `agent/{tid}` |" in packet
+    assert f"| **Worktree** | this folder (`wt-{tid}`) |" in packet
+    assert f"harness pipeline complete {tid}\n" in packet
+    assert "[REDACTED]" not in packet
+
+
+def test_complete_from_inside_the_worktree_needs_no_repo_flag(tmp_path):
+    """Why the packet can drop ``--repo``: ``pipeline complete`` defaults its
+    repository to the working directory, and a config pointed at a linked
+    worktree resolves the main checkout from it."""
+    from harness.pipeline import PipelineConfig
+
+    ctx, repo, root = _managed(tmp_path)
+
+    cfg = PipelineConfig(repo=ctx.worktree, designs_dir="designs")
+
+    assert cfg.repo == repo and cfg.worktree_root == root
+
+
+def test_a_design_outside_the_repo_and_home_publishes_no_absolute_path(tmp_path,
+                                                                       monkeypatch):
+    """``--designs`` outside the repository: ``ingest._rel`` records such a design
+    by its ABSOLUTE path, and outside ``$HOME`` nothing rewrote it — the Source
+    design row and the description's ``From design … (<path>)`` both published
+    the layout verbatim. The designs directory is a fourth root of the
+    worktree pass now, named ``{designs}`` — and a design recorded by an
+    absolute path outside the CONFIGURED designs directory (a plan ingested
+    under another ``--designs``) has its own directory named so."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, _repo, _root = _managed(tmp_path)
+    designs = (tmp_path / "srv" / "designs").resolve()
+    designs.mkdir()
+    doc = designs / "feature.md"
+    ctx.config.designs_dir = designs
+    ctx.task.design_doc = str(doc)
+    ctx.task.description = f"From design 'D' ({doc}):\n\nbuild it"
+
+    packet = IdeHandoffBackend()._render_packet(ctx, preflight_summary="ok",
+                                                preflight_findings="")
+
+    assert str(designs) not in packet
+    assert "| **Source design** | `{designs}/feature.md` |" in packet
+    assert "From design 'D' ({designs}/feature.md):" in packet
+
+    ctx.config.designs_dir = _repo / "designs"           # rendered under another --designs
+    packet = IdeHandoffBackend()._render_packet(ctx, preflight_summary="ok",
+                                                preflight_findings="")
+
+    assert str(designs) not in packet
+    assert "| **Source design** | `{designs}/feature.md` |" in packet
+    assert "From design 'D' ({designs}/feature.md):" in packet
+
+
+def test_the_source_design_row_is_not_mangled_by_the_loose_secret_shape(tmp_path,
+                                                                        monkeypatch):
+    """The whole-packet scrub reached the Source design row, which used to be
+    left raw, and the loose ``sk-`` shape matches inside an ordinary design name:
+    ``designs/ri[REDACTED].md``. The row is harness's own record of where the
+    task came from: it takes the control, path and home passes, and comes
+    through the secret pass verbatim, like the task id and the branch."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, _repo, _root = _managed(tmp_path)
+    name = "designs/risk-scoring-for-loan-applications.md"
+    ctx.task.design_doc = name
+
+    packet = IdeHandoffBackend()._render_packet(ctx, preflight_summary="ok",
+                                                preflight_findings="")
+
+    assert f"| **Source design** | `{name}` |" in packet
+    assert "[REDACTED]" not in packet
+
+    # Still harness's control pass: a file name may carry escape bytes.
+    ctx.task.design_doc = "designs/x\x1b]8;;https://e.invalid\x07y.md"
+    packet = IdeHandoffBackend()._render_packet(ctx, preflight_summary="ok",
+                                                preflight_findings="")
+    row = next(line for line in packet.splitlines() if "**Source design**" in line)
+    assert "\x1b" not in row and "\x07" not in row and "y.md" in row
+
+
+def test_a_harness_path_ending_a_sentence_is_rewritten_too(tmp_path, monkeypatch):
+    """The worktree pass refused a match when a ``.`` followed the path, so a
+    path ending a sentence was published verbatim — in a review round outside
+    ``$HOME``, where the home pass rewrites nothing either. A ``.`` followed by
+    a name character still means another name: ``…/proj.git`` is not
+    ``…/proj``."""
+    from harness.pipeline.backends.ide_handoff import PACKET_NAME, append_feedback_round
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, repo, root = _managed(tmp_path)
+    wt = ctx.worktree
+    roles = {"worktree": wt, "worktree_root": root, "repo": repo}
+
+    text = sanitize_publication(f"see {repo}.\nopen {wt}. Then retry\nlist {root}...\n"
+                                f"(in {wt}.)\nend {repo}.", **roles)
+
+    for path in (wt, root, repo):
+        assert str(path) not in text, path
+    assert "see {repo}.\n" in text and "open {worktree}. Then retry" in text
+    assert "list {worktrees}...\n" in text and "(in {worktree}.)" in text
+    assert text.endswith("end {repo}.")
+    # Another name that only starts with the path keeps its own spelling.
+    assert sanitize_publication(f"{repo}.git and {repo}.d/x", **roles) == \
+        f"{repo}.git and {repo}.d/x"
+
+    (wt / PACKET_NAME).write_text("# packet\n<!-- harness:task=t1 -->\n")
+    assert append_feedback_round(wt, f"error: cannot open {wt}.\nsee {repo}.\n",
+                                 risk="high") == 1
+    published = (wt / PACKET_NAME).read_text(encoding="utf-8")
+    for path in (wt, root, repo):
+        assert str(path) not in published, path
+    assert "cannot open {worktree}.\n" in published and "see {repo}.\n" in published
+
+
+def test_a_design_recorded_under_another_spelling_of_the_designs_dir_publishes_no_path(
+        tmp_path, monkeypatch):
+    """Ingested with ``--designs <alias>`` (a symlink to the designs directory)
+    and rendered with ``--designs <its realpath>``, a design kept outside the
+    repository and ``$HOME`` is inside the configured directory by realpath —
+    but recorded under the alias, and only the configured directory's
+    spellings were rewritten: the Source design row and the description's
+    ``From design … (<path>)`` published the alias path verbatim. The spelling
+    the design was recorded under is scrubbed too now, ``{designs}``-relative
+    where it resolves to the designs directory; a design file that is itself a
+    link into it has its own directory named so. The cases rewritten before
+    stay rewritten, the configured spelling with them."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, _repo, _root = _managed(tmp_path)
+    srv = (tmp_path / "srv").resolve()
+    real = srv / "real-designs"
+    (real / "sub").mkdir(parents=True)
+    (real / "feature.md").write_text("# D\n")
+    alias, alias2, elsewhere = srv / "designs-link", srv / "designs-link2", srv / "elsewhere"
+    alias.symlink_to(real, target_is_directory=True)
+    alias2.symlink_to(real, target_is_directory=True)
+    elsewhere.mkdir()
+    (elsewhere / "feature.md").symlink_to(real / "feature.md")
+
+    cases = [  # (configured --designs, the design as recorded, what the packet shows)
+        (real, alias / "feature.md", "feature.md"),                 # recorded via an alias
+        (real, alias / "sub" / "feature.md", "sub/feature.md"),     # …below it
+        (alias2, alias / "feature.md", "feature.md"),               # two aliases
+        (real, elsewhere / "feature.md", "feature.md"),             # a file linked in
+        (alias, real / "feature.md", "feature.md"),                 # the reverse case
+        (real, real / "feature.md", "feature.md"),                  # the plain case
+    ]
+    for configured, doc, shown in cases:
+        ctx.config.designs_dir = configured
+        ctx.task.design_doc = str(doc)
+        ctx.task.description = f"From design 'D' ({doc}):\n\nbuild it"
+
+        packet = IdeHandoffBackend()._render_packet(
+            ctx, preflight_summary=f"grounded against {configured}", preflight_findings="")
+
+        where = (configured, doc)
+        for spelling in (real, alias, alias2, elsewhere):
+            assert str(spelling) not in packet, (*where, spelling)
+        assert f"| **Source design** | `{{designs}}/{shown}` |" in packet, where
+        assert f"From design 'D' ({{designs}}/{shown}):" in packet, where
+        assert "grounded against {designs}" in packet, where
+
+
+@pytest.mark.parametrize("configured", ["absolute", "none", "a-nul-in-it-too",
+                                        "an-escape-in-a-real-directory-name",
+                                        "an-escape-in-a-symlinked-directory-name"])
+def test_a_nul_in_the_recorded_design_directory_still_renders_a_packet_with_no_path(
+        tmp_path, monkeypatch, configured):
+    """A NUL byte in a directory component of the recorded design path — only a
+    hand-edited plan can carry one: no file-system path, argument or
+    environment variable can — or in the configured designs directory too.
+    ``Path.resolve`` raises ValueError on it, and the per-root scrub's resolver
+    caught only OSError and RuntimeError: PRE-FIX ``_render_packet`` raised
+    (and, with no designs directory configured, rendered the absolute path, its
+    NUL shown as U+FFFD, because the path pass compared the root's raw spelling
+    with text whose controls were already rewritten). Now the packet renders,
+    the root is matched as the text spells it, and no absolute path is
+    published. The same holds for a real designs directory whose name holds an
+    escape sequence, which the control pass drops from the text — and when it
+    is a link, the directory it resolves to is still rewritten too: the raw
+    spelling is kept beside the one the text carries."""
+    from harness.pipeline.backends.ide_handoff import IdeHandoffBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    ctx, _repo, _root = _managed(tmp_path)
+    srv = (tmp_path / "srv").resolve()
+    (srv / "designs").mkdir()
+    escaped, real = srv / "de\x1b[1msigns", srv / "real-designs"
+    if configured == "an-escape-in-a-real-directory-name":
+        escaped.mkdir()
+        (escaped / "feature.md").write_text("# D\n")
+    elif configured == "an-escape-in-a-symlinked-directory-name":
+        real.mkdir()
+        (real / "feature.md").write_text("# D\n")
+        escaped.symlink_to(real, target_is_directory=True)
+    ctx.config.designs_dir = {"absolute": srv / "designs", "none": None,
+                              "a-nul-in-it-too": f"{srv}/de\x00signs"}.get(configured, escaped)
+    doc = (f"{escaped}/feature.md" if "escape" in configured
+           else f"{srv}/des\x00igns/feature.md")
+    ctx.task.design_doc = doc
+    ctx.task.description = f"From design 'D' ({doc}):\n\nbuild it"
+    linked = configured == "an-escape-in-a-symlinked-directory-name"
+
+    packet = IdeHandoffBackend()._render_packet(
+        ctx, preflight_summary=f"grounded against {real}" if linked else "ok",
+        preflight_findings="")
+
+    assert str(srv) not in packet and str(tmp_path) not in packet
+    assert "\x00" not in packet and "\x1b" not in packet
+    assert "| **Source design** | `{designs}/feature.md` |" in packet
+    assert "From design 'D' ({designs}/feature.md):" in packet
+    if linked:
+        assert "grounded against {designs}" in packet

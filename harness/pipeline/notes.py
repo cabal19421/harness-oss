@@ -98,13 +98,26 @@ def _proc_cmdline(pid: int) -> str:
     return raw.decode("utf-8", "replace")[:_CMDLINE_MAX]
 
 
-def _ps_lstart(pid: int) -> str:
-    """macOS fallback identity: ``LC_ALL=C ps -o lstart= -p <pid>`` (no /proc)."""
+def _ps_lstart(pid: int, *, utc: bool = False) -> str:
+    """macOS fallback identity: ``ps -o lstart= -p <pid>`` (no /proc); ``""`` if no answer.
+
+    ``ps`` renders the start time in the LOCAL time zone, so the same process
+    reads differently to a reader in another zone — launchd or cron, a tmux
+    server or a shell profile with its own ``TZ``, a Mac that changed zone
+    between a beat and a read. *utc* pins ``TZ=UTC0`` for a rendering that is
+    the same everywhere; ``LC_ALL=C`` always pins the month and day names.
+    ``""`` covers everything that is not an answer — ``ps`` could not run, timed
+    out, failed, or found no such process — so :meth:`Heartbeat.liveness` never
+    reads it as death.
+    """
+    env = {**os.environ, "LC_ALL": "C"}
+    if utc:
+        env["TZ"] = "UTC0"
     try:
         proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
                               capture_output=True, text=True, timeout=10,
                               check=False,  # returncode is inspected below
-                              env={**os.environ, "LC_ALL": "C"})
+                              env=env)
     except (OSError, subprocess.SubprocessError):
         return ""
     return proc.stdout.strip() if proc.returncode == 0 else ""
@@ -129,8 +142,16 @@ def process_identity(pid: int) -> dict:
             return {}
         return {"proc_starttime": start, "proc_cmdline": _proc_cmdline(pid)}
     if sys.platform == "darwin":
-        lstart = _ps_lstart(pid)
-        return {"proc_lstart": lstart} if lstart else {}
+        # Both renderings: the UTC one is what an upgraded reader compares, in
+        # any zone; the local one is what a reader not yet upgraded compares.
+        identity: dict[str, str] = {}
+        pinned = _ps_lstart(pid, utc=True)
+        if pinned:
+            identity["proc_lstart_utc"] = pinned
+        local = _ps_lstart(pid)
+        if local:
+            identity["proc_lstart"] = local
+        return identity
     return {}
 
 
@@ -151,7 +172,8 @@ class Heartbeat:
     # Process identity (see process_identity).
     proc_starttime: str = ""
     proc_cmdline: str = ""
-    proc_lstart: str = ""
+    proc_lstart: str = ""          # macOS: ps lstart in the WRITER's zone (legacy)
+    proc_lstart_utc: str = ""      # macOS: ps lstart pinned to UTC — zone-proof
 
     @property
     def age_seconds(self) -> float:
@@ -218,11 +240,8 @@ class Heartbeat:
                             "recorded — the recorded process is dead", self.pid, self.task_id)
                 return "dead"
             return "alive"
-        if sys.platform == "darwin" and self.proc_lstart:  # pragma: no cover - macOS only
-            lstart = _ps_lstart(self.pid)
-            if not lstart:
-                return "dead"
-            return "alive" if lstart == self.proc_lstart else "dead"
+        if sys.platform == "darwin" and (self.proc_lstart_utc or self.proc_lstart):
+            return self._ps_liveness()
         # No identity binding available on this platform: absence is still proof
         # of death, but presence cannot rule out pid reuse → never "alive".
         try:
@@ -232,6 +251,49 @@ class Heartbeat:
         except (OSError, AttributeError) as exc:  # pragma: no cover - platform-dependent
             logger.debug("cannot probe pid %d (task %s) liveness (%s: %s) — unknown",
                          self.pid, self.task_id, type(exc).__name__, exc)
+        return "unknown"
+
+    def _ps_liveness(self) -> str:
+        """The macOS probe (no ``/proc``): death by ``os.kill``, identity by ``ps``.
+
+        Death is proven by the kernel (``ProcessLookupError``), never by ``ps``
+        printing nothing — a ``ps`` that cannot run, times out or fails prints
+        nothing too. A live pid is the recorded process when its start time
+        matches: the UTC rendering when the record has one (a mismatch there is
+        a different process: the pid was reused), else the legacy local one,
+        whose mismatch can be a different process or only a reader in another
+        time zone — ``unknown``, so a run that beat before the upgrade never
+        reads dead.
+        """
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            logger.debug("pid %d (task %s) does not exist — process is dead",
+                         self.pid, self.task_id)
+            return "dead"                           # positive proof of death
+        except PermissionError:
+            pass                                    # it exists, someone else's
+        except OSError as exc:
+            logger.debug("cannot probe pid %d (task %s) liveness (%s: %s) — unknown",
+                         self.pid, self.task_id, type(exc).__name__, exc)
+            return "unknown"
+        pinned = bool(self.proc_lstart_utc)
+        now = _ps_lstart(self.pid, utc=pinned)
+        if not now:
+            logger.debug("`ps -o lstart=` gave no answer for pid %d (task %s) — "
+                         "liveness unknown (no answer is not proof of death)",
+                         self.pid, self.task_id)
+            return "unknown"
+        if now == (self.proc_lstart_utc if pinned else self.proc_lstart):
+            return "alive"
+        if pinned:
+            logger.info("pid %d (task %s) is now a DIFFERENT process (its UTC start "
+                        "time changed) — the recorded process is dead and its pid "
+                        "reused", self.pid, self.task_id)
+            return "dead"
+        logger.info("pid %d (task %s) reads a different local start time than the "
+                    "heartbeat's legacy record — another process, or only a reader "
+                    "in another time zone; liveness unknown", self.pid, self.task_id)
         return "unknown"
 
     def process_alive(self) -> bool:
@@ -404,7 +466,8 @@ class RunLog:
         atomic_write_text(self.heartbeat_file, json.dumps(hb))
         logger.debug("heartbeat: task=%s status=%s iter=%d pid=%s gen=%s identity=%s → %s",
                      self.task_id, status, iteration, pid, hb["gen"] or "(none)",
-                     hb.get("proc_starttime") or hb.get("proc_lstart") or "(none)",
+                     hb.get("proc_starttime") or hb.get("proc_lstart_utc")
+                     or hb.get("proc_lstart") or "(none)",
                      self.heartbeat_file)
 
     def read_heartbeat_record(self) -> HeartbeatRead:
@@ -439,6 +502,7 @@ class RunLog:
                 proc_starttime=str(d.get("proc_starttime", "") or ""),
                 proc_cmdline=str(d.get("proc_cmdline", "") or ""),
                 proc_lstart=str(d.get("proc_lstart", "") or ""),
+                proc_lstart_utc=str(d.get("proc_lstart_utc", "") or ""),
             )
         except (TypeError, ValueError) as exc:
             logger.warning("malformed heartbeat fields in %s (%s: %s) — liveness for "

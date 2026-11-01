@@ -498,7 +498,12 @@ class PipelineOrchestrator:
 
         for task in plan.by_status("done"):
             wt = self._wt.path_for(task.id)
-            if not wt.is_dir():
+            # By lstat, never is_dir(): a symlink on the path is remove()'s to
+            # refuse, naming it — not the tree it points at to reclaim — and a
+            # directory that is gone while git still has it registered is
+            # remove()'s to deregister (that path only), or its branch stays
+            # pinned for good: no repository-wide prune clears it any more.
+            if not self._wt.occupied(task.id):
                 continue
             _reclaim(task.id, wt, "done task")
 
@@ -514,7 +519,21 @@ class PipelineOrchestrator:
                             "(not ours to reclaim)", wt)
                 skipped.append(f"{wt} (not a pipeline worktree)")
                 continue
-            if not allow_unlanded and not self._wt.is_landed(task_id):
+            proof = None if allow_unlanded else self._wt.landed_proof(task_id)
+            if proof is not None and proof.landed is not True:
+                # Three-state (gitutil.landed_proof): a proof git could not run
+                # is named as such — never reported as work that did not land.
+                if proof.landed is None:
+                    logger.info("prune: keeping unplanned worktree %s — whether "
+                                "branch %s landed in %s cannot be proven: %s",
+                                wt, self._wt.branch_for(task_id), self._wt.base,
+                                proof.detail)
+                    self._tracer.for_task(task_id).span(
+                        "prune", action="skip", path=str(wt),
+                        reason="landed-proof-unavailable", why="unplanned worktree",
+                        git_code=proof.git_code, detail=proof.detail)
+                    skipped.append(f"{wt} (landed-proof-unavailable)")
+                    continue
                 logger.info("prune: keeping unplanned worktree %s — branch %s has "
                             "not landed in %s (allow_unlanded reclaims it anyway)",
                             wt, self._wt.branch_for(task_id), self._wt.base)

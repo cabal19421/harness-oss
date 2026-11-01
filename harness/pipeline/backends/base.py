@@ -32,7 +32,7 @@ from pathlib import Path
 
 from harness.log import fmt_cmd, get_logger, trunc
 
-from .. import procutil, shutdown
+from .. import procutil, procwait, shutdown
 from ..gitutil import commits_ahead, pwd_for
 from ..grounding_gate import GateResult, GroundingGate
 from ..spec import PipelineConfig, Task
@@ -705,8 +705,9 @@ class OneshotResult:
     of them may fail open:
 
     * ``ran=False`` — the call could not be made or completed at all (backend
-      unavailable, launch failure, timeout, non-zero exit). Infrastructure: the
-      gate skips, exactly like every other fail-open branch in the pipeline.
+      unavailable, launch failure, timeout, a signal, a non-zero exit that
+      delivered no answer). Infrastructure: the gate skips, exactly like every
+      other fail-open branch in the pipeline.
     * ``ran=False`` with ``abstain`` set — the call could not be made, for a
       reason that must NOT read as a skip: the OS refused to exec it (E2BIG,
       refused identically on every sample), a call that ran with tools was
@@ -738,6 +739,14 @@ class OneshotResult:
     it is set and ``structured`` is ``None`` the model answered but the answer
     did not conform — output-format drift in the one contract the gate depends
     on, which must NOT be silently skipped (see :mod:`harness.pipeline.verifier`).
+
+    The exit code does not outrank what was delivered: an agent-cli call that
+    exited non-zero after the CLI delivered a schema-validated answer is
+    ``ran=True`` with that ``structured`` object, and one whose CLI reports it
+    never got a conforming answer (``error_max_structured_output_retries``) is
+    ``ran=True`` with ``schema_enforced`` and no ``structured`` — unless the
+    call was terminated or refused by the usage limit, which keep the meanings
+    above.
     """
 
     ran: bool = False
@@ -1436,11 +1445,12 @@ def run_validation_report(commands: list[str], cwd: Path, *, timeout: int = 1800
             proc = _run_one_validation(cmd, cwd, timeout)
         except subprocess.TimeoutExpired:
             if shutdown.requested():
-                # Timed out with a shutdown requested: the signal is what the
-                # command was waiting out (a setsid'd descendant holding the
-                # output pipe keeps the run open after its group is killed), so
-                # the timeout is no verdict either — and a baseline run must not
-                # memoise it as one.
+                # Timed out with a shutdown requested: the command itself
+                # outlived the handler's group signal (one that ignores TERM)
+                # until its deadline — a pipe a leftover holds no longer keeps
+                # the run open (procwait: the wait is for the exit). The timeout
+                # is no verdict either, and a baseline run must not memoise it
+                # as one.
                 interrupted = True
                 chunks.append(f"[timed out after {timeout}s with a shutdown "
                               f"requested — no verdict]")
@@ -2515,6 +2525,15 @@ def _run_grouped(args, *, shell: bool, cwd: Path, timeout: int,
     grandchildren survive and keep mutating the worktree while the loop resets
     it for the next agent — the same orphan race ``_run_agent`` guards against
     for the agent process, previously left open for the oracle.
+
+    The command is judged on its EXIT, not on its output pipes
+    (:mod:`harness.pipeline.procwait`): a process it started that kept stdout
+    or stderr open — a server a test leaves, a shell ``&`` — used to hold the
+    read until the timeout and turn a pass into ``timed out``. Once the command
+    exits, its pipes get ``procwait.PIPE_DRAIN_SECONDS`` to reach EOF; then
+    harness stops reading, closes them, keeps the real exit code and says so in
+    stderr, and the caller's post-return sweep decides the leftover. A command
+    still running at *timeout* still raises ``TimeoutExpired``.
     """
     import os as _os
     import signal as _signal
@@ -2553,8 +2572,8 @@ def _run_grouped(args, *, shell: bool, cwd: Path, timeout: int,
         start_new_session=(_os.name == "posix"),
         env=env,
     )
-    # Registered for the whole call — the communicate and the timeout kill
-    # ladder below. start_new_session puts the suite out of reach of the
+    # Registered for the wait and the timeout kill ladder below — until the
+    # leader is reaped. start_new_session puts the suite out of reach of the
     # terminal's Ctrl-C, so without this the first signal terminated nothing
     # and the run waited out the whole suite (up to `timeout` per command), and
     # the second signal's hard exit left it running orphaned, cwd in the
@@ -2562,11 +2581,12 @@ def _run_grouped(args, *, shell: bool, cwd: Path, timeout: int,
     # group would otherwise outlive the hard exit. The killer signals the group
     # and never reaps (it runs inside the handler, in this very frame). Once
     # the block is left the leader is reaped and its pid is no longer this
-    # process's to signal. A process that left the group (setsid) is beyond
-    # this — callers sweep the tree by cwd before resetting or reusing it.
+    # process's to signal — which is why the drain of a pipe that outlived the
+    # leader runs AFTER the block. A process that left the group (setsid) is
+    # beyond this — callers sweep the tree by cwd before resetting or reusing it.
     with shutdown.killable(proc, shutdown.group_killer):
         try:
-            out, err = proc.communicate(timeout=timeout)
+            done = procwait.wait_exit(proc, timeout)
         except subprocess.TimeoutExpired:
             if _os.name == "posix" and hasattr(_os, "killpg"):
                 for sig in (_signal.SIGTERM, _signal.SIGKILL):
@@ -2575,7 +2595,8 @@ def _run_grouped(args, *, shell: bool, cwd: Path, timeout: int,
                     except (OSError, ProcessLookupError):
                         break
                     try:
-                        proc.communicate(timeout=5)
+                        # Returns as soon as the leader is dead, held pipe or not.
+                        procwait.wait_exit(proc, 5)
                         break
                     except subprocess.TimeoutExpired:
                         continue
@@ -2583,7 +2604,24 @@ def _run_grouped(args, *, shell: bool, cwd: Path, timeout: int,
                 proc.kill()
                 with suppress(subprocess.TimeoutExpired, OSError):
                     proc.communicate(timeout=5)
+            # A timeout has no output to keep: stop holding what a leftover holds.
+            procwait.close_pipes(proc)
             raise
+    if done is not None:
+        out, err = done
+        return subprocess.CompletedProcess(args, proc.returncode, out, err)
+    # The command exited; something it started still holds its output pipe.
+    out, err, held = procwait.drain(proc, stop=shutdown.requested)
+    if held:
+        logger.warning("validation command exited rc=%s, but a process it started "
+                       "kept its output pipe open — stopped reading %gs after the "
+                       "exit and closed the pipe; the exit code stands: %s",
+                       proc.returncode, procwait.PIPE_DRAIN_SECONDS,
+                       trunc(args if isinstance(args, str) else " ".join(args), 120))
+        err = (err or "") + (f"\n[the command exited rc={proc.returncode}; a process "
+                             f"it started kept its output pipe open, so harness "
+                             f"stopped reading {procwait.PIPE_DRAIN_SECONDS:g}s after "
+                             f"the exit and closed the pipe]")
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 

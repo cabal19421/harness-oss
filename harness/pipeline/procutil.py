@@ -264,7 +264,22 @@ def _proc_starttime(pid: int) -> str | None:
     return _starttime_field(stat)
 
 
-def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
+def _targets_psutil(root: Path, protected: set[int],
+                    vanished: set[int] | None = None) -> list[_Target]:
+    """One psutil pass. Pids that were gone before their cwd could be read
+    (exited mid-scan, or a zombie) are added to *vanished*.
+
+    ``process_iter`` reports only some of them. It builds each ``Process`` as
+    the iteration reaches its pid and DROPS, without a word, a pid that was
+    already reaped by then (it catches ``NoSuchProcess`` inside the
+    generator) — the vanishing parent of a daemonising handoff, exactly. Only
+    a zombie, or an exit between ``Process()`` and ``cwd()``, ever raised
+    here, so on a host with no persistent zombie the re-scan of
+    :func:`_scan_targets` almost never fired (19 and 20 of 20 handoffs missed
+    at 2 ms of set-up, in two runs). So, with *vanished* to fill, the pass
+    lists the pids itself first and also counts each listed pid the iteration
+    never yielded.
+    """
     # psutil 6.0+ memoises process_iter across calls; the supervisor is a
     # long-lived process that rescans on every recovery pass, so a stale entry
     # would otherwise persist for the life of the daemon.
@@ -273,10 +288,16 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
         cache_clear()
     targets: list[_Target] = []
     unreadable = 0
+    # Taken just before process_iter takes its own: a listed pid it does not
+    # yield was gone before psutil could build its Process (a pid born between
+    # the two listings is simply yielded, and read, in this same pass).
+    listed: set[int] = set(psutil.pids()) if vanished is not None else set()
+    yielded: set[int] = set()
     # No `attrs=` — `proc.pid` is a plain attribute, while passing attrs forces
     # a full as_dict() round-trip for every process on the machine.
     for proc in psutil.process_iter():
         pid = proc.pid
+        yielded.add(pid)
         if pid in protected:
             continue
         try:
@@ -284,6 +305,10 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
         except (psutil.AccessDenied, PermissionError):
             unreadable += 1             # another user's process: not ours to read
             continue
+        except psutil.NoSuchProcess:    # ZombieProcess too: its cwd never reads
+            if vanished is not None:
+                vanished.add(pid)
+            continue                    # exited mid-scan
         except (psutil.Error, OSError):
             continue                    # exited mid-scan
         except Exception as exc:        # noqa: BLE001 - contain it to THIS process
@@ -295,6 +320,8 @@ def _targets_psutil(root: Path, protected: set[int]) -> list[_Target]:
             continue
         if cwd and _is_inside(Path(cwd), root):
             targets.append(_Target(pid=pid, proc=proc))
+    if vanished is not None:
+        vanished.update(listed - yielded - protected)
     _log_unreadable(root, unreadable)
     return targets
 
@@ -307,11 +334,13 @@ def _log_unreadable(root: Path, unreadable: int) -> None:
                      "run's writer", root, unreadable)
 
 
-def _targets_proc(root: Path, protected: set[int]) -> list[_Target]:
+def _targets_proc(root: Path, protected: set[int],
+                  vanished: set[int] | None = None) -> list[_Target]:
     """Linux fallback: read ``/proc/<pid>/cwd`` symlinks.
 
     Raises when there is no ``/proc`` to read: that is a scan that could not
-    look, never a directory found quiet.
+    look, never a directory found quiet. Pids whose link was gone (ENOENT or
+    ESRCH: exited mid-scan, or a zombie) are added to *vanished*.
     """
     targets: list[_Target] = []
     unreadable = 0
@@ -329,6 +358,10 @@ def _targets_proc(root: Path, protected: set[int]) -> list[_Target]:
         except PermissionError:
             unreadable += 1             # another user's process: not ours to read
             continue
+        except (FileNotFoundError, ProcessLookupError):
+            if vanished is not None:
+                vanished.add(pid)
+            continue                    # exited mid-scan (or a zombie)
         except OSError:
             continue                    # exited mid-scan
         except Exception as exc:        # noqa: BLE001 - contain it to THIS process
@@ -374,6 +407,26 @@ def _scan_targets(root: Path | str, *, refuse_only: bool) -> list[_Target] | Non
     root it could not look at — on Python 3.14 an EACCES or I/O error on a
     directory above it — while a process can keep its cwd inside such a tree;
     any other failure to look is an unprovable scan, ``None``.
+
+    A pass that saw a listed pid VANISH before its cwd could be read is no
+    proof of a quiet tree: the pid list is taken first and the newest pids are
+    read last, so a process cwd'd here that forks a successor and exits during
+    the pass — a daemonising double fork a launcher left a few ms earlier — is
+    read as gone while its successor, born after the list, was never on it.
+    "Gone" includes a listed pid psutil never yielded, because it was reaped
+    before psutil could build its ``Process`` (:func:`_targets_psutil`); the
+    ``/proc`` pass reads every listed pid. So a pass that found nothing but
+    saw a NEWLY vanished pid — one no earlier pass of this scan reported — is
+    followed by another, at most :data:`_SCAN_PASSES` in all. "Newly" is what
+    keeps it bounded in practice: a zombie's cwd never reads, so a host that
+    has one sees a vanished pid on every pass, and it costs one extra pass,
+    not a loop; on a busy host any process that exits mid-pass counts too, and
+    costs the same. A pass that FINDS something ends the scan at once (every
+    caller looks again while something is found), and running out of passes is
+    accepted as the last pass's answer, never read as busy or unprovable —
+    that would stop every sweep on a fork-busy host. Every scan inherits this:
+    the post-return sweep, the tenant baseline, the relaunch gate,
+    :func:`terminate_in_dir` and recovery.
     """
     root = Path(root).resolve()
     try:
@@ -403,16 +456,39 @@ def _scan_targets(root: Path | str, *, refuse_only: bool) -> list[_Target] | Non
                            "this process's own ancestor, the shell that started "
                            "it)", exc, root)
             return None
-    try:
-        if psutil is not None:
-            return _targets_psutil(root, protected)
-        return _targets_proc(root, protected)
-    except Exception as exc:  # noqa: BLE001 - best-effort; never let scanning crash a caller
-        logger.warning("process scan under %s failed (%s: %s) — the scan is "
-                       "UNPROVABLE; nothing will be signalled, and no caller may "
-                       "read this as a quiet directory",
-                       root, type(exc).__name__, exc)
-        return None
+    scan = _targets_psutil if psutil is not None else _targets_proc
+    reported: set[int] = set()        # pids an earlier pass already saw vanish
+    targets: list[_Target] = []
+    for npass in range(1, _SCAN_PASSES + 1):
+        vanished: set[int] = set()
+        try:
+            targets = scan(root, protected, vanished)
+        except Exception as exc:  # noqa: BLE001 - best-effort; never let scanning crash a caller
+            logger.warning("process scan under %s failed (%s: %s) — the scan is "
+                           "UNPROVABLE; nothing will be signalled, and no caller may "
+                           "read this as a quiet directory",
+                           root, type(exc).__name__, exc)
+            return None
+        newly = vanished - reported
+        if targets or not newly:
+            return targets
+        reported |= vanished
+        if npass < _SCAN_PASSES:
+            logger.debug("scan of %s: %d listed pid(s) vanished before their cwd "
+                         "could be read (%s) — a successor they started may not "
+                         "have been listed; scanning again (pass %d of %d)", root,
+                         len(newly), sorted(newly)[:8], npass + 1, _SCAN_PASSES)
+    logger.debug("scan of %s: pids still vanishing mid-scan after %d passes — the "
+                 "last pass's answer stands", root, _SCAN_PASSES)
+    return targets
+
+
+#: The most passes one scan takes when listed pids keep vanishing before their
+#: cwd could be read (:func:`_scan_targets`). Three cover the classic two-step
+#: daemonisation (parent → child → grandchild) straddling successive passes; a
+#: longer handoff chain, or one landing on the last pass during a fork storm,
+#: is the documented residual.
+_SCAN_PASSES = 3
 
 
 def _targets_in_dir(root: Path | str) -> list[_Target]:

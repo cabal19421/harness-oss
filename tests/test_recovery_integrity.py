@@ -63,14 +63,22 @@ def _backdate_mtimes(path: Path) -> Path:
 
 
 def _dirty_worktree(path: Path) -> Path:
-    """A git repo with one commit plus an uncommitted, half-written iteration."""
-    path.mkdir(parents=True, exist_ok=True)
-    _git(["init", "-q", "-b", "main"], path)
-    _git(["config", "user.email", "t@t"], path)
-    _git(["config", "user.name", "t"], path)
-    (path / "README.md").write_text("# r\n")
-    _git(["add", "-A"], path)
-    _git(["commit", "-q", "-m", "init"], path)
+    """A linked worktree with one commit plus an uncommitted, half-written iteration.
+
+    Made by ``git worktree add``, as every task tree is: recovery stashes and
+    resets only a tree that passes the strict owner proof
+    (``worktree_owner_proof(wt, linked=True)``), which refuses a standalone
+    checkout's ``.git`` directory.
+    """
+    main = path.parent / f"{path.name}-main"
+    main.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", "-b", "main"], main)
+    _git(["config", "user.email", "t@t"], main)
+    _git(["config", "user.name", "t"], main)
+    (main / "README.md").write_text("# r\n")
+    _git(["add", "-A"], main)
+    _git(["commit", "-q", "-m", "init"], main)
+    _git(["worktree", "add", "-q", "-b", f"agent/{path.name}", str(path)], main)
     (path / "work.py").write_text("print('half written')\n")     # uncommitted
     return _backdate_mtimes(path)
 
@@ -304,7 +312,10 @@ def test_an_unreadable_worktree_is_not_recorded_as_a_reset(tmp_path):
     wt = _dirty_worktree(tmp_path / "wt-t1")
     plan = _plan(cfg, _task(worktree=str(wt)))
     RunLog(cfg.state_dir, "t1").beat("implementing", pid=_dead_pid())
-    (wt / ".git" / "index").write_bytes(b"not an index")     # `git status` now fails
+    # A linked worktree's index lives in its admin dir, not under <wt>/.git.
+    index = _git(["rev-parse", "--path-format=absolute", "--git-path", "index"], wt)
+    assert index.returncode == 0, index.stderr
+    Path(index.stdout.rstrip("\n")).write_bytes(b"not an index")   # `git status` now fails
     assert not gitutil.working_tree_dirty(wt)                # …and reads as "clean"
 
     told: list[str] = []
@@ -366,7 +377,10 @@ def test_the_run_summary_counts_verified_recoveries_apart_from_withheld_ones(tmp
     cfg = _cfg(tmp_path, prevent_sleep=False)
     good = _dirty_worktree(tmp_path / "wt-t1")
     unreadable = _dirty_worktree(tmp_path / "wt-t2")
-    (unreadable / ".git" / "index").write_bytes(b"not an index")   # `git status` fails
+    # A linked worktree's index lives in its admin dir, not under <wt>/.git.
+    index = _git(["rev-parse", "--path-format=absolute", "--git-path", "index"], unreadable)
+    assert index.returncode == 0, index.stderr
+    Path(index.stdout.rstrip("\n")).write_bytes(b"not an index")   # `git status` fails
     _plan(cfg, _task("t1", worktree=str(good)),
           _task("t2", worktree=str(unreadable)))         # read back off disk by run()
     for tid in ("t1", "t2"):

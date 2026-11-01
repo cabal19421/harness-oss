@@ -29,7 +29,9 @@ The loop is hardened for genuinely unattended runs (see
 
 The backend never assumes a particular CLI's flag surface: it probes
 ``<cli> --help`` once and passes an optional flag only when the installed CLI
-advertises it (a pinned ``--model`` is the one exception).
+advertises it (a pinned ``--model`` is the one exception) — or, for a per-call
+cap on the legacy family, when a dry run of the CLI's own option parser shows
+it takes the flag, since some CLIs hide ``--max-turns`` from ``--help``.
 
 It speaks two flag families and reads which one a binary speaks from that same
 ``--help`` text (:func:`_cli_family`), never from an exit code. **Gemini CLI**'s:
@@ -73,7 +75,7 @@ from typing import Any, NamedTuple
 from harness.config import _ESCAPE_SEQUENCE
 from harness.log import fmt_cmd, get_logger, redact, trunc
 
-from .. import gitutil, procutil, shutdown
+from .. import gitutil, procutil, procwait, shutdown
 from ..looptools import (
     FailureKind,
     LoopBudget,
@@ -118,10 +120,11 @@ logger = get_logger(__name__)
 #: would instead silently delete the verifier gate.
 #:
 #: The probe stays regardless — it is what makes this correct on a CLI we did
-#: not pick: a flag is only ever passed when the installed CLI advertises it.
-#: Watch your agent CLI's release notes / security advisories, which is where a
-#: flag rename or a removed containment flag shows up before a run finds it the
-#: hard way.
+#: not pick: a flag is only ever passed when the installed CLI advertises it,
+#: or, for a per-call cap on the legacy family, when its own option parser shows
+#: it takes the flag (:func:`_cli_takes`). Watch your agent CLI's release
+#: notes / security advisories, which is where a flag rename or a removed
+#: containment flag shows up before a run finds it the hard way.
 _CLI_HELP_CACHE: dict[str, str] = {}
 
 #: How much of each failure stream survives into the quoted detail vs. the
@@ -219,7 +222,9 @@ def _cli_supports(cli: str, token: str) -> bool:
 
     *token* is matched as a whole word so ``--tools`` does not match inside
     ``--allowed-tools``; it also works for a ``--permission-mode`` choice such as
-    ``dontAsk``, which is not itself a flag.
+    ``dontAsk``, which is not itself a flag. A flag the CLI declares but hides
+    from its help reads as absent here; :func:`_cli_takes` also asks the CLI's
+    own option parser.
     """
     help_text = _cli_help(cli)
     if not help_text:
@@ -284,6 +289,112 @@ def _warn_once(noted: set[tuple[str, str]], key: tuple[str, str], msg: str,
     if key not in noted:
         noted.add(key)
         logger.warning(msg, *args)
+
+
+#: What each binary's own option parser answered the dry run
+#: :func:`_cli_parse_probe` gave it, per ``(cli, flag)``: ``(returncode,
+#: output)``. Only an answer is kept; a probe that could not run (it timed out,
+#: or the binary could not be started) or that a signal ended (the shutdown
+#: handler's, the OOM killer's — asked nothing) is asked again next time.
+_CLI_PARSE_CACHE: dict[tuple[str, str], tuple[int, str]] = {}
+
+#: How long one dry run of the CLI's option parser may take, in seconds. It
+#: exits while still reading its options: about 0.15s where it was measured.
+_FLAG_PROBE_TIMEOUT = 30
+
+
+def _cli_parse_probe(cli: str, flag: str) -> tuple[int | None, str]:
+    """``(returncode, output)`` of ``<cli> --help <flag>``, or ``(None, why not run)``.
+
+    A dry run of the CLI's own option parser. *flag* goes LAST with its value
+    left out, and the parser fails a declared option that takes a value and got
+    none — "error: option '--max-turns <turns>' argument missing", exit 1 —
+    while it is still reading the options: before ``--help``, an unknown-option
+    check or anything else runs, and whatever the option's own value parser
+    would say (an older parser accepts any value). An option it does not
+    declare is set aside, and the ``--help`` in front then prints the help and
+    exits 0. Either way nothing runs — no session, prompt or API call: run
+    offline with an empty HOME, the probe exited in about 0.15s and created no
+    file. A probe that sent the flag a junk value instead would read a CLI
+    whose value parser takes anything as not declaring it.
+
+    Asked of the legacy family only (:func:`_cli_budget_flags`): Gemini CLI's
+    parser prints its help and exits 0 beside an unknown flag, so a dry run
+    proves nothing there.
+
+    The file run is the absolute path :func:`harness.config._resolve_cli`
+    finds — as for the version probe, an empty or relative PATH entry is never
+    run — started the way :func:`harness.config._probe_version_text` starts
+    its own: in the temp directory, with the trusted PATH, in a process group
+    of its own that a timeout kills whole. Answers are cached
+    (:data:`_CLI_PARSE_CACHE`).
+    """
+    key = (cli, flag)
+    cached = _CLI_PARSE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from harness.config import _resolve_cli, _trusted_path
+
+    from .base import _run_grouped
+
+    path, unresolved = _resolve_cli(cli)
+    if not path:
+        return None, unresolved or f"`{cli}` is not on PATH"
+    try:
+        proc = _run_grouped([path, "--help", flag], shell=False,
+                            cwd=Path(tempfile.gettempdir()),
+                            timeout=_FLAG_PROBE_TIMEOUT,
+                            env_overlay={"PATH": _trusted_path()})
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {_FLAG_PROBE_TIMEOUT}s"
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, f"could not be run ({type(exc).__name__}: {trunc(str(exc), 160)})"
+    if proc.returncode < 0 or proc.returncode in (128 + signal.SIGTERM,
+                                                  128 + signal.SIGKILL):
+        # Killed, not answered: the group signal of a shutdown (or the OOM
+        # killer) ended it before the parser said anything, so it is neither a
+        # proof nor a refusal to keep.
+        return None, f"was ended by a signal before it answered (rc={proc.returncode})"
+    answer = (proc.returncode,
+              "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip())
+    _CLI_PARSE_CACHE[key] = answer
+    logger.debug("flag probe: `%s --help %s` exited rc=%s: %s", cli, flag,
+                 proc.returncode, trunc(answer[1], 160))
+    return answer
+
+
+def _cli_takes(cli: str, flag: str) -> tuple[bool, str]:
+    """``(True, "")`` when the installed CLI takes *flag*, else ``(False, why not)``.
+
+    *flag* is an option that takes a value. Advertised in ``--help`` is enough
+    (:func:`_cli_supports`). One the CLI hides from its help — some agent CLIs
+    hide ``--max-turns`` from ``--help`` (a hidden option in their parser), so
+    the help probe alone read it as absent and the turn cap was skipped on
+    every run — is proven by the CLI's own option parser instead
+    (:func:`_cli_parse_probe`): only its "argument missing" for *flag* counts.
+    Help printed, an unknown-option error, any other exit, a timeout or a
+    binary that could not be started proves nothing, and unknown is never a
+    proof. The legacy family's rule: on Gemini CLI a cap is passed only when
+    its help lists the flag (:func:`_gemini_budget_flags`).
+    """
+    if _cli_supports(cli, flag):
+        return True, ""
+    rc, output = _cli_parse_probe(cli, flag)
+    if rc is None:
+        return False, f"its option parser could not be asked: `{cli} --help {flag}` {output}"
+    name = re.escape(flag)
+    if rc != 0 and re.search(rf"option '[^'\n]*(?<![\w-]){name}(?![\w-])[^'\n]*' "
+                             r"argument missing", output):
+        return True, ""
+    if re.search(rf"unknown option '{name}'", output):
+        return False, f"it rejects {flag} as an unknown option"
+    if rc == 0:
+        return False, (f"it does not advertise {flag}, and `{cli} --help {flag}` "
+                       "printed its help instead of failing on the missing value, "
+                       "as it does for an option it does not declare")
+    return False, (f"it does not advertise {flag}, and `{cli} --help {flag}` exited "
+                   f"rc={rc} without naming {flag}'s missing value: "
+                   f"{trunc(redact(output), 160)}")
 
 
 def _read_only_flags(cli: str) -> list[str]:
@@ -381,22 +492,55 @@ def _model_flags(cli: str, cfg) -> list[str]:
     return flags
 
 
-def _cli_budget_flags(cli: str, cfg, budget: LoopBudget | None) -> list[str]:
-    """CLI-side caps that bound ONE invocation — defense in depth for LoopBudget.
+def _cli_budget_flags(cli: str, cfg,
+                      budget: LoopBudget | None) -> tuple[list[str], str]:
+    """CLI-side caps that bound ONE invocation, or why one cannot be applied.
 
     harness re-implements budgeting in Python, and ``parse_agent_usage`` returns
     silent zeros on JSON-shape drift: the Python cap goes inert exactly when the
     CLI's output changes. A cap the CLI enforces itself cannot be defeated that
-    way, so both run.
+    way, so both run — and ``max_agent_turns`` exists ONLY as the CLI's
+    ``--max-turns``.
+
+    Returns ``(flags, refusal)``. ``refusal`` is non-empty when a cap the
+    operator set — the remaining ``max_cost_usd`` budget, or
+    ``max_agent_turns`` — cannot be shown to reach the installed CLI
+    (:func:`_cli_takes`): the caller must then refuse to launch (fail CLOSED).
+    A cap is never dropped silently: while the CLI hid ``--max-turns`` from
+    ``--help``, the turn cap was skipped on every run, unenforced and unlogged.
+
+    That is the legacy family's rule. Gemini CLI (:func:`_cli_family`) gets
+    :func:`_gemini_budget_flags` instead — no dry run of its parser proves a
+    flag, and it has neither cap flag — and is refused only for a
+    ``max_agent_turns`` it would never be handed (:func:`_gemini_cap_refusal`).
     """
     flags: list[str] = []
     remaining = budget.remaining_cost() if budget is not None else None
-    if remaining is not None and _cli_supports(cli, "--max-budget-usd"):
-        flags += ["--max-budget-usd", f"{max(0.01, remaining):.2f}"]
     turns = getattr(cfg, "max_agent_turns", None)
-    if turns and _cli_supports(cli, "--max-turns"):
+    if (remaining is not None or turns) and _cli_family(cli).name == _GEMINI:
+        refusal = _gemini_cap_refusal(cli, cfg)
+        return ([] if refusal else _gemini_budget_flags(cli, cfg, budget)), refusal
+    if remaining is not None:
+        takes, why = _cli_takes(cli, "--max-budget-usd")
+        if not takes:
+            return [], _cap_refusal(cli, "max_cost_usd", "HARNESS_MAX_COST_USD",
+                                    "--max-budget-usd", why)
+        flags += ["--max-budget-usd", f"{max(0.01, remaining):.2f}"]
+    if turns:
+        takes, why = _cli_takes(cli, "--max-turns")
+        if not takes:
+            return [], _cap_refusal(cli, "max_agent_turns", "HARNESS_MAX_TURNS",
+                                    "--max-turns", why)
         flags += ["--max-turns", str(int(turns))]
-    return flags
+    return flags, ""
+
+
+def _cap_refusal(cli: str, knob: str, env: str, flag: str, why: str) -> str:
+    """The refusal :func:`_cli_budget_flags` returns for a cap the CLI cannot take."""
+    return (f"{knob} ({env}) is set, but the installed `{cli}` CLI cannot be shown to "
+            f"take {flag}: {why}. Refusing to launch an agent without that cap (fail "
+            f"closed; a cap is never dropped silently): upgrade the agent CLI, or "
+            f"unset {knob} to run without it.")
 
 
 #: ``NAME=value`` — a leading env assignment is a prefix, not the program.
@@ -922,6 +1066,56 @@ def _gemini_plan_mode_deny(cli: str, family: _Family, cfg) -> tuple[list[str], l
     return ["--admin-policy", str(path)], [path]
 
 
+def _gemini_budget_flags(cli: str, cfg, budget: LoopBudget | None) -> list[str]:
+    """Gemini CLI's per-call caps: each passed only when its help lists the flag.
+
+    Never the legacy family's dry run (:func:`_cli_takes`): Gemini CLI's parser
+    prints its help and exits 0 beside an unknown flag, so no exit status
+    proves a flag there. Gemini CLI has neither flag. Its own turn cap is
+    ``model.maxSessionTurns`` in its settings, so a ``max_agent_turns`` it
+    cannot be handed refuses the task (:func:`_gemini_cap_refusal`). Without
+    ``--max-budget-usd``, ``max_cost_usd`` rests on harness's per-model
+    estimate alone: never a refusal, and said once per binary at WARNING.
+    """
+    flags: list[str] = []
+    remaining = budget.remaining_cost() if budget is not None else None
+    if remaining is not None and _cli_supports(cli, "--max-budget-usd"):
+        flags += ["--max-budget-usd", f"{max(0.01, remaining):.2f}"]
+    elif remaining is not None:
+        _warn_once(_POLICY_NOTED, (cli, "--max-budget-usd"),
+                   "max_cost_usd is set, but the agent CLI `%s` (Gemini CLI) takes no "
+                   "per-call budget flag — harness's own cost bound is the only one: "
+                   "it adds up each call's estimated cost between calls, and it cannot "
+                   "see a drifted envelope (a call whose stats it cannot read counts "
+                   "$0)", cli)
+    turns = getattr(cfg, "max_agent_turns", None)
+    if turns and _cli_supports(cli, "--max-turns"):
+        flags += ["--max-turns", str(int(turns))]
+    return flags
+
+
+def _gemini_cap_refusal(cli: str, cfg) -> str:
+    """Why a task must not launch on Gemini CLI with the caps the operator set, or ``""``.
+
+    ``max_agent_turns`` exists only as a per-call ``--max-turns``, which Gemini
+    CLI does not take: unless its help lists one (:func:`_gemini_budget_flags`),
+    the cap would never reach the CLI, so the task is refused before launch
+    (:meth:`AgentCliBackend.cap_refusal`) — a cap is never dropped silently.
+    Read from the help alone, never the legacy family's dry run
+    (:func:`_cli_takes`). ``max_cost_usd`` never refuses here: harness's own
+    bound still applies.
+    """
+    if not getattr(cfg, "max_agent_turns", None) or _cli_supports(cli, "--max-turns"):
+        return ""
+    return (f"max_agent_turns (HARNESS_MAX_TURNS) is set, but it has no effect with this "
+            f"CLI: Gemini CLI takes no per-call turn flag (the installed `{cli}` lists no "
+            f"--max-turns in its --help), and its own turn cap is the session-turn limit "
+            f"in its settings file (`model.maxSessionTurns`). Refusing to launch an agent "
+            f"without the max_agent_turns cap (fail closed; a cap is never dropped "
+            f"silently): set that limit instead, and unset max_agent_turns to run without "
+            f"it.")
+
+
 def _gemini_implement_argv(cli: str, family: _Family, ctx: ImplementContext,
                            prompt: str, budget: LoopBudget | None,
                            ) -> tuple[list[str], str, list[Path]] | str:
@@ -931,10 +1125,12 @@ def _gemini_implement_argv(cli: str, family: _Family, ctx: ImplementContext,
     ``untrusted_designs`` (:func:`_suppression_flags`), or on a detected help
     that lacks ``--approval-mode auto_edit`` — without it a headless run denies
     ``write_file`` and ``replace``. Refusals are decided before any file is
-    written. ``auto_edit`` is the legacy ``acceptEdits``: it approves the edit
-    tools (path-checked inside the workspace) and leaves the shell to the allow
-    rules; ``yolo`` would lift neither of Gemini CLI's build-file and
-    redirection denials and would add every other tool.
+    written. A ``max_agent_turns`` the CLI cannot be handed is refused before
+    the loop starts, not here (:func:`_gemini_cap_refusal`). ``auto_edit`` is
+    the legacy ``acceptEdits``: it approves the edit tools (path-checked inside
+    the workspace) and leaves the shell to the allow rules; ``yolo`` would lift
+    neither of Gemini CLI's build-file and redirection denials and would add
+    every other tool.
     """
     cfg = ctx.config
     refusal = _suppression_flags(cli, cfg)[1]
@@ -957,7 +1153,7 @@ def _gemini_implement_argv(cli: str, family: _Family, ctx: ImplementContext,
     cmd += deny
     cmd += ["--output-format", "json"]
     cmd += _model_flags(cli, cfg)
-    cmd += _cli_budget_flags(cli, cfg, budget)
+    cmd += _gemini_budget_flags(cli, cfg, budget)
     return cmd, prompt_args[-1], policy_files
 
 
@@ -1105,10 +1301,12 @@ def _rmdir_quietly(path: Path) -> None:
 def _sweep_verifier_dir(ctx: ImplementContext, path: Path) -> None:
     """After a terminated verifier call, stop what still runs in its own directory.
 
-    The model had no tools, so only the operator's own Gemini CLI hooks can have
-    started a process there. Signals only under ``kill_worktree_procs``, as
-    :func:`_reclaim_worktree` does; a busy result is a WARNING and changes
-    nothing, since that directory is not the tree being judged. Never raises.
+    Also after one that exited while something it started still held its
+    output pipe. The model had no tools, so only the operator's own Gemini CLI
+    hooks can have started a process there. Signals only under
+    ``kill_worktree_procs``, as :func:`_reclaim_worktree` does; a busy result is
+    a WARNING and changes nothing, since that directory is not the tree being
+    judged. Never raises.
     """
     if getattr(ctx.config, "kill_worktree_procs", True):
         term = procutil.terminate_in_dir(path)
@@ -1122,7 +1320,7 @@ def _sweep_verifier_dir(ctx: ImplementContext, path: Path) -> None:
                 f"{len(pids)} process(es) are still running (pids {_pid_list(pids)}) "
                 f"and kill_worktree_procs is off" if pids else "")
     if busy:
-        logger.warning("after the verifier call was terminated, %s in its own "
+        logger.warning("after the verifier call ended, %s in its own "
                        "directory %s — not the tree being judged, so the review goes on",
                        busy, path)
 
@@ -1179,6 +1377,22 @@ class AgentCliBackend(CodingBackend):
         """Run only if this CLI can be told to ignore the reviewed repo's config."""
         return _suppression_flags(self.cli, config)[1]
 
+    def cap_refusal(self, config) -> str:
+        """Run only if every cap the operator set can be shown to reach this CLI.
+
+        ``max_agent_turns`` exists only as the CLI's ``--max-turns``, and the
+        ``max_cost_usd`` balance is also handed over as ``--max-budget-usd``
+        (:func:`_cli_budget_flags`). ``""`` when each cap that is set reaches
+        the CLI; otherwise the refusal that names the cap and why not. Gemini
+        CLI is handed a cap only when its help lists the flag
+        (:func:`_gemini_budget_flags`), and only ``max_agent_turns`` refuses
+        there (:func:`_gemini_cap_refusal`): without the flag, ``max_cost_usd``
+        is harness's own bound alone, which one WARNING per binary says.
+        """
+        budget = LoopBudget(getattr(config, "max_tokens", None),
+                            getattr(config, "max_cost_usd", None))
+        return _cli_budget_flags(self.cli, config, budget)[1]
+
     # ── the ralph loop ────────────────────────────────────────────────────────
 
     def implement(self, ctx: ImplementContext) -> ImplementOutcome:
@@ -1209,6 +1423,16 @@ class AgentCliBackend(CodingBackend):
         if refusal:
             logger.error("failing %s fast: %s", ctx.task.id, refusal)
             return ImplementOutcome(status="failed", detail=refusal)
+        # The same for a cap the operator set that the CLI cannot be shown to
+        # take: refused HERE, before anything ran, and not from inside the loop,
+        # where a permanent stop ends in the terminal discard of a dirty tree —
+        # and the only dirt in it then is a previous run's work, kept for this
+        # relaunch. (On the legacy family _run_agent still refuses on its own,
+        # for any other caller.)
+        refusal = self.cap_refusal(cfg)
+        if refusal:
+            logger.error("failing %s fast: %s", ctx.task.id, refusal)
+            return ImplementOutcome(status="failed", detail=refusal)
         if not getattr(cfg, "agent_model", None):
             logger.warning("agent_model is unset — the CLI's (or your org policy's) "
                            "default model decides cost, context size and behaviour "
@@ -1229,13 +1453,26 @@ class AgentCliBackend(CodingBackend):
         consecutive_failures = 0      # consecutive non-green / agent-error iterations
         commit_failures = 0           # consecutive green-but-uncommittable iterations
         warned_no_usage = False
+        warned_unreported = False
+        # True while the tree holds the red work of a call the CLI ended at its
+        # cap, kept for the next iteration to continue (the red verdict below).
+        # `nested` then stays the snapshot taken before that call, so whatever
+        # discards that work — a later attempt's discard, a terminal stop — also
+        # sweeps the nested repositories it created.
+        kept_capped_work = False
+        # The note that leads `feedback` after a red capped call, telling the
+        # next agent that work is in the tree to continue. It goes from the
+        # feedback with the work: a failed call's discard takes both.
+        cap_note = ""
+        nested: gitutil.NestedRepoIds | None = None
 
         for i in range(1, cfg.max_iters + 1):
             # A stop was requested (Ctrl-C / SIGTERM): the running agent has
             # already been terminated by the handler — never start another one.
             if shutdown.requested():
                 return self._interrupted(ctx, i - 1, last_oracle, runlog,
-                                         preserve_worktree=pending_commit_failure is not None)
+                                         preserve_worktree=pending_commit_failure is not None,
+                                         nested=nested if kept_capped_work else None)
             ctx.log(f"  ↻ iteration {i}/{cfg.max_iters} (agent-cli)")
             logger.info("iteration %d/%d for %s (agent-cli) — cumulative %s%s",
                         i, cfg.max_iters, ctx.task.id, budget.summary(),
@@ -1252,14 +1489,18 @@ class AgentCliBackend(CodingBackend):
                                ctx.task.id, i, why)
                 runlog.append("budget", why, iteration=i)
                 return self._stopped(ctx, i, last_oracle, f"stopped on budget — {why}", runlog,
-                                     preserve_worktree=preserve)
+                                     preserve_worktree=preserve,
+                                     nested=nested if kept_capped_work else None)
 
             # The untracked nested repositories there BEFORE this attempt, by
             # .git identity. LOCAL, never on self — one backend instance serves
             # every worker thread: a discard below may remove only what this
-            # attempt created (_sweep_nested_repos).
-            nested = (gitutil.untracked_nested_repos(ctx.worktree)
-                      if cfg.reset_on_failure else None)
+            # attempt created (_sweep_nested_repos). Not retaken while a capped
+            # call's work is kept: this attempt continues that work, and a
+            # discard of this attempt takes that work too.
+            if not kept_capped_work:
+                nested = (gitutil.untracked_nested_repos(ctx.worktree)
+                          if cfg.reset_on_failure else None)
             t_it = ctx.trace.timed()
             run = self._run_with_retries(ctx, feedback, pending_commit_failure, runlog, i,
                                          budget=budget)
@@ -1268,15 +1509,38 @@ class AgentCliBackend(CodingBackend):
                            cost_usd=round(run.cost, 4),
                            duration_s=Tracer.duration(t_it),
                            # An ok run's detail is set only when the CLI exited 0
-                           # leaving processes, and the sweep reclaimed them.
+                           # leaving processes, and the sweep reclaimed them —
+                           # or when the CLI ended the call at its cap.
                            detail=run.detail[:300])
-            if run.ok and run.detail:
+            if run.capped:
+                # The call ended at a cap the operator set. What it did is judged
+                # below like any finished call's: no retry, no discard unjudged —
+                # and a red verdict keeps it for the next iteration to continue.
+                logger.warning("iteration %d for %s: the agent call ended at its cap "
+                               "(%s) — judging what it did", i, ctx.task.id,
+                               trunc(redact(run.capped), 200))
+                runlog.append("cap", f"the agent call ended at its cap: {run.capped}",
+                              detail=run.detail, iteration=i)
+                ctx.log(f"  ⏱ the agent call ended at its cap "
+                        f"({trunc(run.capped, 120)}) — judging what it did")
+            elif run.ok and run.detail:
                 # So an operator learns that agents leave processes behind.
                 runlog.append("reclaim", "processes the agent left running were "
                               "terminated after it exited 0",
                               detail=run.detail, iteration=i)
             budget.add(tokens=run.tokens, cost_usd=run.cost)
-            if budget.active and run.ok and run.tokens == 0 and run.cost == 0 and not warned_no_usage:
+            if run.usage_unreported:
+                # Gemini CLI prints no stats with its exit-53 error: nothing was
+                # unparseable, and its calls that exit 0 still report theirs —
+                # so never the drift alarm below, and no run-log note (the
+                # notes' summaries reach the next prompt). Said once per run.
+                if budget.active and not warned_unreported:
+                    warned_unreported = True
+                    logger.warning("iteration %d for %s: the call Gemini CLI ended at "
+                                   "its session-turn limit printed no stats — its "
+                                   "spend is not counted toward max_tokens/"
+                                   "max_cost_usd (said once per run)", i, ctx.task.id)
+            elif budget.active and run.ok and run.tokens == 0 and run.cost == 0 and not warned_no_usage:
                 # parse_agent_usage returns silent zeros on shape drift; with a
                 # budget configured that would quietly unbound the run — say so.
                 warned_no_usage = True
@@ -1294,7 +1558,8 @@ class AgentCliBackend(CodingBackend):
                 return self._interrupted(
                     ctx, i, last_oracle, runlog,
                     preserve_worktree=preserve or run.preserve_worktree,
-                    live=run.detail if run.preserve_worktree else "")
+                    live=run.detail if run.preserve_worktree else "",
+                    nested=nested if kept_capped_work else None)
             if run.preserve_worktree:
                 # _run_agent could not prove the tree quiet after terminating
                 # the agent: a retry would launch a second writer into it, and
@@ -1330,8 +1595,16 @@ class AgentCliBackend(CodingBackend):
                                  "back to %r after failed invocation",
                                  ctx.diff_base or "HEAD")
                     gitutil.discard_changes(ctx.worktree, ctx.diff_base or "HEAD")
+                    if kept_capped_work:
+                        # The capped call's work went with this discard: the
+                        # note telling the next agent it is still in the
+                        # worktree would now point at work that is gone.
+                        feedback = feedback.replace(f"{cap_note}\n\n", "", 1)
                     feedback = gitutil.with_nested_note(
                         feedback, _sweep_nested_repos(ctx, nested, i))
+                    # Back at the clean seed: a capped call's work this attempt
+                    # continued went with it, and the next attempt snapshots anew.
+                    kept_capped_work = False
                 if consecutive_failures >= cfg.max_consecutive_failures:
                     logger.error("aborting %s after %d consecutive agent "
                                  "failures", ctx.task.id, consecutive_failures)
@@ -1395,8 +1668,11 @@ class AgentCliBackend(CodingBackend):
             last_oracle = oracle
 
             if oracle.passed:
-                # Reaching green breaks any non-green streak.
+                # Reaching green breaks any non-green streak. Kept capped work
+                # is green work now: committed below, or held for a commit
+                # repair, whose iterations snapshot as they always have.
                 consecutive_failures = 0
+                kept_capped_work = False
                 commit = self._ensure_committed(ctx)
                 if commit is not None and not commit.ok:
                     # Green by the oracle but the commit was rejected (pre-commit
@@ -1475,15 +1751,33 @@ class AgentCliBackend(CodingBackend):
                     grounding_summary=oracle.grounding.summary,
                 )
 
-            # Reported failure: the agent ran but the oracle is red.
-            consecutive_failures += 1
+            # Reported failure: the agent ran but the oracle is red. A call the
+            # CLI ended at its cap was cut off, not finished, and is no failed
+            # attempt: it never counts toward max_consecutive_failures, and
+            # reset_on_failure never discards it — its work stays in the tree
+            # for the next iteration to continue, with this verdict as its
+            # feedback. max_iters, the budget and the no-progress guard below
+            # still bound the loop, and every stop keeps its usual cleanup.
+            if not run.capped:
+                consecutive_failures += 1
             feedback = oracle.feedback()
-            logger.debug("iteration %d for %s: oracle red (consecutive failure "
-                         "%d/%d) — feeding back %d chars of findings",
-                         i, ctx.task.id, consecutive_failures,
-                         cfg.max_consecutive_failures, len(feedback))
+            logger.debug("iteration %d for %s: oracle red (%s %d/%d) — feeding "
+                         "back %d chars of findings", i, ctx.task.id,
+                         "a capped call, not counted — consecutive failures"
+                         if run.capped else "consecutive failure",
+                         consecutive_failures, cfg.max_consecutive_failures,
+                         len(feedback))
             runlog.append("fail", oracle.grounding.summary,
                           detail=feedback[:200], iteration=i)
+            if run.capped:
+                # So the next agent knows the attempt was cut off, not finished,
+                # and that what it did is there to build on — until a discard
+                # takes that work (the failed-call discard above drops the note).
+                cap_note = (f"Note: the previous attempt was ended by its per-call "
+                            f"cap before it finished ({run.capped}); what it had "
+                            f"done was judged as it stood, and it is still in the "
+                            f"worktree — continue from it.")
+                feedback = f"{cap_note}\n\n{feedback}"
             # No-progress guard: if the loop keeps reaching the SAME red state,
             # more iterations will only reproduce it — abstain to a human with a
             # diagnostic instead of burning the budget on a dead end.
@@ -1499,7 +1793,14 @@ class AgentCliBackend(CodingBackend):
                     f"{oracle.grounding.summary}", runlog, last_oracle=oracle,
                     nested=nested,
                     preserve_worktree=pending_commit_failure is not None)
-            if pending_commit_failure is None and cfg.reset_on_failure:
+            if pending_commit_failure is None and cfg.reset_on_failure and run.capped:
+                # Kept, not discarded: the next iteration continues this work. A
+                # later attempt's discard takes it along (back to the clean
+                # seed), as does a terminal stop's; `nested` stays this
+                # attempt's snapshot until then, so their sweeps also reach the
+                # nested repositories this work created.
+                kept_capped_work = True
+            elif pending_commit_failure is None and cfg.reset_on_failure:
                 # Discard this attempt so the next fresh agent starts from the
                 # clean seed; the textual feedback + notes carry the learning.
                 # Guarded on pending_commit_failure like the invocation-failure
@@ -1511,7 +1812,18 @@ class AgentCliBackend(CodingBackend):
                 # it goes now, and the next agent hears about any that stay.
                 feedback = gitutil.with_nested_note(
                     feedback, _sweep_nested_repos(ctx, nested, i))
-            if consecutive_failures >= cfg.max_consecutive_failures:
+                kept_capped_work = False
+            if run.capped:
+                # Never the consecutive-failure stop: this call was cut off.
+                if i < cfg.max_iters:
+                    logger.info("iteration %d for %s: red, but the agent call was "
+                                "ended by its cap — its work stays in the worktree "
+                                "for the next iteration (not counted toward "
+                                "max_consecutive_failures)", i, ctx.task.id)
+                    ctx.log("  ⏱ red, but the call was cut off by its cap — its work "
+                            "stays in the worktree for the next iteration (not "
+                            "counted as a failure)")
+            elif consecutive_failures >= cfg.max_consecutive_failures:
                 logger.error("aborting %s after %d consecutive non-green "
                              "iterations (last grounding: %s)",
                              ctx.task.id, consecutive_failures,
@@ -1534,9 +1846,12 @@ class AgentCliBackend(CodingBackend):
         logger.warning("%s exhausted %d iterations without converging (%s) — %s",
                        ctx.task.id, cfg.max_iters, budget.summary(),
                        trunc(detail, 300))
+        # Red work a capped last iteration kept goes with this stop's discard,
+        # and so do the nested repositories it created.
         return self._stopped(ctx, cfg.max_iters, last_oracle, detail, runlog,
                              oracle_passed=False,
-                             preserve_worktree=pending_commit_failure is not None)
+                             preserve_worktree=pending_commit_failure is not None,
+                             nested=nested if kept_capped_work else None)
 
     # ── one fresh agent invocation (+ transient retry/backoff) ─────────────────
 
@@ -1545,7 +1860,8 @@ class AgentCliBackend(CodingBackend):
                      cost: float = 0.0, permanent: bool = False,
                      text: str = "", preserve_worktree: bool = False,
                      limit_kind: FailureKind | None = None,
-                     limit_text: str = "") -> None:
+                     limit_text: str = "", capped: str = "",
+                     usage_unreported: bool = False) -> None:
             self.ok = ok
             self.detail = detail
             self.tokens = tokens
@@ -1568,12 +1884,27 @@ class AgentCliBackend(CodingBackend):
             # _gemini_failure reads and finds not permanent carries its regime
             # here: "transient" when its exit status decides it (a 429 with no
             # stated reset, an exit status and an error object that disagree
-            # about a 429, its turn limit), else the classifier's verdict on
-            # the CLI's own words (_gemini_classified) — so the detail, whose
-            # stderr part quotes whatever Gemini CLI printed, is never
-            # classified again.
+            # about a 429, its turn limit on a call a shutdown ended), else the
+            # classifier's verdict on the CLI's own words (_gemini_classified)
+            # — so the detail, whose stderr part quotes whatever Gemini CLI
+            # printed, is never classified again.
             self.limit_kind = limit_kind
             self.limit_text = limit_text
+            # Set (always with ok) when the CLI ended the call at a cap harness
+            # handed it — its own envelope's words (_cli_cap_text) — or, on
+            # Gemini CLI, at its own session-turn limit (exit 53, in the fixed
+            # words of _gemini_turn_limit: this text reaches the next prompt).
+            # The call is over, not failed: never retried, never discarded
+            # unjudged; the loop judges what it did, and on a red verdict keeps
+            # it for the next iteration to continue (never discarded by
+            # reset_on_failure, never counted toward max_consecutive_failures),
+            # telling that agent the call before it was capped.
+            self.capped = capped
+            # Set only by Gemini CLI's capped path (_gemini_outcome): the call
+            # reported no usage — Gemini CLI prints no stats with its exit-53
+            # error — so its spend is not counted toward the budget. The loop
+            # says so once per run instead of raising its drift alarm.
+            self.usage_unreported = usage_unreported
 
     def _run_with_retries(self, ctx: ImplementContext, feedback: str,
                           pending_commit_failure: str | None, runlog: RunLog,
@@ -1621,7 +1952,14 @@ class AgentCliBackend(CodingBackend):
             # calls otherwise stack into a legal quiet period LONGER than the
             # stale threshold, and a concurrent run would "recover" a live task.
             runlog.beat("implementing", iteration=iteration)
-            last = self._run_agent(ctx, feedback, pending_commit_failure, budget=budget)
+            # Each attempt is handed what is left AFTER this iteration's earlier
+            # attempts (_spent_view): the loop adds their spend only once this
+            # returns, so every retry used to be handed the whole balance again
+            # as --max-budget-usd, and one iteration could spend
+            # (max_agent_retries + 1)× what was left.
+            view = (_spent_view(budget, spent_tokens, spent_cost)
+                    if budget is not None and (spent_tokens or spent_cost) else budget)
+            last = self._run_agent(ctx, feedback, pending_commit_failure, budget=view)
             # Every attempt's spend counts toward the budget — a failed attempt
             # still billed tokens; returning only the last attempt's numbers
             # made the cap under-count on retried iterations.
@@ -1642,6 +1980,15 @@ class AgentCliBackend(CodingBackend):
             # other failure is classified from the detail, as before.
             kind: FailureKind = (last.limit_kind
                                  or classify_invocation_failure(last.detail))
+            if kind != "permanent" and budget is not None:
+                # Once this iteration's attempts have spent the budget, nothing
+                # is waited out and nothing is retried: the loop's own budget
+                # check stops the run (a permanent failure keeps its own stop).
+                over, why = _spent_view(budget, last.tokens, last.cost).exceeded()
+                if over:
+                    logger.info("no further attempt on iteration %d: its attempts "
+                                "spent the budget — %s", iteration, why)
+                    return last
             if kind == "quota-window":
                 # The wait comes from that refusal's own reset clause when there
                 # is one (in the zone it names); from the detail otherwise. A
@@ -1752,6 +2099,7 @@ class AgentCliBackend(CodingBackend):
         family = _cli_family(self.cli)
         policy_files: list[Path] = []
         popen_kw: dict[str, Any] = {}
+        budget_flags: list[str] = []
         if family.name == _GEMINI:
             built = _gemini_implement_argv(self.cli, family, ctx, prompt, budget)
             if isinstance(built, str):
@@ -1776,7 +2124,14 @@ class AgentCliBackend(CodingBackend):
                 return self._Run(False, detail=refusal, permanent=True)
             cmd += suppression
             cmd += _model_flags(self.cli, ctx.config)
-            cmd += _cli_budget_flags(self.cli, ctx.config, budget)
+            budget_flags, refusal = _cli_budget_flags(self.cli, ctx.config, budget)
+            if refusal:
+                # A cap the operator set that the CLI cannot be shown to take:
+                # never launch without it, and never retry — the same CLI
+                # answers alike. implement() already refused up front
+                # (cap_refusal); this guards any other caller of _run_agent.
+                return self._Run(False, detail=refusal, permanent=True)
+            cmd += budget_flags
             # The prompt is design-doc-derived text — log its size, never its
             # contents; the flags after it are safe to show verbatim.
             logger.debug("%s", fmt_cmd(
@@ -1829,12 +2184,15 @@ class AgentCliBackend(CodingBackend):
         # arrives now must reach the whole detached group (Ctrl-C cannot — see
         # harness.pipeline.shutdown), and one that arrives after it must not
         # signal a pid this process no longer owns — which is also why the
-        # sweep after a timeout runs outside this block, once the leader is
-        # reaped.
+        # sweep after a timeout, and the drain of a pipe that outlived the CLI,
+        # run outside this block, once the leader is reaped. The wait is for
+        # the CLI's EXIT, not for its pipes (procwait): a process it started
+        # that kept stdout open no longer turns a finished call into a timeout.
         timed_out = False
+        done: tuple[str, str] | None = None
         with shutdown.killable(proc, _signal_process_group):
             try:
-                out, err = proc.communicate(timeout=_AGENT_TIMEOUT_SECONDS)
+                done = procwait.wait_exit(proc, _AGENT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 logger.warning("agent invocation timed out after %ss — "
                                "terminating its process group (pid=%s), then "
@@ -1846,16 +2204,31 @@ class AgentCliBackend(CodingBackend):
         # Read by Gemini CLI at startup; the call is over either way.
         _unlink_quietly(policy_files)
         if timed_out:
+            procwait.close_pipes(proc)
             why = f"timed out after {_AGENT_TIMEOUT_SECONDS}s"
             sweep = _reclaim_worktree(ctx)
             if sweep.busy:
                 return self._Run(False, permanent=True, preserve_worktree=True,
                                  detail=_live_process_detail(why, sweep))
             return self._Run(False, detail=why + sweep.note())
+        held = False
+        if done is None:
+            # The CLI exited; something it started still holds its output pipe.
+            # What it printed is complete; a sweep after the exit decides the
+            # process (the success path's, or the reclaim sweep below).
+            out, err, held = procwait.drain(proc, stop=shutdown.requested)
+            if held:
+                logger.warning("the agent CLI exited rc=%s, but a process it "
+                               "started kept its output pipe open — stopped "
+                               "reading %gs after the exit and closed the pipe; "
+                               "the exit code stands", proc.returncode,
+                               procwait.PIPE_DRAIN_SECONDS)
+        else:
+            out, err = done
         if family.name == _GEMINI:
             return self._gemini_outcome(ctx, proc.returncode, out or "", err or "",
                                         env, tenants_before,
-                                        elapsed=time.monotonic() - t0)
+                                        elapsed=time.monotonic() - t0, held=held)
 
         tokens, cost = parse_agent_usage(out or "")
         logger.debug("agent CLI exited rc=%s in %.1fs — stdout=%d chars, "
@@ -1876,6 +2249,32 @@ class AgentCliBackend(CodingBackend):
         # `or denials[:6]` keeps the message no worse than before when the CLI
         # omits tool_input entirely.
         denied_calls = parse_permission_denial_details(out or "") or denials[:6]
+        # The CLI ended the call at a cap harness handed it (--max-turns,
+        # --max-budget-usd): its own envelope says so, and its non-interactive
+        # JSON mode exits 1 on it as on any is_error result. That call is over,
+        # not failed — the cap bounded it the way max_iters bounds the loop — so
+        # it goes neither on the retry ladder (each retry was handed the same
+        # cap, and the same remaining balance) nor to the failed-call discard of
+        # work nobody judged: like a clean exit's, the tree is proven quiet below
+        # and the loop judges what the call did (_Run.capped). Read from the
+        # envelope's structured fields only (_cli_cap_text), only on exit 1
+        # outside a shutdown — one a signal ended built no result of its own —
+        # and only for a cap flag this launch's argv carried.
+        capped = (_cli_cap_text(out or "", budget_flags)
+                  if proc.returncode == 1 and not shutdown.requested() else "")
+        if capped:
+            # What the loop's budget is charged for the call: at least the
+            # --max-budget-usd balance it was handed, when that is the cap the
+            # CLI says it reached (_capped_call_cost).
+            charged = _capped_call_cost(capped, budget_flags, cost)
+            if charged != cost:
+                logger.warning("the CLI ended the call at its --max-budget-usd cap, "
+                               "but its envelope's cost reads $%.4f (none, not a "
+                               "number, or below the cap) — charging the $%.2f it "
+                               "was handed: the most it was allowed, since its "
+                               "real spend cannot be read",
+                               cost, charged)
+                cost = charged
         # A CLI that exited on SIGTERM — the shutdown handler's, or anyone
         # else's — left behind whatever of its tools no TERM stopped; one
         # killed by any other signal (the OOM killer's SIGKILL) ran no
@@ -1883,16 +2282,24 @@ class AgentCliBackend(CodingBackend):
         # tree however the CLI exited.
         sigtermed = proc.returncode in (143, -signal.SIGTERM)
         reclaimed = ""
-        if sigtermed or proc.returncode < 0 or shutdown.requested():
+        ended = sigtermed or proc.returncode < 0 or shutdown.requested()
+        # A failed call whose pipe something it started still held left that
+        # process running: swept before anything retries into the tree, as
+        # after a termination. (A clean exit gets the sweep further down, and
+        # so does a call the CLI ended at its cap: it is no failed call.)
+        if ended or (held and proc.returncode != 0 and not capped):
             sweep = _reclaim_worktree(ctx)
             if sweep.busy:
                 return self._Run(False, permanent=True, preserve_worktree=True,
                                  tokens=tokens, cost=cost,
                                  detail=_live_process_detail(
-                                     f"the CLI {_how_it_ended(proc.returncode)}",
+                                     f"the CLI {_how_it_ended(proc.returncode)}"
+                                     if ended else
+                                     f"the CLI exited rc={proc.returncode} while a "
+                                     f"process it started kept its output pipe open",
                                      sweep))
             reclaimed = sweep.note()
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not capped:
             err_text = (err or "").strip()
             out_text = (out or "").strip()
             # The CLI's own error report, pulled out of the JSON envelope: it is
@@ -2030,13 +2437,17 @@ class AgentCliBackend(CodingBackend):
             return self._Run(False, detail=detail + reclaimed, tokens=tokens, cost=cost,
                              permanent=permanent, limit_kind=limit_kind,
                              limit_text=limit_text if limit_kind else "")
+        # What ended the call: a clean exit, or a cap the CLI enforced.
+        after = "the CLI exited 0" if not capped else "the CLI ended the call at its cap"
         if denials:
             # The agent finished anyway (it routed around the blocked tool), so
             # this is not a failure — but it is the operator's cue to widen the
-            # allow list before the next task hits it harder.
-            logger.warning("agent CLI completed but %d tool call(s) were denied by the "
+            # allow list before the next task hits it harder. A capped call is
+            # the same: its cap ended the turn, not the denied calls.
+            logger.warning("agent CLI %s but %d tool call(s) were denied by the "
                            "allow rules (%s) — widen PipelineConfig.allowed_tools "
                            "if the agent needs them",
+                           "completed" if not capped else "ended its call at its cap",
                            len(denials), "; ".join(denied_calls))
         # A clean exit is not a finished tree. A helper an allowed launcher
         # started (python3, make, npm, a test that leaks one) outlives the CLI
@@ -2046,13 +2457,19 @@ class AgentCliBackend(CodingBackend):
         # anything parses an ABSTAIN, judges, commits or reviews the tree;
         # stragglers that exit on their own (a detached `git gc --auto`, MCP
         # servers shutting down) are settled first.
-        sweep = sweep_after_return(ctx, after="the CLI exited 0",
+        sweep = sweep_after_return(ctx, after=after,
                                    settle=_SWEEP_SETTLE_SECONDS,
                                    baseline=tenants_before)
         if sweep.busy:
             return self._Run(False, permanent=True, preserve_worktree=True,
                              tokens=tokens, cost=cost,
-                             detail=_live_process_detail("the CLI exited 0", sweep))
+                             detail=_live_process_detail(after, sweep))
+        if capped:
+            logger.debug("the CLI ended the call at its cap (%s) — judged like a "
+                         "finished call: no retry, no discard", capped)
+            return self._Run(True, tokens=tokens, cost=cost, capped=capped,
+                             text=_result_text(out or ""),
+                             detail=f"{after} ({capped}){reclaimed}{sweep.note()}")
         # An ok run carries a detail only when leftovers were reclaimed: the loop
         # puts it in the run log and the `agent` span.
         return self._Run(True, tokens=tokens, cost=cost,
@@ -2062,7 +2479,8 @@ class AgentCliBackend(CodingBackend):
 
     def _gemini_outcome(self, ctx: ImplementContext, rc: int, out: str, err: str,
                         env: dict[str, str], tenants_before: list, *,
-                        elapsed: float = 0.0) -> AgentCliBackend._Run:
+                        elapsed: float = 0.0,
+                        held: bool = False) -> AgentCliBackend._Run:
         """What one Gemini CLI implement call came to — exit status first, then text.
 
         Gemini CLI prints its result envelope on stdout and its error object on
@@ -2072,9 +2490,19 @@ class AgentCliBackend(CodingBackend):
         handler exits 0 without printing one) and an exit 1 with neither a
         result nor an error object (how 0.64.0's launcher reports a CLI process
         a signal killed). Both are swept like any terminated call, then retried
-        — never read as a success. A denied tool call is not fatal on Gemini CLI
-        (the model is told and the turn goes on) and it reports no denial list,
-        so no denial is parsed here.
+        — never read as a success. Exit 53, its own session-turn limit, is no
+        failure either: the call ended at its cap (:func:`_gemini_turn_limit`),
+        so the tree is proven quiet as after a clean exit and the loop judges
+        what it did (``_Run.capped``, in fixed words; what Gemini CLI said goes
+        only into the detail) — never retried, and charged only what the call
+        reported, since no flag harness passed set that limit and no balance
+        was handed over (the legacy family's :func:`_capped_call_cost` has
+        nothing to charge here): nothing, as Gemini CLI prints no stats with
+        that exit (``_Run.usage_unreported``). A denied tool call is not fatal
+        on Gemini CLI (the model is told and the turn goes on) and it reports
+        no denial list, so no denial is parsed here. *held*: something the CLI
+        started still held its output pipe when it exited (``_run_agent``'s
+        drain), so a failed call is swept as a terminated one is.
         """
         stderr = _clean_stderr(err)
         envelope = _gemini_envelope(out)
@@ -2086,13 +2514,24 @@ class AgentCliBackend(CodingBackend):
         stopped = _gemini_stopped(rc, out, stderr, error)
         sigtermed = rc in (143, -signal.SIGTERM)
         reclaimed = ""
-        if sigtermed or rc < 0 or shutdown.requested() or stopped:
+        ended = sigtermed or rc < 0 or shutdown.requested() or bool(stopped)
+        # Over, not failed — but never a call that ended otherwise: one a
+        # shutdown ended belongs to the interruption, as on the legacy family.
+        capped = "" if ended else _gemini_turn_limit(rc)
+        # A failed call whose pipe something it started still held left that
+        # process running: swept before anything retries into the tree, as
+        # after a termination. (A clean exit gets the sweep below, and so does
+        # a call that ended at its cap: it is no failed call.)
+        if ended or (held and rc != 0 and not capped):
             sweep = _reclaim_worktree(ctx)
             if sweep.busy:
                 return self._Run(False, permanent=True, preserve_worktree=True,
                                  tokens=tokens, cost=cost,
                                  detail=_live_process_detail(
-                                     stopped or f"the CLI {_how_it_ended(rc)}", sweep))
+                                     (stopped or f"the CLI {_how_it_ended(rc)}")
+                                     if ended else
+                                     f"the CLI exited rc={rc} while a process it "
+                                     f"started kept its output pipe open", sweep))
             reclaimed = sweep.note()
         if rc == 0 and envelope is not None:
             _log_gemini_envelope(envelope)
@@ -2107,6 +2546,24 @@ class AgentCliBackend(CodingBackend):
                              text=_gemini_result_text(out),
                              detail=(f"the CLI exited 0{sweep.note()}" if sweep.reclaimed
                                      else ""))
+        if capped:
+            after = "the CLI ended the call at its cap"
+            sweep = sweep_after_return(ctx, after=after, settle=_SWEEP_SETTLE_SECONDS,
+                                       baseline=tenants_before)
+            if sweep.busy:
+                return self._Run(False, permanent=True, preserve_worktree=True,
+                                 tokens=tokens, cost=cost,
+                                 detail=_live_process_detail(after, sweep))
+            # What Gemini CLI said tells how to raise its limit: the operator's
+            # alone — the detail (the `cap` note's detail, the `agent` span),
+            # never `capped`, which reaches the next prompt.
+            said = _gemini_turn_limit_said(stderr, error)
+            logger.debug("Gemini CLI ended the call at its session-turn limit (%s) — "
+                         "judged like a finished call: no retry, no discard", said)
+            return self._Run(True, tokens=tokens, cost=cost, capped=capped,
+                             text=_gemini_result_text(out),
+                             usage_unreported=envelope is None,
+                             detail=f"{after} ({capped}): {said}{sweep.note()}")
         if stopped and rc == 0:
             logger.warning("Gemini CLI %s — a signal stopped the turn before it "
                            "finished; retried like any terminated call",
@@ -2237,6 +2694,17 @@ class AgentCliBackend(CodingBackend):
         1, and ``usage_limit_kind`` its regime), which ends the review with no
         verdict.
 
+        A non-zero exit is read in this order: a call that was terminated
+        (timeout, signal, shutdown) fails open as above; then the usage-limit
+        refusal; then, under an enforced schema, a ``result`` envelope carrying
+        ``structured_output`` is the answer whatever the exit code or
+        ``is_error`` say — the CLI validated it before delivering it (some CLI
+        versions exit non-zero with ``is_error`` true when the connection drops
+        after the delivery); then the CLI's own
+        ``error_max_structured_output_retries`` is an answer that ran and never
+        conformed (``ran=True`` with no ``structured``: the gate's blocking
+        contract error, never a skip); any other non-zero exit fails open.
+
         On Gemini CLI (:func:`_cli_family`) the read-only call is left without
         tools by other means — a deny-all policy file passed with ``--policy``
         (a Gemini CLI that cannot take it makes the call abstain, never judge
@@ -2342,9 +2810,15 @@ class AgentCliBackend(CodingBackend):
                            "— verifier fails open (skipped)", type(exc).__name__, exc)
             return OneshotResult(ran=False, detail=f"{type(exc).__name__}: {exc}")
         timed_out = False
+        held = False
+        done: tuple[str, str] | None = None
+        out = err = ""
         with shutdown.killable(proc, _signal_process_group):
             try:
-                out, err = proc.communicate(timeout=_ONESHOT_TIMEOUT_SECONDS)
+                # The CLI's EXIT, not its pipes (procwait): a process it started
+                # that kept stdout open no longer turns a delivered verdict into
+                # a timeout and a fail-open skip.
+                done = procwait.wait_exit(proc, _ONESHOT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 if sweep_after_termination:
                     logger.warning("verifier one-shot agent call (with tools) timed "
@@ -2359,6 +2833,18 @@ class AgentCliBackend(CodingBackend):
         _unlink_quietly(policy_files)
         # Outside the registration: the leader is reaped, and its pid may
         # already belong to an unrelated process.
+        if timed_out:
+            procwait.close_pipes(proc)
+        elif done is None:
+            out, err, held = procwait.drain(proc, stop=shutdown.requested)
+            if held:
+                logger.warning("verifier one-shot call exited rc=%s, but a "
+                               "process it started kept its output pipe open — "
+                               "stopped reading %gs after the exit and closed the "
+                               "pipe; the exit code stands", proc.returncode,
+                               procwait.PIPE_DRAIN_SECONDS)
+        else:
+            out, err = done
         terminated = (timed_out or shutdown.requested()
                       or (proc.returncode or 0) < 0 or proc.returncode == 143)
         stderr = ""
@@ -2372,13 +2858,18 @@ class AgentCliBackend(CodingBackend):
             terminated = terminated or bool(
                 _gemini_stopped(proc.returncode, out or "", stderr, error))
         if launch_dir is not None:
-            if terminated:
+            if terminated or held:
                 _sweep_verifier_dir(ctx, launch_dir)
             _unlink_quietly([launch_dir])
-        if sweep_after_termination and terminated:
+        # A call that ran WITH tools and left something holding its pipe left
+        # a process running, as a terminated one does: swept the same way.
+        if sweep_after_termination and (terminated or held):
             why = (f"the verifier call timed out after {_ONESHOT_TIMEOUT_SECONDS}s"
                    if timed_out else
-                   f"the verifier call {_how_it_ended(proc.returncode)}")
+                   f"the verifier call {_how_it_ended(proc.returncode)}"
+                   if terminated else
+                   f"the verifier call exited rc={proc.returncode} while a process "
+                   f"it started kept its output pipe open")
             sweep = _reclaim_worktree(ctx)
             if sweep.busy:
                 detail = (f"{why}, and {sweep.busy} — it ran with tools, and "
@@ -2408,6 +2899,32 @@ class AgentCliBackend(CodingBackend):
                                  usage_limit_kind=limit_kind,
                                  detail=f"refused by the usage limit: "
                                         f"{trunc(redact(limit), 300)}")
+        if proc.returncode != 0 and schema_enforced and not terminated:
+            # The answer the CLI delivered decides, not the exit code that
+            # followed it: the envelope is the CLI's own `result`, and its
+            # structured_output passed the schema before it was written.
+            try:
+                envelope = json.loads(out or "")
+            except (ValueError, TypeError):
+                envelope = None
+            if isinstance(envelope, dict) and envelope.get("type") == "result":
+                delivered = _structured_output(out or "")
+                if delivered is not None:
+                    logger.warning("verifier one-shot call exited rc=%s "
+                                   "(subtype=%r, is_error=%r) after delivering a "
+                                   "schema-validated answer — the answer is used",
+                                   proc.returncode, envelope.get("subtype"),
+                                   envelope.get("is_error"))
+                    return OneshotResult(ran=True, text=_result_text(out or ""),
+                                         structured=delivered, schema_enforced=True)
+                if envelope.get("subtype") == "error_max_structured_output_retries":
+                    logger.warning("verifier one-shot call: the CLI reports "
+                                   "the answer never conformed to the enforced schema "
+                                   "(error_max_structured_output_retries, rc=%s) — an "
+                                   "answer that ran and did not conform blocks, it is "
+                                   "not a skip", proc.returncode)
+                    return OneshotResult(ran=True, text=_result_text(out or ""),
+                                         structured=None, schema_enforced=True)
         if proc.returncode != 0:
             logger.debug("verifier one-shot agent call exited rc=%s — failing open",
                          proc.returncode)
@@ -2543,7 +3060,8 @@ class AgentCliBackend(CodingBackend):
                      last_oracle: OracleResult | None,
                      runlog: RunLog, *,
                      preserve_worktree: bool = False,
-                     live: str = "", stage: str = "agent") -> ImplementOutcome:
+                     live: str = "", stage: str = "agent",
+                     nested: gitutil.NestedRepoIds | None = None) -> ImplementOutcome:
         """Stop cleanly on Ctrl-C / SIGTERM / SIGHUP, leaving the task resumable.
 
         The shutdown handler has already terminated the agent's process group
@@ -2570,6 +3088,10 @@ class AgentCliBackend(CodingBackend):
         ``stage="validation"`` is the oracle's interruption: the agent call had
         finished and its validation run was terminated instead, so that run has
         no verdict and *last_oracle* is the one before it.
+
+        *nested* is passed on to :meth:`_stopped`: the snapshot taken before a
+        capped call whose red work the tree still holds, which a discard here
+        takes along.
         """
         signame = shutdown.signame() or "SIGINT"
         what = ("its validation run was terminated (no verdict — not recorded as "
@@ -2589,7 +3111,8 @@ class AgentCliBackend(CodingBackend):
                         "re-validate" if stage == "validation" else "")
         outcome = self._stopped(ctx, iterations, last_oracle, detail, runlog,
                                 preserve_worktree=preserve_worktree,
-                                beat_status="aborted", preserve_reason=kept)
+                                beat_status="aborted", preserve_reason=kept,
+                                nested=nested)
         ctx.log(f"  ⏹ interrupted by {signame} after {iterations} iteration(s) — "
                 f"stopping cleanly; the task stays resumable")
         return outcome
@@ -2617,9 +3140,11 @@ class AgentCliBackend(CodingBackend):
 
         *nested* is the iteration's snapshot of untracked nested repositories,
         passed by a stop whose attempt no earlier discard swept (a permanent
-        agent error; the non-green abort while a commit repair was pending):
-        the discard here then removes the ones that attempt created, as the
-        loop's own discards do. ``None`` removes none.
+        agent error; the non-green abort while a commit repair was pending; a
+        stop while the tree holds a capped call's kept red work, whose snapshot
+        is then the one taken before that call): the discard here then removes
+        the ones that attempt created, as the loop's own discards do. ``None``
+        removes none.
         """
         if preserve_worktree and preserve_reason:
             logger.warning("preserving worktree %s on failure — %s",
@@ -2682,11 +3207,16 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     return in its TERM phase with a TERM-ignoring tool process still alive and
     cwd'd in the worktree. A caller must follow it with
     :func:`_reclaim_worktree` before retrying into, or resetting, that tree.
+
+    Each grace waits for the CLI's EXIT, not for its pipes
+    (:func:`harness.pipeline.procwait.wait_exit`): a process outside the group
+    that holds the CLI's stdout no longer stretches every rung to its full
+    grace. What such a process still holds, the caller closes.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
         _signal_process_group(proc, sig)
         try:
-            proc.communicate(timeout=_TEARDOWN_GRACE_SECONDS[sig])
+            procwait.wait_exit(proc, _TEARDOWN_GRACE_SECONDS[sig])
             logger.debug("agent process group (pid=%s) reaped after %s",
                          proc.pid, sig.name)
             return
@@ -3042,6 +3572,88 @@ def _cli_limit_text(stdout: str) -> str:
     return result.strip() if isinstance(result, str) else ""
 
 
+def _spent_view(budget: LoopBudget, tokens: int, cost: float) -> LoopBudget:
+    """*budget* as it stands once *tokens* / *cost* more have been spent.
+
+    What the retry ladder (``_run_with_retries``) hands a retry, and checks
+    before one: the loop adds an iteration's spend only once its attempts are
+    over, so the shared budget alone does not know what they spent.
+    """
+    return LoopBudget(budget.max_tokens, budget.max_cost_usd,
+                      tokens=budget.tokens + max(0, tokens),
+                      cost_usd=budget.cost_usd + max(0.0, cost))
+
+
+#: The ``subtype`` of the result envelope the CLI ends a call with once a cap
+#: harness handed it is reached, per cap flag. The same in older and newer CLIs
+#: alike: ``type`` ``result``, ``is_error`` true, that subtype, and the CLI's
+#: own sentence in ``errors`` ("Reached maximum number of turns (5)", "Reached
+#: maximum budget ($1.00)"); its non-interactive JSON mode then exits 1, as on
+#: every ``is_error`` result.
+_CLI_CAP_SUBTYPES = {"--max-turns": "error_max_turns",
+                     "--max-budget-usd": "error_max_budget_usd"}
+
+
+def _cli_cap_text(stdout: str, flags: list[str]) -> str:
+    """The CLI's own report that it ended the call at a cap it was handed, or ``""``.
+
+    Read from the JSON envelope's structured fields only — ``type`` ``result``,
+    ``is_error`` true, ``subtype`` ``error_max_turns`` / ``error_max_budget_usd``
+    (:data:`_CLI_CAP_SUBTYPES`) — and only for a cap whose flag is in *flags*,
+    the cap flags this launch's argv carried: those fields are written by the
+    CLI, never by the model, and a cap harness did not hand it is not one the
+    operator set. Returns ``"<subtype>: <the CLI's sentence>"`` (the subtype
+    alone when ``errors`` holds none). Unknown is never a proof: any other
+    shape — the agent's prose naming the cap among it — yields ``""``.
+    """
+    if not stdout:
+        return ""
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return ""
+    if (not isinstance(data, dict) or data.get("type") != "result"
+            or data.get("is_error") is not True):
+        return ""
+    subtype = data.get("subtype")
+    if not any(flag in flags and subtype == name
+               for flag, name in _CLI_CAP_SUBTYPES.items()):
+        return ""
+    errors = data.get("errors")
+    said = ([e.strip() for e in errors if isinstance(e, str) and e.strip()]
+            if isinstance(errors, list) else [])
+    return trunc(f"{subtype}: {'; '.join(said)}" if said else str(subtype), 300)
+
+
+def _capped_call_cost(capped: str, flags: list[str], cost: float) -> float:
+    """What a call the CLI ended at its cap (*capped*, :func:`_cli_cap_text`) costs the loop.
+
+    *cost* — the envelope's own figure, :func:`parse_agent_usage`'s — except
+    at the ``--max-budget-usd`` cap: the CLI ends a call there once the session's
+    cost has reached the balance in *flags* (the balance it was handed), and
+    newer CLIs also end one there when the session's cost is no longer a
+    number, before any balance is reached; either way the call is charged at
+    least that balance — the most it was allowed, not a measured spend. Its own
+    figure is kept when it reads as at least the balance. One that cannot be
+    read — ``null`` (newer CLIs refuse a session cost that is not a number
+    under the same subtype, and JSON writes the NaN as ``null``), a bare NaN, a
+    missing or drifted field, each of which parses as $0 or NaN — or that reads
+    below the balance the envelope itself says was reached is no proof of a
+    smaller spend. Taken alone, the figure left the loop's budget check blind
+    exactly where the CLI-side cap exists to hold: every red budget-capped call
+    was handed the whole balance again, until ``max_iters``.
+    """
+    if capped.partition(":")[0] != _CLI_CAP_SUBTYPES["--max-budget-usd"]:
+        return cost
+    try:
+        handed = float(flags[flags.index("--max-budget-usd") + 1])
+    except (ValueError, IndexError):
+        return cost
+    # A NaN fails every comparison, so it reads as unreadable here.
+    readable = cost if 0.0 <= cost < float("inf") else 0.0
+    return max(readable, handed)
+
+
 def _tail_elided(text: str, limit: int) -> str:
     """The LAST *limit* chars of *text*, marking how much was dropped.
 
@@ -3353,8 +3965,45 @@ def _gemini_stopped(rc: int | None, out: str, stderr: str,
     return ""
 
 
+#: How a call Gemini CLI ended at its own session-turn limit is named wherever
+#: the next agent reads it: the run log's ``cap`` summary, which the next
+#: prompt's digest of earlier iterations carries, and the cap note that leads its
+#: feedback. Fixed words, never the CLI's own: its message says how to raise
+#: that limit, which the branch's own .gemini/settings.json can.
+_GEMINI_TURN_LIMIT = "Gemini CLI's own session-turn limit (exit 53)"
+
+
+def _gemini_turn_limit(rc: int | None) -> str:
+    """How a call Gemini CLI ended at its own session-turn limit is named — or ``""``.
+
+    Exit 53 alone decides, whatever the argv carried: Gemini CLI exits 53 once
+    a call has used every turn its settings allow, a limit set in its settings
+    (yours, or the branch's own .gemini/settings.json) — harness hands it no
+    turn cap (:func:`_gemini_cap_refusal`) — and the exit status is the CLI's,
+    never the model's. Always :data:`_GEMINI_TURN_LIMIT`: the name reaches the
+    next agent's prompt, so what Gemini CLI said goes only into the call's
+    detail (:func:`_gemini_turn_limit_said`).
+    """
+    return _GEMINI_TURN_LIMIT if rc == 53 else ""
+
+
+def _gemini_turn_limit_said(stderr: str, error: _GeminiError | None) -> str:
+    """What Gemini CLI said when it ended a call at its session-turn limit.
+
+    :func:`_gemini_said`, redacted and bounded (:func:`_gemini_quote`, then 300
+    characters), for the operator alone: the call's detail, which reaches the
+    run log's ``cap`` note detail and the ``agent`` span but never the next
+    prompt. *stderr* is the cleaned text.
+    """
+    said = _gemini_quote(_gemini_said(error, stderr), error).rstrip(". \n")
+    return trunc(said or "(no error text)", 300)
+
+
 #: Gemini CLI's fatal exit codes: ``(permanent, detail)``. Decided by the exit
-#: status, which the model cannot write, and only on this family.
+#: status, which the model cannot write, and only on this family. 53, its own
+#: session-turn limit, is no failure (a call that ended at its cap,
+#: :func:`_gemini_turn_limit`): its row is read only for a call a shutdown ended,
+#: where it decides the regime and quotes what Gemini CLI said.
 _GEMINI_EXIT_DETAIL: dict[int, tuple[bool, str]] = {
     41: (True, ("Gemini CLI could not authenticate (exit 41): {said} — headless runs "
                 "need GEMINI_API_KEY (or another auth method Gemini CLI can use "
@@ -3369,8 +4018,7 @@ _GEMINI_EXIT_DETAIL: dict[int, tuple[bool, str]] = {
     52: (True, ("Gemini CLI rejected its configuration (exit 52): {said} — fix the "
                 "setting it names. Every attempt fails the same way.")),
     53: (False, ("Gemini CLI stopped at its session turn limit (exit 53): {said} — "
-                 "model.maxSessionTurns in its settings; retried like any other "
-                 "unfinished turn.")),
+                 "model.maxSessionTurns in its settings")),
     54: (True, ("Gemini CLI stopped on a fatal tool error (exit 54): {said}. Every "
                 "attempt fails the same way until it is fixed.")),
     55: (True, ("Gemini CLI refused to run in an untrusted folder (exit 55): {said} "
@@ -3469,18 +4117,20 @@ def _gemini_failure(rc: int, out: str, stderr: str, error: _GeminiError | None,
     In order: an argument refusal (permanent); an HTTP 429 (:func:`_gemini_limit`
     — a quota window or transient, never permanent); Gemini CLI's fatal exit
     codes (:data:`_GEMINI_EXIT_DETAIL` — 53, its turn limit, is the one
-    transient); an exit that is an HTTP error status mod 256 with that status
-    in the error object (classified from ``HTTP <code>``, and permanent on a bad
-    API key); an exit 1 whose object is an ``UnauthorizedError`` or
-    ``ForbiddenError`` (permanent); any other error object — an exit 1, its
-    cancellation's 130 — classified; and otherwise the legacy layout, classified
-    as before. An error object's rows are classified from its own words alone,
-    and every row that is not permanent carries its regime
-    (:func:`_gemini_classified`). *stderr* is cleaned; Gemini CLI's log of its
-    own retries is neither quoted nor classified (:func:`_gemini_without_retries`
-    — it quotes each retried attempt's error, a 429's included); every quoted
-    part is redacted and bounded, and the stderr text before the object follows
-    the head as a ``stderr:`` part — never the object twice.
+    transient, and reaches this only from a call a shutdown ended: any other
+    ended at its cap, :func:`_gemini_turn_limit`); an exit that is an HTTP error
+    status mod 256 with that status in the error object (classified from
+    ``HTTP <code>``, and permanent on a bad API key); an exit 1 whose object is
+    an ``UnauthorizedError`` or ``ForbiddenError`` (permanent); any other error
+    object — an exit 1, its cancellation's 130 — classified; and otherwise the
+    legacy layout, classified as before. An error object's rows are classified
+    from its own words alone, and every row that is not permanent carries its
+    regime (:func:`_gemini_classified`). *stderr* is cleaned; Gemini CLI's log
+    of its own retries is neither quoted nor classified
+    (:func:`_gemini_without_retries` — it quotes each retried attempt's error, a
+    429's included); every quoted part is redacted and bounded, and the stderr
+    text before the object follows the head as a ``stderr:`` part — never the
+    object twice.
     """
     said_raw = _gemini_said(error, stderr)
     said = _gemini_quote(said_raw, error).rstrip(". \n") or "(no error text)"

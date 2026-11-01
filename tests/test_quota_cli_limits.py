@@ -96,7 +96,8 @@ def _cli_reset(reset: float, now: float, zone: str, variant: str = "older") -> s
     beyond, ``Mon D, `` first, plus the year when it is not the current one in
     that zone. An older CLI strips only an ASCII space before AM/PM, so an ICU
     that emits U+202F leaves "10:53\u202fPM" (variant ``older-nnbsp``); a newer
-    one strips either (variant ``newer``).
+    one strips either (variant ``newer``), and so does the newest (variant
+    ``newest``).
     """
     tz = _zone(zone)
     when = datetime.fromtimestamp(reset, tz)
@@ -154,28 +155,34 @@ _OPERATOR_ACTION = (
 )
 
 
-def _rows(clause: str, *, newer: bool) -> list[tuple[str, str | None, bool]]:
-    """``(text, expected regime, states a reset)`` for one reset clause."""
+def _rows(clause: str, *, newer: bool,
+          newest: bool = False) -> list[tuple[str, str | None, bool]]:
+    """``(text, expected regime, states a reset)`` for one reset clause.
+
+    *newest* is the wording of the newest CLIs, which call the five-hour window
+    the "5-hour limit" where older ones said "session limit".
+    """
     ultra = "Ultra limit" if newer else "Ultra 5 limit"
+    session = "5-hour limit" if newest else "session limit"
     rows: list[tuple[str, str | None, bool]] = []
     # The window family reopens at its stated reset; hit with no reset stated,
     # a named window gets the bounded default wait.
-    for name in ("session limit", "weekly limit", "Pro limit", "Flash limit", ultra,
+    for name in (session, "weekly limit", "Pro limit", "Flash limit", ultra,
                  "usage limit", "limit"):
         rows.append((f"You've hit your {name} {_D} resets {clause}", "quota-window", True))
         rows.append((f"You've hit your {name} {_D} resets {clause} {_D} progress saved",
                      "quota-window", True))
         rows.append((f"You've hit your {name}", "quota-window", False))
-    rows.append((f"You've hit your session limit {_D} progress saved", "quota-window", False))
+    rows.append((f"You've hit your {session} {_D} progress saved", "quota-window", False))
     # A spend or usage cap beside a stated reset: the window reopens on its own
     # (the cap only blocked overage).
     rows += [
         ((f"You've hit your monthly spend limit {_D} raise it at {_URL} {_D} your "
-          f"session limit resets {clause}"), "quota-window", True),
+          f"{session} resets {clause}"), "quota-window", True),
         ((f"You've hit your org's monthly spend limit {_D} ask your admin to raise it at "
           f"{_URL} {_D} your weekly limit resets {clause}"), "quota-window", True),
         ((f"You've hit your individual spend limit {_D} run /usage-credits to raise it, "
-          f"or visit {_ADMIN} {_D} your session limit resets {clause}"), "quota-window", True),
+          f"or visit {_ADMIN} {_D} your {session} resets {clause}"), "quota-window", True),
         (f"You've hit your individual usage limit {_D} resets {clause}", "quota-window", True),
         (f"You've hit your org's monthly usage limit {_D} resets {clause}",
          "quota-window", True),
@@ -186,15 +193,19 @@ def _rows(clause: str, *, newer: bool) -> list[tuple[str, str | None, bool]]:
     if newer:
         rows += [
             ((f"You've hit your team's shared budget {_D} raise it at {_ADMIN} {_D} your "
-              f"session limit resets {clause}"), "quota-window", True),
-            ((f"You've hit your channel's monthly spend limit{_CHANNEL} {_D} your session "
-              f"limit resets {clause}"), "quota-window", True),
+              f"{session} resets {clause}"), "quota-window", True),
+            ((f"You've hit your channel's monthly spend limit{_CHANNEL} {_D} your "
+              f"{session} resets {clause}"), "quota-window", True),
             (f"You've hit your channel's monthly usage limit{_CHANNEL} {_D} resets {clause}",
              "quota-window", True),
             ("Pro requires usage credits. /model to switch models.", "permanent", False),
             ("You've hit your team's shared budget. Switch to another model to continue.",
              "permanent", False),
         ]
+    if newest:
+        # The same CLIs name the overage meter the "usage credit limit". It is
+        # no reopening window: with no reset stated, an operator lifts it.
+        rows.append(("You've hit your usage credit limit", "permanent", False))
     rows += [(text, "permanent", False) for text in _OPERATOR_ACTION]
     # The same 429 error kind, or the CLI's warnings, but not a usage limit:
     # not claimed, so the ordinary classifier keeps them.
@@ -206,8 +217,11 @@ def _rows(clause: str, *, newer: bool) -> list[tuple[str, str | None, bool]]:
         "Pro is experiencing high load, please use /model to switch to Flash",
         ("API Error: Repeated 529 Overloaded errors. The API is at capacity — this is "
          "usually temporary. Try again in a moment."),
-        f"You've used 90% of your session limit {_D} resets {clause}",
+        f"You've used 90% of your {session} {_D} resets {clause}",
+        f"Over 90% of your {session} used",
+        f"Approaching {session} {_D} resets {clause}",
         f"Approaching weekly limit {_D} resets {clause}",
+        "You're close to your usage credit limit",
         "You've reached your rate limit — retry shortly",
     )]
     return rows
@@ -217,10 +231,10 @@ _OFFSETS = {"+12m": 12 * 60, "+3h53m": 3 * 3600 + 53 * 60, "+23h30m": 23 * 3600 
             "+26h": 26 * 3600, "+3d2h": 3 * 86400 + 7200, "+6d23h": 6 * 86400 + 23 * 3600}
 
 
-# ── 1. the recognizer: the CLI's whole message table, both versions ─────────────
+# ── 1. the recognizer: the CLI's whole message table, each version ──────────────
 
 
-@pytest.mark.parametrize("variant", ["older", "older-nnbsp", "newer"])
+@pytest.mark.parametrize("variant", ["older", "older-nnbsp", "newer", "newest"])
 @pytest.mark.parametrize("offset", sorted(_OFFSETS))
 @pytest.mark.parametrize("zone", ["UTC", "America/Los_Angeles", "Asia/Kolkata"])
 def test_every_cli_refusal_gets_its_regime_and_its_exact_reset(zone, offset, variant):
@@ -233,7 +247,8 @@ def test_every_cli_refusal_gets_its_regime_and_its_exact_reset(zone, offset, var
     delta = _OFFSETS[offset]
     clause = _cli_reset(_NOW + delta, _NOW, zone, variant)
     bad = []
-    for text, want, has_reset in _rows(clause, newer=variant == "newer"):
+    for text, want, has_reset in _rows(clause, newer=variant in ("newer", "newest"),
+                                       newest=variant == "newest"):
         got = cli_usage_limit_kind(text, now=_NOW)
         reset = cli_reset_seconds(text, now=_NOW)
         if got != want:
@@ -253,6 +268,23 @@ def test_the_per_model_limit_that_names_a_model_switch_is_permanent():
     text = "You've reached your Ultra 5 limit. Switch to another model to continue."
     assert classify_invocation_failure(text) == "quota-window"     # the legacy read
     assert cli_usage_limit_kind(text, now=_NOW) == "permanent"
+
+
+def test_the_5_hour_limit_of_newer_clis_is_the_window_the_session_limit_was():
+    """The newest CLIs call the five-hour window the "5-hour limit" — "You've
+    hit your 5-hour limit" — where older ones said "session limit".
+    Unrecognised, a refusal that stated no reset read as PERMANENT — the task
+    stopped instead of getting the bounded default wait. One that states its
+    reset was already rescued by the reset clause."""
+    from harness.pipeline.looptools import cli_reset_seconds, cli_usage_limit_kind
+
+    for text in ("You've hit your 5-hour limit",
+                 f"You've hit your 5-hour limit {_D} progress saved"):
+        assert cli_usage_limit_kind(text, now=_NOW) == "quota-window", text
+        assert cli_reset_seconds(text, now=_NOW) is None, text
+    stated = f"You've hit your 5-hour limit {_D} resets 10:53pm (UTC)"
+    assert cli_usage_limit_kind(stated, now=_NOW) == "quota-window"
+    assert cli_reset_seconds(stated, now=_NOW) == 3 * 3600 + 53 * 60
 
 
 # ── 2. reset parsing: zones, DST, the year, separators, the clock's edges ───────
@@ -504,11 +536,13 @@ def test_prose_that_quotes_the_wording_is_never_claimed():
     words inside a detail, a quote or a JSON tail are not a refusal."""
     from harness.pipeline.looptools import cli_usage_limit_kind
 
-    quote = f"You've hit your session limit {_D} resets 10:53pm (UTC)"
-    for text in (f"agent report: {quote}", f"The CLI said: {quote}",
-                 f'stdout tail: {{"result": "{quote}"}}', f"Done.\n{quote}"):
-        assert cli_usage_limit_kind(text, now=_NOW) is None, text
-        assert classify_invocation_failure(text) == "transient", text
+    for quote in (f"You've hit your session limit {_D} resets 10:53pm (UTC)",
+                  f"You've hit your 5-hour limit {_D} resets 10:53pm (UTC)",
+                  "You've hit your 5-hour limit"):
+        for text in (f"agent report: {quote}", f"The CLI said: {quote}",
+                     f'stdout tail: {{"result": "{quote}"}}', f"Done.\n{quote}"):
+            assert cli_usage_limit_kind(text, now=_NOW) is None, text
+            assert classify_invocation_failure(text) == "transient", text
 
 
 # ── 4. the envelope gate: only what the CLI marked ──────────────────────────────
@@ -768,10 +802,18 @@ def test_a_reset_the_remaining_waits_can_reach_is_waited_in_capped_slices(tmp_pa
     assert cli.waits[:1] == [3600]                 # a capped slice, not a stop
 
 
+@pytest.mark.parametrize("text", [
+    pytest.param("You've hit your session limit", id="session-limit"),
+    # The newest CLIs: the same five-hour window, renamed — and they may append
+    # " · progress saved".
+    pytest.param("You've hit your 5-hour limit", id="5-hour-limit"),
+    pytest.param(f"You've hit your 5-hour limit {_D} progress saved",
+                 id="5-hour-limit-progress-saved"),
+])
 def test_a_named_window_with_no_reset_gets_the_bounded_default_wait(tmp_path,
-                                                                    monkeypatch):
+                                                                    monkeypatch, text):
     cli = _Cli(tmp_path, monkeypatch)
-    cli.serve(_envelope("You've hit your session limit"))
+    cli.serve(_envelope(text))
     ctx = _ctx(tmp_path, max_agent_retries=0, max_quota_waits=2)
 
     run = _retries(ctx, cli)

@@ -15,7 +15,7 @@ what unlocks what, and how to install it.
 | Requirement | Version | Why |
 |---|---|---|
 | Python | ≥ 3.10 | Runtime |
-| git | any recent; ≥ 2.31 for the submodule hold proof | The design-docs → PRs pipeline (worktrees, branches). A reset that must keep a submodule out of its recursion proves the hold through `GIT_CONFIG_COUNT`, which git 2.31 introduced; on an older git the proof fails and that reset recurses into no submodule, so every submodule's edits stay in place and a checkout left away from its recorded commit is recorded and its pointer held back |
+| git | ≥ 2.39.0 recommended (a warning, never a refusal); ≥ 2.31 for the submodule hold proof | The design-docs → PRs pipeline (worktrees, branches). Below the git a feature needs, the proof behind it fails **closed**: `merge-tree --write-tree` (2.38) is the squash-landed proof, so an older git keeps a squash-merged branch as unproven, and `patch-id --verbatim` (2.39) is the force-push retry's whitespace-exact check, so an older git refuses every retry (see [Why those minimums](#why-those-minimums)). A reset that must keep a submodule out of its recursion proves the hold through `GIT_CONFIG_COUNT`, which git 2.31 introduced; on an older git the proof fails and that reset recurses into no submodule, so every submodule's edits stay in place and a checkout left away from its recorded commit is recorded and its pointer held back |
 
 ```bash
 git clone https://github.com/your-org/harness-oss.git   # or clone your fork
@@ -52,7 +52,7 @@ pip install -e ".[z3,proc,dev]" # all three
 | `dev` | `pytest>=9.1.1`, `mypy>=2.0,<3`, … | `pytest -q` runs the test suite | — |
 
 The `z3` floor is a *lower* bound only — no upper cap, deliberately: z3-solver
-4.12 … 5.3.1.0 are all tested, and `Z3Solver.__init__` probes the API it needs at
+4.12 … 5.3.3.0 are all tested, and `Z3Solver.__init__` probes the API it needs at
 construction time, so an incompatible future release degrades to the builtin
 solver (or fails loudly under `--require-z3`) rather than being pre-emptively
 refused by a cap that guessed wrong. `mypy` **is** capped: 2.0 flipped defaults
@@ -69,11 +69,11 @@ is missing.
 
 | Tool | Unlocks | Minimum | Install |
 |---|---|---|---|
-| **git** | the pipeline itself (worktrees/branches) — *effectively required* | any recent; **2.31** for the submodule hold proof (not probed; see [Core install](#1-core-install-required)) | `apt/brew/pacman install git` |
+| **git** | the pipeline itself (worktrees/branches) — *effectively required* | **2.39.0** (warn); **2.31** for the submodule hold proof (not probed; see [Core install](#1-core-install-required)) | `apt/brew/pacman install git` |
 | **gh** | `harness pipeline run --pr github` (open real PRs) | **2.97.0** (warn) | https://cli.github.com — then `gh auth login` |
 | **tmux** | `harness pipeline tmux` cockpit (run several features at once) | **2.1** (exact `=` session targets; not probed) | `apt/brew/pacman install tmux` |
 | **gemini** (or another agent CLI, registered as an `AgentCliBackend(cli=...)` drop-in) | the `agent-cli` backend (unattended ralph loop) **and the review verifier** — the ≥ 2 fresh-context judges are one-shot agent-CLI calls | — (pin your own: see below) | https://github.com/google-gemini/gemini-cli — auth via `GEMINI_API_KEY` or Google OAuth login; harness launches it headless with `GEMINI_CLI_TRUST_WORKSPACE=true` unless you set that yourself ([Driving Gemini CLI](#driving-gemini-cli)) |
-| **go** | augments the Go grounding stdlib set via `go list std` (bundled set works without it) | **1.26.9** or **1.27.2** (warn) | https://go.dev/dl |
+| **go** | augments the Go grounding stdlib set via `go list std` (bundled set works without it) | **1.26.10** or **1.27.3** (warn) | https://go.dev/dl |
 | **npm** | JS/TS repos the pipeline validates via an autodetected `npm test --silent` oracle | — | https://nodejs.org |
 
 The default `ide-handoff` backend (pair it with Google Antigravity or any other
@@ -82,30 +82,53 @@ can run the full design-docs → PRs loop with only the core install.
 
 ### Why those minimums
 
-Each floor harness probes is security-derived, and `harness status` prints the
-detected-vs-required pair so "installed" and "recent enough" are visibly
-different states. Every shipped floor is a warning, because refusing to work on
-a machine whose CLI is merely old costs more than it protects:
+Each floor harness probes is security-derived but git's (a capability floor),
+and `harness status` prints the detected-vs-required pair so "installed" and
+"recent enough" are visibly different states. Every shipped floor is a warning,
+because refusing to work on a machine whose CLI is merely old costs more than it
+protects:
 
 * **gh 2.97.0** — clears the 2026-07-31 advisories, notably
   GHSA-4fjg-2h4q-fwg3 / CVE-2026-64653 (unescaped URL path components in REST
   calls). harness interpolates design-doc-derived `agent/<id>` branch names into
   `gh pr create --head` / `gh pr list --head`, which is the reachable end of it.
-* **go 1.26.9 / 1.27.2** — GO-2026-6601 / CVE-2026-94444 and GO-2026-6602 /
-  CVE-2026-94447 (published 2026-10-08): `cmd/go` checksum-database bypasses for
-  the golang.org/fips140 module and for the golang.org/toolchain download — 6602
-  is the class of GO-2026-4984, where a `toolchain` line in the inspected repo
-  makes `go` download and execute a toolchain — fixed **only** in 1.26.9 and
-  1.27.2. Go 1.25 is end-of-life and got no fix, so no 1.25.x passes. The same
-  floor covers GO-2026-6179 / GO-2026-6180 (sumdb verification bypasses),
-  GO-2026-4871, GO-2026-4338 and GO-2025-3828. All are in `cmd/go`, which the
-  `go build` / `go vet` oracle runs inside repositories you do not own. Note
-  1.27.0–1.27.1 are *newer* than 1.26.9 but miss the fix (as 1.26.0–1.26.2 did
-  under the previous floor), so the check knows both release branches: `harness
-  status` shows `1.27.1 (require >= 1.26.9 / 1.27.2)`, and where Go grounding
-  probes `go` (`harness verify`, `verify --hook`, the pipeline's grounding gate)
-  the warning reads `` `go` 1.27.1 misses the fix in the recommended 1.26.9 /
-  1.27.2 ``.
+* **go 1.26.10 / 1.27.3** — GO-2026-6809 / CVE-2026-111943 (published
+  2026-10-21): `crypto/x509` now distrusts compromised intermediate certificates
+  in `Certificate.Verify`, which the go command's own HTTPS fetches (GOPROXY,
+  sum.golang.org, a toolchain download) go through — fixed **only** in 1.26.10
+  and 1.27.3. The checksum database still guards module integrity, so an older go
+  risks a man-in-the-middle's read and availability where the system trust store
+  lags: low urgency. The floor's earlier fixes stay below it (1.26.9 / 1.27.2):
+  GO-2026-6601 / CVE-2026-94444 and GO-2026-6602 / CVE-2026-94447 (published
+  2026-10-08), `cmd/go` checksum-database bypasses for the golang.org/fips140
+  module and for the golang.org/toolchain download — 6602 is the class of
+  GO-2026-4984, where a `toolchain` line in the inspected repo makes `go`
+  download and execute a toolchain. Go 1.25 is end-of-life and got no fix, so no
+  1.25.x passes. The same floor covers GO-2026-6179 / GO-2026-6180 (sumdb
+  verification bypasses), GO-2026-4871, GO-2026-4338 and GO-2025-3828, all in
+  `cmd/go`, which the `go build` / `go vet` oracle runs inside repositories you
+  do not own. Note 1.27.0–1.27.2 are *newer* than 1.26.10 but miss the fix (as
+  1.27.0–1.27.1 did under the previous floor), so the check knows both release
+  branches: `harness status` shows `1.27.2 (require >= 1.26.10 / 1.27.3)`, and
+  where Go grounding probes `go` (`harness verify`, `verify --hook`, the
+  pipeline's grounding gate) the warning reads
+  `` `go` 1.27.2 misses the fix in the recommended 1.26.10 / 1.27.3 ``.
+* **git 2.39.0** — a capability floor, not a security one, and a warning like the
+  rest: every proof an older git cannot run fails **closed**, so an old git loses
+  function, never safety. `merge-tree --write-tree` (2.38) is the squash-landed
+  proof behind `pipeline prune` and branch deletion, and the dependency re-seed's
+  plumbing: on git 2.31–2.37 a squash-merged branch is kept as `kept_unproven` and
+  named as such — proof unavailable, never "not landed" — and a re-seed falls back
+  to the old diff base. `patch-id --verbatim` (2.39) is the force-push retry's
+  whitespace-exact clobber check: below it every retry refuses, naming the floor
+  and the version it found. `show-ref --exists` (2.43) only proves an unborn HEAD,
+  which an older git reads as unknown (fail-closed); the floor is not raised to
+  2.43, which would exclude Debian 12's 2.39.5. Below 2.31 the submodule hold
+  proof fails (see [Core install](#1-core-install-required)), and
+  `harness pipeline complete <id>` run from inside a worktree cannot find the main
+  checkout (it asks `git rev-parse --path-format=absolute --git-common-dir`), so
+  pass `--repo` there. `harness status` shows the version it found against the
+  floor, e.g. `⚠ 2.34.1 (require >= 2.39.0)`.
 * **tmux 2.1** — functional, not security, and documented rather than probed:
   `harness pipeline tmux` names its session by an exact target
   (`=harness-<repo>`), which tmux reads from 2.1 on, because a bare
@@ -124,6 +147,7 @@ allowlist as its containment boundary — so watch your agent CLI's release note
 / security advisories and raise the floor when a fix lands in that area. A hard
 floor pinned for `gh` or `go` stops nothing: it is logged as an ERROR and shown
 as refused by `harness status`, but `--pr github` and Go grounding still run.
+One pinned for git stops nothing either, and only `harness status` shows it.
 
 A hard floor you pin for the agent CLI fails closed: below it, **or when the
 version cannot be verified**, the `agent-cli` backend reports itself
@@ -138,20 +162,21 @@ same way, an absolute path is taken as is, a relative path is refused); there is
 no CLI-selection flag.
 
 How a version is read, for every floor: from each CLI's own version line on
-stdout or stderr (`gh version X.Y.Z`, `go version goX.Y[.Z]`), after terminal
-escape sequences (colour, hyperlinks) are deleted. Without such a line a single
-distinct `X.Y.Z` is accepted — which is how the single bare `X.Y.Z` an agent CLI
-prints is read — and several different versions count as unknown, so a
-wrapper's banner or an "update available" notice never stands in for the
-version that runs. The probe runs the absolute file an absolute `PATH` entry
-names, never a bare name; it runs from the temp directory, in its own process
-group (killed whole after 20 s), with empty and relative entries removed from
-its `PATH`, and `go version` runs with `GOTOOLCHAIN=local`.
+stdout or stderr (`gh version X.Y.Z`, `go version goX.Y[.Z]`,
+`git version X.Y.Z`), after terminal escape sequences (colour, hyperlinks) are
+deleted. Without such a line a single distinct `X.Y.Z` is accepted — which is
+how the single bare `X.Y.Z` an agent CLI prints is read — and several different
+versions count as unknown, so a wrapper's banner or an "update available" notice
+never stands in for the version that runs. The probe runs the absolute file an
+absolute `PATH` entry names, never a bare name; it runs from the temp directory,
+in its own process group (killed whole after 20 s), with empty and relative
+entries removed from its `PATH`, and `go version` runs with `GOTOOLCHAIN=local`.
 
 What `harness status` shows: a version below a recommended floor as
 `⚠ 2.96.1 (require >= 2.97.0)`; an unknown version under a recommended floor as
 `⚠ unknown (require >= X) — <reason>`, logged as one WARNING per binary while
-the run goes on; and under a hard floor, such as one pinned for your agent CLI,
+the run goes on (but never git's, which a run reads only to name an old git in a
+failing proof); and under a hard floor, such as one pinned for your agent CLI,
 `⛔ unknown (require >= X) — <reason> — cannot verify the hard minimum Y, refused`
 (or `⛔ <version> (require >= X) — below the hard minimum Y, refused`), with the
 `agent-cli` line under Backends carrying the same refusal. Each CLI's version is
@@ -169,12 +194,12 @@ flush against one fuses with the version (`1\x1b[0m2.97.0` reads as 12.97.0); a
 two-byte escape outside the stripped range, such as `ESC 8` (`tput rc`), is not
 stripped and glues the same way (82.97.0); and non-ASCII digits are accepted. A
 wrapper that prints only its own single `X.Y.Z` reads as that version. A probe
-child that leaves its process group (`setsid`) survives the timeout and keeps
-the probe busy about 10 s longer, and Ctrl-C during `harness status`, which has
-no shutdown guard, does not reach a hung probe (it runs in its own session until
-it exits); under `pipeline run` the guard kills it. Go grounding's own `go list
-std` still runs the bare `go` the inherited `PATH` names, from the temp
-directory.
+child that leaves its process group (`setsid`) survives the timeout, but holds
+the probe at most 2 s past the version command's own exit. Ctrl-C during
+`harness status`, which has no shutdown guard, does not reach a hung probe (it
+runs in its own session until it exits); under `pipeline run` the guard kills
+it. Go grounding's own `go list std` still runs the bare `go` the inherited
+`PATH` names, from the temp directory.
 
 ### Driving Gemini CLI
 
@@ -231,7 +256,7 @@ The full list, with the exit codes and the quota path, is in
 ```bash
 harness status               # environment doctor: grounding solver, backends, deps, extensions
 harness pipeline backends    # which code-writing backends are usable here
-pytest -q                    # (after `.[dev]`) → 2465 passed, 1 skipped
+pytest -q                    # (after `.[dev]`) → 2866 passed, 1 skipped
 harness verify - --lang go <<<'package main
 import "fmtx"
 func main(){}'               # grounding smoke test (should FAIL on the bad import)

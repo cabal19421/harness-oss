@@ -511,7 +511,7 @@ def test_outdated_toolchain_warns_but_still_merges_the_live_package_set(monkeypa
         go_stdlib.stdlib_packages.cache_clear()
         config.tool_version.cache_clear()
 
-    # 1.26.0 is on a live release branch yet misses its 1.26.9 fixes.
+    # 1.26.0 is on a live release branch yet misses its 1.26.10 fixes.
     warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
     assert any("1.26.0" in m for m in warnings), warnings
     assert "crypto/brandnew" in pkgs and "fmt" in pkgs

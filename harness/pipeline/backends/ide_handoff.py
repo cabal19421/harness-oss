@@ -17,18 +17,30 @@ backend.
 from __future__ import annotations
 
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from harness.log import get_logger, trunc
+from harness.log import get_logger, redact_home_paths, trunc
 
 from .. import gitutil
-from ..sanitize import neutralize_markers, sanitize_design, sanitize_publication
+from ..sanitize import (
+    neutralize_controls,
+    neutralize_markers,
+    redact_worktree_paths,
+    sanitize_design,
+    sanitize_publication,
+)
 from .base import CodingBackend, ImplementContext, ImplementOutcome
 
 logger = get_logger(__name__)
 
 PACKET_NAME = "TASK.md"
+
+#: The private-use characters that fence a sentinel in the packet's scrub: no
+#: pass of :func:`sanitize_publication` matches or removes either one, so what
+#: they enclose comes through it untouched and is put back by plain replace.
+_FENCE_OPEN, _FENCE_CLOSE = chr(0xE000), chr(0xE001)
 
 
 class IdeHandoffBackend(CodingBackend):
@@ -114,45 +126,78 @@ class IdeHandoffBackend(CodingBackend):
         # hint never actually depended on ctx.validation.
         verify_hint = "harness verify <file>.py --project ."
         # `implement` COMMITS this packet to the task branch and `pipeline
-        # complete` pushes that branch, so every design-derived fragment in it
-        # crosses the same publication boundary as the PR body. The scrub is
-        # therefore the SAME one (:func:`sanitize_publication`) and it is
-        # applied UNIFORMLY: a fragment-by-fragment choice of which passes to
-        # run is how the packet ended up publishing a pasted key that the PR
-        # body next to it redacted. What differs from the PR body is only WHERE
-        # the scrub runs — per fragment, never over the assembled packet,
-        # because harness's own interpolations (the worktree path, the `--repo`
-        # line) must survive verbatim; see the note at the end of this method.
-        #
-        # So: every fragment below is somebody else's bytes.
+        # complete` pushes that branch, so the whole packet crosses the same
+        # publication boundary as the PR body and takes the same ONE scrub
+        # (:func:`sanitize_publication`) over the assembled text: a
+        # per-fragment choice of passes is how the packet once published a
+        # pasted key the PR body next to it redacted, and the next fragment
+        # added to it would arrive unprotected. Its fragments are somebody
+        # else's bytes:
         #   * ``title`` / ``description`` — the design doc's own words.
         #   * ``preflight_findings`` / ``preflight_summary`` — the grounding
         #     gate's render of the design's code blocks and the paths it
         #     resolved them against.
         #   * ``ctx.validation`` — the oracle this task is judged by. A design
-        #     names its own via `(validate: …)` (ingest.py), so the command line
-        #     can be that author's — and under ``--untrusted`` the list ALSO
-        #     carries the operator's own `--test-cmd`/autodetected commands,
-        #     since there a design's commands are ADDED to the operator's oracle
-        #     rather than replacing it. Both origins are committed and pushed
-        #     with the packet, so both take the scrub: somebody else's pasted
-        #     credential and the operator's own `/home/<user>/…` interpreter path
-        #     are the same leak at this boundary.
-        title = sanitize_publication(task.title)
+        #     names its own via `(validate: …)` (ingest.py), and under
+        #     ``--untrusted`` the list ALSO carries the operator's own
+        #     `--test-cmd`/autodetected commands: somebody else's pasted
+        #     credential and the operator's own `/home/<user>/…` interpreter
+        #     path are the same leak at this boundary.
+        #
+        # And the packet carries NO absolute path of harness's own. It used to
+        # hand the operator the worktree path and a `--repo "<main checkout>"`
+        # line verbatim — the operator's `/home/<account>/…` layout on every
+        # default-layout ide-handoff PR, all of it for a repository outside
+        # $HOME — while the human reading TASK.md is already in that folder,
+        # and `pipeline complete` run from inside the worktree finds the main
+        # checkout itself (PipelineConfig → gitutil.main_repo_root). The
+        # console prints the absolute paths when the packet is written. The
+        # scrub's worktree pass rewrites any of harness's paths a fragment does
+        # carry to {worktree} / {worktrees} / {repo} / {designs}, before its
+        # home pass — the designs directory because ingest records a design
+        # kept outside the repository by its absolute path (the Source design
+        # row, the description's `From design … (<path>)`), spelled as the
+        # `--designs` it was ingested under. So that pass runs once per designs
+        # root (_designs_roots): the configured directory's spellings first,
+        # exactly as before, then the directory the recorded path names, on
+        # what the first run left. Each run carries the other three roles too,
+        # so a longer path of theirs keeps its own placeholder.
+        design_roots = _designs_roots(task.design_doc,
+                                      getattr(ctx.config, "designs_dir", None))
+        roots = {"worktree": ctx.worktree,
+                 "worktree_root": getattr(ctx.config, "worktree_root", None),
+                 "repo": getattr(ctx.config, "repo", None),
+                 "designs": design_roots[0] if design_roots else None}
+
+        def own_paths(text: str) -> str:
+            for designs in design_roots or (None,):
+                text = redact_worktree_paths(text, **{**roots, "designs": designs})
+            return text
+
+        # harness's own identifiers — the task id, the branch, the folder name —
+        # must come through verbatim (the command has to run, and a loose
+        # secret shape matches inside an ordinary id: `…fla[sk-app-factory…]`),
+        # so they enter the scrub as sentinels nothing in it touches and are put
+        # back after it. They carry nothing the scrub exists to remove: an id
+        # is a slug, and a ref name holds no control character and no `:`.
+        # So does the Source design row, harness's record of where the task came
+        # from (`designs/ri[sk-scoring-for-loan-applications].md` was masked as a
+        # key) — but a design is a file NAME, which may hold escape bytes and
+        # may be absolute, so it takes the control, path and home passes first.
+        branch = ctx.task.branch or gitutil.current_branch(ctx.worktree) or ""
+        design = redact_home_paths(own_paths(neutralize_controls(str(task.design_doc or ""))))
+        own = {"id": task.id, "branch": branch, "folder": Path(ctx.worktree).name,
+               "design": design}
+        nonce = secrets.token_hex(8)
+        mark = {key: f"{_FENCE_OPEN}{nonce}{key}{_FENCE_CLOSE}" for key in own}
         # The description is the one fragment that ALSO crosses the *prompt*
         # boundary — an editor agent reads this packet — so it keeps
-        # :func:`sanitize_design`'s control-token defang on top of the
-        # publication scrub. The two share ``redact_secrets``; running it twice
-        # is a no-op, and the composition says which boundary each pass is for.
-        description = sanitize_publication(sanitize_design(task.description))
-        findings = sanitize_publication(preflight_findings)
-        summary = sanitize_publication(preflight_summary)
-        # Scrubbed inside the join, per command: the checklist around them is
-        # harness's own text and must not be rewritten.
-        validation = "\n".join(f"- [ ] `{sanitize_publication(c)}` exits 0"
-                               for c in ctx.validation) \
+        # :func:`sanitize_design`'s control-token defang under the publication
+        # scrub. The two share ``redact_secrets``; running it twice is a no-op.
+        description = sanitize_design(task.description)
+        validation = "\n".join(f"- [ ] `{c}` exits 0" for c in ctx.validation) \
             or "- [ ] (no validation commands configured — add some!)"
-        body = f"""# Task packet — {title}
+        body = f"""# Task packet — {task.title}
 
 > Generated by the harness design-docs → PRs pipeline. Implement this task in
 > **this worktree** using your agentic IDE (Google Antigravity, or VSCodium +
@@ -161,11 +206,11 @@ class IdeHandoffBackend(CodingBackend):
 
 | | |
 |---|---|
-| **Task id** | `{task.id}` |
+| **Task id** | `{mark["id"]}` |
 | **Risk** | `{task.risk}` |
-| **Branch** | `{ctx.task.branch or gitutil.current_branch(ctx.worktree)}` |
-| **Source design** | `{task.design_doc}` |
-| **Worktree** | `{ctx.worktree}` |
+| **Branch** | `{mark["branch"]}` |
+| **Source design** | `{mark["design"]}` |
+| **Worktree** | this folder (`{mark["folder"]}`) |
 
 ## What to build
 
@@ -183,8 +228,8 @@ Your change is complete only when every box is checked:
 The pipeline grounded the code already present in the design against this repo +
 the installed environment:
 
-> {summary}
-{findings}
+> {preflight_summary}
+{preflight_findings}
 As you write, ground individual files yourself:
 
 ```bash
@@ -195,28 +240,30 @@ As you write, ground individual files yourself:
 
 ## When you're done
 
-Commit your work in this worktree, then run:
+Commit your work in this worktree, then run, from inside this worktree:
 
 ```bash
-harness pipeline complete {task.id} --repo "{ctx.config.repo}"
+harness pipeline complete {mark["id"]}
 ```
 
-or run the VSCodium task **Harness: Complete task → PR**. That step re-grounds
-your changes, runs the validation oracle, assigns a risk level, and opens the
-PR (`--pr local` branch or `--pr github`).
+harness finds the main checkout from here (git 2.31 or newer); from anywhere
+else, add `--repo <your main checkout>`. Or run the VSCodium task **Harness:
+Complete task → PR**. That step re-grounds your changes, runs the validation
+oracle, assigns a risk level, and opens the PR (`--pr local` branch or
+`--pr github`).
 
 ---
 """
-        # Same boundary rule as the PR body: scrub, then sign. At THIS level
-        # only the marker pass may run — a blanket scrub over the assembled
-        # packet would rewrite the worktree and `--repo "…"` lines this packet
-        # exists to hand the operator, and mask them as credentials besides.
-        # That is why the full scrub runs per fragment above and this pass does
-        # not repeat it; the fragments are already defanged, so this is the
-        # marker guard for harness's own assembled text. Not optional either
-        # way: `append_feedback_round` really does parse a
-        # `<!-- harness:review-round N -->` marker back out of this file.
-        return (f"{neutralize_markers(body)}"
+        # The worktree pass, once per designs root, over the assembled text
+        # (controls first, as in the scrub); the one scrub then finds those
+        # paths already rewritten.
+        packet = sanitize_publication(own_paths(neutralize_controls(body)), **roots)
+        for key, value in own.items():
+            packet = packet.replace(mark[key], value)
+        # Same boundary rule as the PR body: scrub, then sign — with the marker
+        # pass once more over the restored text, which `append_feedback_round`
+        # parses a `<!-- harness:review-round N -->` marker back out of.
+        return (f"{neutralize_markers(packet)}"
                 f"<!-- harness:task={task.id} -->\n")
 
 
@@ -257,16 +304,92 @@ def append_feedback_round(worktree: Path | str, feedback: str, *,
     #   * SECRETS, because a target repo's failing test prints its environment
     #     (an earlier exemption argued these fragments only describe the
     #     operator's own worktree — that argument never covered credentials);
+    #   * harness's own checkout paths, BEFORE the home pass: a traceback names
+    #     the worktree (`File "<worktree>/check.py"`), and outside $HOME the
+    #     home pass left it verbatim;
     #   * home paths, for the reason every other published fragment gets them.
     # ``risk`` is harness's own verdict word and is left alone.
+    paths = _own_paths(Path(worktree))
     meta = (f"\n> risk: `{risk or 'n/a'}`"
-            + (f" — {sanitize_publication(summary)}" if summary else "") + "\n")
-    body = sanitize_publication(feedback.strip()) or "(no detail captured)"
+            + (f" — {sanitize_publication(summary, **paths)}" if summary else "") + "\n")
+    body = sanitize_publication(feedback.strip(), **paths) or "(no detail captured)"
     section = f"{head}{meta}\n```\n{body}\n```\n\nFix the above, then re-run the *Complete* step.\n"
     packet.write_text(existing + section, encoding="utf-8")
     logger.info("feedback round %d appended to %s (%d chars of findings, "
                 "risk=%s)", round_no, packet, len(body), risk or "n/a")
     return round_no
+
+
+def _own_paths(worktree: Path) -> dict[str, Path | None]:
+    """harness's own checkout paths around *worktree*, for the scrub's worktree pass.
+
+    The worktree itself; its parent as the worktree root when it is a managed
+    tree (``wt-<task id>``, directly under that root); and the main checkout
+    git resolves from it — none when that is the worktree itself, or when git
+    cannot tell (:func:`gitutil.main_repo_root` then answers with its input).
+    """
+    root = worktree.parent if worktree.name.startswith("wt-") else None
+    main = Path(gitutil.main_repo_root(worktree))
+    try:
+        same = main.resolve() == worktree.resolve()
+    except (OSError, RuntimeError):
+        same = main == worktree
+    return {"worktree": worktree, "worktree_root": root, "repo": None if same else main}
+
+
+def _designs_roots(design_doc: str | None,
+                   configured: Path | str | None) -> tuple[Path | str, ...]:
+    """The directories the packet's scrub names ``{designs}``, in the order it runs them.
+
+    The configured designs directory, then — for a design recorded by an
+    ABSOLUTE path (ingest keeps a design outside the repository that way, under
+    the spelling of the ``--designs`` it was ingested with) — the directory that
+    recorded path itself names: the nearest of its ancestors that IS the
+    configured directory by realpath, so the packet reads ``{designs}/<the path
+    below it>`` whichever spelling recorded it (ingested with ``--designs
+    <alias>``, a symlink, and rendered with ``--designs <its realpath>``, or the
+    other way round); failing that (a plan ingested under another
+    ``--designs``, a design file that is itself a link into this directory, no
+    designs directory configured), the design's own directory. Deciding by
+    realpath alone while rewriting only the configured directory's spellings
+    published an alias-recorded design's absolute path.
+
+    A root holding a control character (an escape byte in a directory's name,
+    or a NUL, which only a hand-edited plan or config can carry) comes with a
+    second spelling, the one the packet's text carries: the scrub's path pass
+    runs on text :func:`neutralize_controls` has already rewritten, where the
+    raw spelling never matches. And a path that cannot be resolved is no match
+    (``Path.resolve`` raises ``ValueError`` on an embedded NUL, which
+    ``sanitize._path_spellings`` already allows for), so the packet still
+    renders: a NUL raised out of ``_render_packet``.
+    """
+    def resolved(path: Path | str) -> Path | None:
+        try:
+            return Path(path).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def spellings(root: Path | str) -> list[Path | str]:
+        shown = neutralize_controls(str(root))
+        return [root] if shown == str(root) else [root, shown]
+
+    roots: list[Path | str] = [] if configured is None else spellings(configured)
+    doc = Path(str(design_doc or ""))
+    if not doc.is_absolute():
+        return tuple(roots)
+    recorded = doc.parent
+    target = None if configured is None else resolved(configured)
+    if target is not None:
+        for ancestor in doc.parents:
+            if ancestor == ancestor.parent:         # the filesystem root names nothing
+                break
+            if resolved(ancestor) == target:
+                recorded = ancestor
+                break
+    for spelling in spellings(recorded):
+        if all(str(spelling) != str(root) for root in roots):
+            roots.append(spelling)
+    return tuple(roots)
 
 
 def _findings(preflight) -> str:

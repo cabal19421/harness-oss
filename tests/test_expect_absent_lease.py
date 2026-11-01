@@ -32,6 +32,16 @@ _REAL_GIT = shutil.which("git") or "git"
 _LEASE = "--force-with-lease=refs/heads/agent/t1:"
 #: The retry's refspec: in full and unforced, so no remote.origin.push mapping applies.
 _REFSPEC = "refs/heads/agent/t1:refs/heads/agent/t1"
+#: What the retry leads with, right after ``push``: no followed tag, no submodule push.
+_ONLY_THE_REFSPEC = ("--no-follow-tags", "--recurse-submodules=check")
+#: The fixtures' own git calls, pinned against whatever config the run has (the
+#: suite also runs under a hostile global/system config); harness's calls are not.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +55,7 @@ def _hermetic_git(monkeypatch):
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    res = subprocess.run([_REAL_GIT, "-c", "init.defaultBranch=main",
+    res = subprocess.run([_REAL_GIT, *_FIXTURE_GIT_PINS, "-c", "init.defaultBranch=main",
                           "-c", "core.autocrlf=false", *args],
                          cwd=str(cwd), capture_output=True, text=True, check=False)
     if check:
@@ -138,7 +148,7 @@ def test_a_mirror_fetch_refspec_cannot_lease_the_retry_over_a_reviewers_commit(
     res = GitHubPR._safe_repush(wt, "agent/t1", first)
 
     assert not res.ok and "stale info" in res.err, res
-    assert pushes == [["push", _LEASE, "origin", _REFSPEC]]
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, _LEASE, "origin", _REFSPEC]]
     assert _git(origin, "rev-parse", "refs/heads/agent/t1") == fix
     assert _git(origin, "show", "refs/heads/agent/t1:cfg.yaml") == "svc:\n  port: 81"
 
@@ -168,7 +178,7 @@ def test_a_fetch_racing_the_read_cannot_lease_the_retry_either(tmp_path, monkeyp
 
     assert raced == [(("", ""), fix)]          # the premise: absent, then current
     assert not res.ok and "stale info" in res.err, res
-    assert pushes == [["push", _LEASE, "origin", _REFSPEC]]
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, _LEASE, "origin", _REFSPEC]]
     assert _git(origin, "rev-parse", "refs/heads/agent/t1") == fix
 
 
@@ -195,7 +205,7 @@ def test_a_forced_push_refspec_cannot_force_the_expect_absent_retry(tmp_path,
     assert _git(origin, "rev-parse", "refs/heads/agent/t1") == fix
     assert _git(origin, "show", "refs/heads/agent/t1:cfg.yaml") == "svc:\n  port: 81"
     assert not res.ok and "stale info" in res.err, res
-    assert pushes == [["push", _LEASE, "origin", _REFSPEC]]
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, _LEASE, "origin", _REFSPEC]]
 
 
 def test_the_retry_still_goes_out_when_the_remote_branch_is_really_absent(tmp_path,
@@ -214,7 +224,7 @@ def test_the_retry_still_goes_out_when_the_remote_branch_is_really_absent(tmp_pa
     res = GitHubPR._safe_repush(wt, "agent/t1", first)
 
     assert res.ok, res
-    assert pushes == [["push", _LEASE, "origin", _REFSPEC]]
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, _LEASE, "origin", _REFSPEC]]
     assert _git(origin, "rev-parse", "refs/heads/agent/t1") == local
 
 

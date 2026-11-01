@@ -151,8 +151,17 @@ def writers():
         p.wait(timeout=_POLL)
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
+
 def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), check=True, capture_output=True)
 
 
 def _dead_pid() -> int:

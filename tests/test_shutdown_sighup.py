@@ -64,6 +64,14 @@ from harness.pipeline.spec import PipelineConfig, Task
 from harness.pipeline.trace import Tracer, read_spans
 from harness.pipeline.worktree import WorktreeManager
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
 _LINUX = sys.platform.startswith("linux")
 pytestmark = pytest.mark.skipif(not hasattr(signal, "SIGHUP"),
                                 reason="SIGHUP is POSIX-only")
@@ -526,7 +534,7 @@ def test_a_terminal_that_hangs_up_after_the_signal_is_let_go_at_the_end(tmp_path
 
 
 def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(["git", "-c", "color.ui=never", *args], cwd=str(cwd),
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
                    capture_output=True, text=True, check=True)
 
 
@@ -817,7 +825,7 @@ class _Target:
                      ["commit", "-q", "-m", "init"]):
             if args[0] == "add":
                 (self.repo / "app.py").write_text("x = 1\n")
-            subprocess.run(["git", *args], cwd=str(self.repo), env=self.env,
+            subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(self.repo), env=self.env,
                            capture_output=True, check=True)
         validate = "true"
         if slow_suite:

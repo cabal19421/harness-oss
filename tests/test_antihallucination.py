@@ -29,9 +29,17 @@ from harness.pipeline.verifier import (
     verify_change,
 )
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _repo_with_change(path: Path, files: dict[str, str]) -> Path:
@@ -880,9 +888,9 @@ def test_diff_manifest_marks_itself_clipped_past_the_limit(tmp_path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "init", "-q", "."], cwd=repo, check=True)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "config", "user.email", "t@t.t"], cwd=repo, check=True)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "config", "user.name", "t"], cwd=repo, check=True)
     for i in range(12):
         (repo / f"f{i:03d}.py").write_text(f"x = {i}\n")
 

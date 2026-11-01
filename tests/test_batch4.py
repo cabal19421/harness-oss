@@ -10,9 +10,17 @@ from harness.pipeline.backends.base import parse_abstention, run_validation
 from harness.pipeline.looptools import ProgressLedger
 from harness.pipeline.notes import RunLog
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _repo(tmp_path: Path, design: str) -> Path:

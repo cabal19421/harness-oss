@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 ![Grounding](https://img.shields.io/badge/grounding-Python%20%2B%20Go-blueviolet)
-![Tests](https://img.shields.io/badge/tests-2866%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-2921%20passing-brightgreen)
 
 ---
 
@@ -56,7 +56,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 **Foundations**
 - 🔍 **Dependency doctor** — `harness status` reports the grounding solver and the constraint kinds it decides, backend availability, every external tool it can use — `git`, `gh`, `tmux`, `agent` (the agent CLI driving the `agent-cli` backend; default binary `gemini`), `go`, `npm` — with its detected-vs-required version, the optional Python extras, and an extensions summary. See **[INSTALL.md](INSTALL.md)**.
 - 📓 **Two observability channels** — an append-only JSONL **span trace** (`.harness/trace.jsonl`, one line per consequential decision) and a **verbose log** (`-v`/`-vv`, `HARNESS_LOG`) whose output is secret-redacted *and* terminal-safe. See **[LOGGING.md](LOGGING.md)**.
-- 🧪 **Tested** — **2866 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
+- 🧪 **Tested** — **2921 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
 
 ---
 
@@ -359,7 +359,7 @@ harness/
 │       ├── cockpit.py         # tmux cockpit (run features simultaneously)
 │       ├── orchestrator.py    # Ties ingest→ground→implement→verify→review→PR; recovery + supervise/prune
 │       └── store.py           # Repo-local plan persistence (.harness/pipeline.json) + the run lock
-├── tests/                     # 2866 passing, 1 skipped (pytest; config in pytest.toml)
+├── tests/                     # 2921 passing, 1 skipped (pytest; config in pytest.toml)
 │   ├── conftest.py            # Isolated cwd/data per test
 │   ├── test_grounding.py      test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py   test_grounding_precision.py
@@ -390,6 +390,8 @@ harness/
 │   ├── test_gh_env_isolation.py      test_git_floor.py
 │   ├── test_landed_proof.py          test_lstart_identity.py
 │   ├── test_recovery_owner_proof.py  test_scan_handoff_rescan.py
+│   ├── test_agent_branch_listing.py  test_landed_proof_integrity.py
+│   ├── test_publish_followed_tags.py  test_push_config_isolation.py
 │   └── test_verifier_exit_envelope.py  test_worktree_registration_safety.py
 ├── designs/                   # ← drop your design .md files here (pipeline input)
 │   ├── TEMPLATE.md

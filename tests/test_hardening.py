@@ -1974,8 +1974,10 @@ def test_safe_repush_uses_expect_absent_lease_not_fetch(tmp_path, monkeypatch):
     assert not any(c[:1] == ["fetch"] for c in calls), f"must not fetch: {flat}"
     assert any("--force-with-lease" in " ".join(c) for c in calls)
     # the lease expects the remote branch ABSENT (an empty expected value), never the
-    # bare token git checks against whatever tracking ref its fetch refspec maps to
-    assert ["push", "--force-with-lease=refs/heads/agent/x:", "origin",
+    # bare token git checks against whatever tracking ref its fetch refspec maps to;
+    # and nothing rides on it: no followed tag, no submodule push
+    assert ["push", "--no-follow-tags", "--recurse-submodules=check",
+            "--force-with-lease=refs/heads/agent/x:", "origin",
             "refs/heads/agent/x:refs/heads/agent/x"] in calls
     assert not any(c == "--force-with-lease" for parts in calls for c in parts)
 

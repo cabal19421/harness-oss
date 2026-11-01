@@ -539,7 +539,15 @@ counted as a failure)". If the call that continues kept work then fails as an
 invocation (its retries spent), that failure's discard takes the kept work back
 to the clean seed too, and the note goes with it: the next prompt still carries
 the capped call's verdict, never the claim that its work is in the worktree
-(without `reset_on_failure` nothing is discarded, and the note stays).
+(without `reset_on_failure` nothing is discarded, and the note stays). When the
+oracle goes green, the loop drops the whole feedback before the commit step: the
+cap note, the earlier red verdict, and any nested-repository note
+(`AgentCliBackend._implement_loop`'s green path). A commit repair's feedback is
+then the commit failure alone; the digest of earlier iterations still lists what
+came before. Before, the repair prompt also opened with an earlier capped call's
+note and red verdict. The prompt after a repair call that failed as an
+invocation also gets only the commit failure, since that call discards nothing.
+A repair call that ends red starts the feedback afresh from its own verdict.
 `max_iters`, the token and cost budget (on Gemini CLI a call ended at its
 session-turn limit reports no usage, so there the budget does not bound
 a run of such calls) and the no-progress guard still bound the loop — capped
@@ -557,22 +565,46 @@ passes to `_stopped`). What this costs is ledgered below.
 
 A call the CLI stopped at its budget (`error_max_budget_usd`) is judged the same
 way, and the loop's budget is charged at least the `--max-budget-usd` balance
-that call was handed (`agent_cli._capped_call_cost`, applied in
+that call was handed, and at least the exact budget left as it launched
+(`agent_cli._capped_call_cost`, given that figure by
 `AgentCliBackend._run_agent`). The envelope's `total_cost_usd` is kept when it
-reads at least that balance. Otherwise the balance is charged, with a WARNING:
-for `null`, a NaN, a missing or drifted field, or a figure below the balance.
-The CLI ends a call under that subtype once the session's cost reaches the
-balance, and some CLIs also end one there when the session cost is no longer a
-number (a usage or pricing fault), which JSON writes as `null`. In that case the
-real spend is unknown, so the charged balance is the most that call was allowed,
-not a measured spend. A red budget-capped call is kept. The next iteration's
-budget check then stops the run with that cleanup: one launch at $1.00 under
-`max_cost_usd=1.0`, where an unreadable cost used to hand every red
-budget-capped call the whole balance again until `max_iters`. If a sub-cent
-remainder was rounded down to the cent handed to the CLI, the stop comes one
-check later, after one more launch at the $0.01 floor. The `agent` span's
-`cost_usd` and the budget summary show the charged figure. A retry after an
-ordinary failure is handed the balance net of what its iteration's earlier
+reads at least both. Otherwise the larger of the two is charged, with a WARNING:
+for `null`, a NaN, a missing or drifted field, or a figure below them. The CLI
+ends a call under that subtype once the session's cost reaches the balance, and
+some CLIs also end one there when the session cost is no longer a number (a
+usage or pricing fault), which JSON writes as `null`. In that case the real
+spend is unknown, so the charge is the budget the call launched with, the most
+it could have been allowed, not a measured spend. A red budget-capped call is
+kept. The next iteration's budget check then stops the run with that cleanup:
+one launch at $1.00 under `max_cost_usd=1.0`, where an unreadable cost used to
+hand every red budget-capped call the whole balance again until `max_iters`.
+
+The balance goes over floored to the cent, never above what remains
+(`agent_cli._handed_balance`, called by `agent_cli._cli_budget_flags` and
+`agent_cli._gemini_budget_flags`; a balance within a billionth of a dollar below
+a cent, `_CENT_NOISE_USD`, counts as that cent: it is float noise, not a
+remainder); on Gemini CLI, whose help lists no `--max-budget-usd`, no balance is
+handed (see [§ Driving Gemini CLI](#driving-gemini-cli)), and a help that did
+list it would be handed the same cent-floored balance. The balance used to be
+rounded to the nearest cent, so $0.336 went over as $0.34. A remainder below one
+cent goes over as $0.01, the one hand-over that can exceed what remains (by less
+than a cent). harness hands over whole cents, and the CLI refuses a balance that
+is not above 0 ("--max-budget-usd must be a positive number greater than 0"),
+although it accepts sub-cent amounts. The CLI checks its balance between turns,
+so a call's last turn can still overshoot it, and the overshoot is charged when
+the envelope reports it. Once the CLI stops a call at its budget, the loop
+raises the total to `max_cost_usd` if it is short of it
+(`agent_cli._exhaust_cost_budget`), because a remainder added back in floats can
+land an ulp short (`0.047 + (0.21 - 0.047)` is `0.20999999999999996`). The next
+budget check therefore stops the run with no further launch. Under
+`max_cost_usd=1.0`, a $0.667 call and then a budget-capped call with a `null`
+cost are handed 1.00 and 0.33, the second is charged $0.333, and the run stops
+at $1.0000. A third call used to go out at the $0.01 floor, and the run stopped
+at $1.0070. A budget-capped call that goes green but whose commit is refused is
+therefore followed by no commit-repair launch: the run stops on budget, and the
+green work is kept. The `agent` span's `cost_usd` and the budget summary show
+the charged figure (0.333 in that example, not the 0.33 handed). A retry after
+an ordinary failure is handed the balance net of what its iteration's earlier
 attempts spent (`agent_cli._spent_view`), and once they have spent the cost or
 token budget nothing is retried and no usage window is waited out: the run stops
 on budget. Before, every retry was handed the whole balance again, so one
@@ -1035,7 +1067,9 @@ harness pipeline supervise --recover  # roll back any crashed/hung task and re-a
 **`harness pipeline prune`** deletes finished `agent/*` branches, **safe by
 default** — it only removes a branch whose work has actually **landed** in the
 base (proven by an ancestor check *or* a squash-merge `merge-tree` content
-proof), and never one that is still checked out in a worktree:
+proof, both read against the history as it really is and with no merge driver
+run, so neither an agent's git config nor the shared `.git` can make unlanded
+work read as landed), and never one that is still checked out in a worktree:
 
 ```bash
 harness pipeline prune                    # delete merged branches; keep unlanded + active ones
@@ -1046,18 +1080,32 @@ harness pipeline prune --allow-dirty      # also remove worktrees with UNCOMMITT
 The landed proof has three outcomes, each carrying git's exit code and error
 line (`gitutil.landed_proof` → `gitutil.LandedProof`): **landed** — an ancestor
 of the base, or merging it into the base changes nothing; **not landed** — the
-merge brings changes in, or conflicts (`merge-tree` exit 1); and **proof
-unavailable** (`landed is None`) — the base does not resolve, or
-`merge-tree --write-tree` exits with anything but 0 or 1: git 2.31–2.37 has no
+merge brings changes in, or conflicts in a file git's own line merge decides
+(`merge-tree` exit 1 whose output leads with the merged tree's id); and **proof
+unavailable** (`landed is None`) — the base does not resolve (`no-base`); the
+head does not resolve to a commit (`no-head`: a branch deleted after it was
+listed, or a name that is no ref); the base's tree cannot be read, the merge
+drivers the configuration defines cannot be listed, the conflicting files'
+attributes cannot be read, or `merge-tree --write-tree` exits with anything but
+0 or 1, or exits 0 or 1 without the merged tree's id leading its output
+(`unavailable`); or the merge conflicts **only** in files a merge driver would
+merge, which the proof never runs (`merge-driver`). git 2.31–2.37 has no
 `--write-tree` and answers "fatal: unknown rev --write-tree" with exit 128, the
-code a current git gives unrelated histories too. A branch whose proof is
-unavailable is listed in its own `kept_unproven` bucket (printed "kept unproven:
-…"), never as `kept_unlanded`, and one WARNING per prune names git's exit code
-and error line; nothing is deleted for it, `prune` still exits 0, and
-`--allow-unlanded` deletes unproven branches too
-(`WorktreeManager.prune_merged`). An unplanned worktree whose branch cannot be
-proven landed is skipped with the `prune` span reason `landed-proof-unavailable`
-(with `git_code` and `detail`) and listed in `worktrees_skipped` as
+code a current git gives unrelated histories too. git also exits 1, printing no
+tree, when it refuses to merge at all (`<rev> - not something we can merge`);
+that used to read as a conflict, and so as unlanded work. After the base check,
+the proof checks that the branch tip resolves to a commit
+(`git rev-parse --verify <head>^{commit}`); one that does not is `no-head`, with
+the detail `the head '<ref>' does not resolve to a commit (<git's error line>)`.
+A branch whose proof is unavailable is listed in its own `kept_unproven` bucket
+(printed "kept unproven: …"), never as `kept_unlanded`, and one WARNING per
+prune names git's exit code and error line; nothing is deleted for it, `prune`
+still exits 0, and `--allow-unlanded` deletes unproven branches too
+(`WorktreeManager.prune_merged`): a ref that still exists but is no commit is
+deleted as UNPROVEN, and one already gone fails `git branch -D` and is reported
+as `delete_failed` (below). An unplanned worktree whose branch cannot be proven
+landed is skipped with the `prune` span reason `landed-proof-unavailable` (with
+`git_code` and `detail`) and listed in `worktrees_skipped` as
 `(landed-proof-unavailable)`. `WorktreeManager.remove` with `delete_branch=True`
 and no `allow_unlanded` refuses an unproven branch with "whether its work landed
 in '\<base>' cannot be proven — \<detail>. Nothing was deleted; check the branch
@@ -1070,6 +1118,30 @@ failure read as "not landed", so on an older git every squash-merged branch was
 reported as unmerged work, behind a remedy that discards it.
 `gitutil.content_landed` stays the fail-closed bool every deletion gate is built
 on.
+
+Neither half of the proof reads anything an agent can rewrite through the
+configuration or the shared `.git`, since a yes licenses `git branch -D`. Every
+read in the proof takes the history as it really is — no replace ref and no
+graft (`gitutil._REAL_HISTORY`: `GIT_NO_REPLACE_OBJECTS=1` and an impossible
+`GIT_GRAFT_FILE`), and on the ancestor walk and the merge no commit-graph file
+either (`gitutil._NO_COMMIT_GRAPH`, `core.commitGraph=false`;
+`gitutil.is_ancestor(…, real_history=True)`). Before, a `git replace --graft`, a
+`.git/info/grafts` line or a forged `.git/objects/info/commit-graph` edge
+rewrote the parents the ancestor walk reads and made another task's tip read as
+an ancestor of the base. The squash proof pins `merge.default=text` and
+`merge.renormalize=false` (`gitutil._PROOF_MERGE_PINS`) and refuses every merge
+driver the configuration defines, and the built-in `union`
+(`gitutil._merge_drivers` / `_refusing_drivers`). A driver chosen by
+`merge.default` or by a `merge` attribute — in `.gitattributes`,
+`.git/info/attributes`, or the file `core.attributesFile` names — used to merge
+a conflicting file by dropping the branch's side, so the three-way merge came
+out equal to the base; `union` did it for lines the base rewrote and the branch
+deleted; and `merge.renormalize=true` with a `filter` clean program erased the
+branch's change. All are agent-writable under the default `Bash(git:*)`, and all
+made unlanded work read as landed one step before `git branch -D`. A file a
+refused driver would merge now conflicts, and a merge whose conflicts are all in
+such files is proof unavailable (`merge-driver`), not landed; any other conflict
+is still not landed (`gitutil._conflicted_paths`, `_refused_merges`).
 
 That landed proof — and the ahead-count that decides whether a task is green and
 whether its PR opens — is measured on
@@ -1085,6 +1157,33 @@ there. A tag you name as the base on purpose still means the tag (qualification
 never reinterprets it), and the short name stays what `gh pr create --base`,
 `integrate` and the cockpit see.
 
+`prune` lists the agent branches with plumbing,
+`git for-each-ref --sort=refname --format=%(refname) refs/heads/agent/`
+(`WorktreeManager.list_agent_branches`): one refname per line, in refname order,
+nested `agent/x/y` names included, so `column.ui=always`, `column.branch=always`
+and `branch.sort`, in the operator's config or the repository's shared
+`.git/config`, no longer reshape it. It used to read
+`git branch --list 'agent/*' --format=%(refname)`, which printed several
+refnames per line under a column key, even into a pipe: each line git packed
+with several refnames was read as one name that names no branch, so none of the
+branches on such a line was deleted, and each fused name was reported as
+`kept_unlanded` (how many names share a line depends on their lengths and on the
+terminal width git assumes); under `--allow-unlanded` prune warned that it was
+deleting them as UNLANDED before `git branch -D` failed on each. A listing git
+cannot produce lists no branch, so prune deletes none, and a WARNING names git's
+exit code and error and says it is "listing none (prune deletes nothing)"; the
+CLI can still print "no agent/* branches to prune" under it. Branch names are
+read, and deleted, by the filesystem codec
+(`WorktreeManager.list_agent_branches` and `_checked_out_branches`): a branch
+whose name is not UTF-8, which git accepts, is listed, pruned and shown in git's
+own quoting, where it used to raise `UnicodeDecodeError` out of every prune
+until it was deleted by hand; the name reaches `git branch -D` byte for byte. A
+branch whose `git branch -D` fails is reported in its own `delete_failed` bucket
+(printed "delete failed: …"), whatever its proof said, and the WARNING names
+what the branch was (LANDED, UNLANDED or UNPROVEN); a landed branch blocked by a
+stale ref lock used to be reported as `kept_unlanded`, inviting
+`--allow-unlanded` for work already in the base.
+
 `prune` also **reconciles directories**, not just plan entries: a worktree git
 still has registered under `worktree_root` whose task was dropped from the
 designs, renamed, or lost with a corrupt plan file is reclaimed under the same
@@ -1099,7 +1198,8 @@ Nothing is bulldozed. Two *unrelated* risks get two *separate* opt-ins
 | The worktree has uncommitted work, including edits hidden from `git status` by index flags (assume-unchanged / skip-worktree / `core.ignoreStat`), which `git worktree remove` would delete as if clean | `dirty` | `--allow-dirty` / `remove(allow_dirty=True)` |
 | A populated submodule holds what `git worktree remove --force` would delete with the tree — uncommitted or untracked work, a stash, a checked-out commit the superproject's module store lacks, a commit no other copy has — or which submodules the tree holds cannot be read | `dirty` | none: `allow_dirty` waives only the tree's own uncommitted work |
 | The branch's work never landed in the base | `unlanded` | `--allow-unlanded` / `remove(allow_unlanded=True)` |
-| Whether the branch's work landed cannot be proven: git could not run the proof (`merge-tree --write-tree` needs git 2.38), or the base does not resolve | `landed-proof-unavailable` (an unplanned worktree), `kept_unproven` (the branch) | `--allow-unlanded` / `remove(allow_unlanded=True)` |
+| Whether the branch's work landed cannot be proven: git could not run the proof (`merge-tree --write-tree` needs git 2.38), the base does not resolve, the branch no longer resolves to a commit (`no-head`), or the merge conflicts only in files a merge driver would merge (`merge-driver`) | `landed-proof-unavailable` (an unplanned worktree), `kept_unproven` (the branch) | `--allow-unlanded` / `remove(allow_unlanded=True)` |
+| `git branch -D` fails on a branch prune would delete — a stale ref lock, a branch gone since it was listed — whatever its proof said | `delete_failed` (the branch) | none: the WARNING names git's error and whether the branch was LANDED, UNLANDED or UNPROVEN |
 | Processes are still running inside it | `processes` / `survivors` | `kill_worktree_procs` (terminate them first) |
 | The scan for processes inside it could not be completed, so it cannot be proven quiet | `unverified-scan` | `remove(in_use="ignore")`, which skips the process check entirely (library only, no CLI flag); `kill_worktree_procs` does not lift it, because the kill sweep depends on the same scan |
 | The directory is not provably this repo's worktree: its `.git` marker is gone (git lists the registration `prunable` and an lstat finds no marker; harness deletes that one registration first — the admin dir whose backlink names the directory — which unpins the branch), git cannot reach the marker (the registration is kept), its `.git` names a registration or repository that is not its own, or git does not resolve it to the directory itself; or the worktree path is a symbolic link or anything else but a directory; or a squatting directory is another repository's worktree, or cannot be listed | `unverified` | `remove(prune_orphans=True)` for a directory git no longer has registered (library only, no CLI flag); a directory git still has registered, a link or file on the path and another repository's worktree are never removed automatically |
@@ -1547,7 +1647,7 @@ boundary:
   whatever the fetch refspec says. Every harness push names its refspec in full
   and unforced, so git consults neither `remote.origin.push` nor `push.default`.
   That covers the plain
-  `git push -u origin refs/heads/<branch>:refs/heads/<branch>`
+  `git push --no-follow-tags --recurse-submodules=check -u origin refs/heads/<branch>:refs/heads/<branch>`
   (`pr.GitHubPR.open`) and both retries (`gitutil.force_push_with_lease`, which
   `GitHubPR._safe_repush` now calls for the expect-absent lease too). Before,
   the colon-less `<branch>` went through that mapping, with three effects. A
@@ -1562,15 +1662,73 @@ boundary:
   with the task's work. `-u` still records `origin/<branch>` as the upstream.
   The repository's config still decides which repository the push reaches
   (`remote.origin.url`, `remote.origin.pushurl`, `url.<base>.insteadOf` /
-  `pushInsteadOf`) and what else it sends (ledgered below). The bare lease the
-  expect-absent lease replaces was checked against whatever tracking ref git's
-  own fetch refspec maps the branch to, so under a non-default
-  `remote.origin.fetch` (`+refs/heads/*:refs/remotes/mirror/*`), after a fetch,
-  it passed on the mapped ref and force-pushed over a reviewer's commit with the
-  check never run; that is closed, and so is its racy form, a fetch creating
-  `refs/remotes/origin/<branch>` between the read and the push. No bare lease is
-  left anywhere: handed no expected commit, `gitutil.force_push_with_lease`
-  builds the expect-absent lease itself
+  `pushInsteadOf`) and which push options it transmits (ledgered below). It no
+  longer adds refs to the push: every harness push leads with `--no-follow-tags`
+  and `--recurse-submodules=check`, in that order, right after `push`.
+
+  Before, `push.followTags=true` sent every annotated tag the branch reaches: a
+  tag an agent made on its commit, and the operator's own unpublished tags on
+  the base, such as a local release-candidate tag on `main`.
+  `pr._unpublishable_messages` never reads tag messages, so a tag carrying a
+  `ghp_` token reached origin, even with a push whose branch was rejected,
+  because git updates refs one by one. And `push.recurseSubmodules=on-demand`,
+  or `submodule.recurse=true`, first pushed each populated submodule's
+  same-named branch to that submodule's own remote, while
+  `push.recurseSubmodules=only` pushed the submodule's branch and skipped the
+  superproject altogether, exiting 0 with nothing on origin.
+
+  `check` pushes no submodule. When a pushed commit that no
+  `refs/remotes/origin/*` of the superproject reaches changes a gitlink to a
+  commit the populated submodule holds, but none of the submodule's
+  `refs/remotes/*` reaches, git refuses the whole push and names the submodule
+  ("The following submodule paths contain changes that can not be found on any
+  remote"). Nothing reaches origin or the submodule's remote, and git's
+  diagnosis is the PR result's detail. No retry is tried. Should a refused path
+  itself contain "rejected", "non-fast-forward", "fetch first" or "stale info",
+  the lease-guarded retry does run, and git refuses it the same way.
+  Reachability is read from the submodule's local refs, not asked of its
+  remote. So a commit the remote does have is refused too when no
+  remote-tracking ref reaches it: one published only under a tag (a default
+  fetch maps no tag into `refs/remotes/*`), or one fetched by name while the
+  tracking refs are stale. This holds under any config, none included. Remedy:
+  run `git -C <worktree>/<path> fetch origin` (stale ref) or
+  `git -C <worktree>/<path> fetch origin +refs/tags/<tag>:refs/remotes/origin/tags/<tag>`
+  (tag-only commit). For an agent's own commit, push it to a branch of the
+  submodule's remote first; a push from that submodule updates its tracking
+  ref. Then `harness pipeline complete <id>`. An operator's own
+  `push.recurseSubmodules=check` is honoured; `--recurse-submodules=no` would
+  have switched it off.
+
+  `check` is a guard, not a proof, and an agent can write every input it reads:
+
+  - The superproject's own `refs/remotes/origin/*`, shared by every worktree,
+    decide which pushed commits are examined, so a ref there that reaches the
+    bump hides it.
+  - The submodule's `refs/remotes/*` decide reachability, so a forged one
+    passes. A submodule with none is not checked.
+  - A gitlink commit the submodule cannot be asked about is not checked either:
+    where the worktree never populated the submodule (what `git worktree add`
+    leaves), where the populated submodule does not hold that commit, or where
+    git cannot open the submodule at its path (a broken gitfile, a symlinked
+    path).
+
+  Those gitlinks are published unchecked, still with nothing pushed to the
+  submodule's remote. The check contacts no remote, with one exception. A
+  submodule configured as a partial clone (`extensions.partialClone` with a
+  promisor remote) lazily fetches a gitlink commit it lacks from that promisor
+  remote, through the submodule's own transport config: the fetch ran the
+  submodule's `core.sshCommand`, and `GIT_NO_LAZY_FETCH=1` stops it. That is
+  the class of residual (a), ledgered below: config an agent can write decides
+  where git connects.
+
+  The bare lease the expect-absent lease replaces was checked against whatever
+  tracking ref git's own fetch refspec maps the branch to, so under a
+  non-default `remote.origin.fetch` (`+refs/heads/*:refs/remotes/mirror/*`),
+  after a fetch, it passed on the mapped ref and force-pushed over a reviewer's
+  commit with the check never run; that is closed, and so is its racy form, a
+  fetch creating `refs/remotes/origin/<branch>` between the read and the push.
+  No bare lease is left anywhere: handed no expected commit,
+  `gitutil.force_push_with_lease` builds the expect-absent lease itself
   (`test_force_push_with_lease_never_pushes_on_a_bare_lease`). Every retry runs
   confined to the worktree, like the plain push. Two residuals, both pinned by
   tests and ledgered below: patch ids ignore line numbers, so a hunk moved to a
@@ -1694,7 +1852,12 @@ repository explicitly. Both pushes —
 the plain one and the lease-guarded retry — run only from a worktree
 `gitutil.worktree_owner_proof` accepts, and both run confined to it
 (`GIT_CEILING_DIRECTORIES`); from one that lost its `.git` marker they would
-publish the enclosing repository's same-named branch.
+publish the enclosing repository's same-named branch. Both push only the branch:
+`--no-follow-tags` and `--recurse-submodules=check` lead each push, so no tag and
+no submodule push rides along. A changed gitlink whose commit no remote-tracking
+ref of its populated submodule reaches makes git refuse the publish (even a
+commit its remote has only under a tag — see *Force-push safety* under
+[§ Trust & safety](#trust--safety-gating-work-you-didnt-write)).
 
 Adopting an open PR does not by itself count as success. When the probe finds it,
 the new head is already on its branch, so harness re-publishes the PR's body and
@@ -2433,8 +2596,9 @@ is in [§ Complete configuration reference](#complete-configuration-reference).
 - **Submodule pointers.** Harness never commits a pointer its own index moves
   left behind. A dependency that does not merge is aborted with
   `submodule.recurse=false` pinned (`gitutil.merge_abort`; no other harness
-  command is pinned, push included, since a pin there would override an
-  operator's `push.recurseSubmodules=check`) and read back
+  command carries that pin; the push instead passes `--recurse-submodules=check`,
+  which outranks `submodule.recurse` and `push.recurseSubmodules` yet leaves an
+  operator's `check` as it was) and read back
   (`gitutil.abort_failed_merge` → `gitutil.MergeAbort`): a merge git refused
   before it began is logged and printed as "was not merged — git refused the
   merge before it began … nothing to abort", never as "merge aborted", and an
@@ -2926,7 +3090,7 @@ says when, if ever, the decision should be revisited.
 | **Release rules for recovered slots** — a slot quarantined as `recovered` is freed only by a named `return <path>`, which warns that its seeded files are unrecorded; `return --all` never releases one (it counts it skipped and prints the named-return command), and every bulk release refuses a slot recovered after listing, under the state lock | Release policy for state harness does not have. The `recovered` quarantine label exists only because of an authenticated state layer (the **HMAC-authenticated** state row above), and the releases it gates belong to a lease model (the **worktree reservation** row above): harness's ownership is a flock-held `TaskClaim` plus `RunLock`, and a reservation that outlives its holder is evidence recovery refuses to act on. The one sound sub-rule — skip an entry whose ownership changed since it was listed — is already here: recovery holds the task's claim for its whole destructive sequence instead of probing it once. | The worktree-reservation or HMAC row's condition is met — harness hands worktrees to consumers outside its own plan, or its state dir becomes writable from outside the operator's trust boundary — since a quarantine label and rules for releasing it only arrive with one of those layers |
 | **Auto-free of recovered slots** — on every pool operation, under the state lock, a `recovered` git slot is released when no process uses it (the caller and its ancestors included) and its owner pid is dead, it is tracked-clean, and its HEAD is contained in a remote-tracking ref or the base branch; untracked files at its root are first moved (renamed, never copied and deleted) into a retained owner-only backup directory, and every other slot stays leased with a recorded reason | Same basis as the release-rules row above: it frees slots an authenticated state layer quarantined, under a lease model, so harness has no `recovered` state to auto-free. Its recovery is per-task, proof-gated and one-shot (`pipeline supervise --recover`), and an `unknown` outcome is never acted on. Its five safety legs, judged one by one, are already here: hidden index flags are cleared before recovery stashes (see *A hidden edit is not a clean tree* under [§ How a run is isolated and resumable](#how-a-run-is-isolated-and-resumable)); `gitutil.status_porcelain` and `working_tree_dirty` pin `--ignore-submodules=none`, which beats both `submodule.<name>.ignore` and `diff.ignoreSubmodules`; `Supervisor._clean_worktree` moves a crashed attempt's uncommitted and untracked debris onto the stash (`--include-untracked`) before resetting, and reports the outcome it reads back; a removal never proceeds over a live process whose cwd is inside the tree, and a scan that cannot be completed fails closed — the caller's own shell and its ancestors exempt, never signalled and not counted; and `gitutil.content_landed` takes landed work to be an ancestor or squash-equivalent of the base, failing closed on a missing ref or a conflict, so a branch merely pushed to some remote never counts. | harness gains a quarantine state of its own — the worktree-reservation or HMAC row's condition is met — and then the auto-free comes with all five legs, never the release alone |
 | The hidden-edit rule (see *A hidden edit is not a clean tree* under [§ How a run is isolated and resumable](#how-a-run-is-isolated-and-resumable)) applied to a skip-worktree entry whose file is **absent** | Every other shape is flagged and cleared; this one deliberately is not. An absent `S` entry is what a sparse checkout is made of — `git worktree add` copies a sparse repo's patterns into every harness worktree, and with `core.sparseCheckout` on git clears `S` itself from a file that reappears — so flagging it would refuse every sparse repository, and clearing it would stage every excluded file as a deletion (`gitutil.clear_hidden_index_flags` clears skip-worktree only where the path exists, so a flagged absent entry would be a review refusal nothing could clear). The price, accepted: a tracked file the agent deletes and then marks skip-worktree is indistinguishable from a sparse exclusion, so the deletion stays hidden and the reviewed commit keeps a file the oracle ran without (the known limitation under [§ Test quality gates](#test-quality-gates-frozen-acceptance-tests--mutation-scoring)). | A deletion hidden this way is seen in a real run — then flagging and clearing change together, as a design of their own (an absent `S` entry flagged only where `core.sparseCheckout` is off, with a clear that stages the deletion), never the flag alone |
-| A **blanket `submodule.recurse=false` pin** on every git call but `fetch` | As a blanket rule the pin is insufficient here and wrong in one place, so harness pins in its own shape instead. Insufficient: it neutralises recursion a config turns on, and harness's trigger was its own explicit `--recurse-submodules` on the discard, which `-c submodule.recurse=false` does not override (`git -c submodule.recurse=false reset --hard --recurse-submodules HEAD` still dies and leaves the dangling gitfile); what fixed it is holding every gitlink git cannot reset out of the recursion (`gitutil._unresettable_gitlinks`). Wrong on push: push reads `push.recurseSubmodules` and `submodule.recurse` in one config pass where the last value read wins, and `-c` is read last, so the pin silently overrode an operator's `push.recurseSubmodules=check` gate (verified: `check` alone refuses the push, `check` plus the pin pushes). Under `submodule.recurse=true` a branch that bumps a populated submodule to an unpushed commit fails to push — loudly, refusing to publish a pointer nobody can fetch — which is no reason to take that gate away. So only `gitutil.merge_abort` is pinned. | harness adds a tree-writing git command that must never recurse and has no recursion flag of its own — pin that one; never push |
+| A **blanket `submodule.recurse=false` pin** on every git call but `fetch` | As a blanket rule the pin is insufficient here and wrong in one place, so harness pins in its own shape instead. Insufficient: it neutralises recursion a config turns on, and harness's trigger was its own explicit `--recurse-submodules` on the discard, which `-c submodule.recurse=false` does not override (`git -c submodule.recurse=false reset --hard --recurse-submodules HEAD` still dies and leaves the dangling gitfile); what fixed it is holding every gitlink git cannot reset out of the recursion (`gitutil._unresettable_gitlinks`). Wrong on push: push reads `push.recurseSubmodules` and `submodule.recurse` in one config pass where the last value read wins, and `-c` is read last, so the pin silently overrode an operator's `push.recurseSubmodules=check` gate (verified: `check` alone refuses the push, `check` plus the pin pushes). Under `submodule.recurse=true`, which push reads as on-demand, a branch that bumped a populated submodule to an unpushed commit failed loudly only when the submodule had no branch named like the task branch ("src refspec … must name a ref"). With one, git pushed that branch to the submodule's own remote and published. So only `gitutil.merge_abort` is pinned. The push now carries `--recurse-submodules=check` instead: it overrides `on-demand`, `only` and `submodule.recurse=true`, keeps an operator's `check`, and refuses both shapes. | harness adds a tree-writing git command that must never recurse and has no recursion flag of its own — pin that one; never pin push to `submodule.recurse=false` |
 | git's own `git worktree remove --force` for a tree that holds a populated submodule — the only way git removes one (`working trees containing submodules cannot be moved or removed`) | `--force` also skips git's own dirty check and deletes every submodule checkout and every clone the tree keeps, absorbed into its git dir or embedded in the checkout, so a stash, a commit made in such a clone, or untracked files in a submodule went with the tree. Without `allow_dirty`, harness forces only on exactly that refusal (the whole of git's stderr, read under `LC_ALL=C`), and with it passes `--force` up front — either way only once its own check has passed (`WorktreeManager._refuse_submodule_hazards`: every populated submodule, nested ones included, holds no uncommitted or untracked work (`gitutil.submodule_dirt`), its checked-out commit already exists in the superproject's primary module store, its stash list is empty, and the clones the removal deletes hold no commit that neither their own remote-tracking refs reach nor that store holds (`gitutil.submodule_clone_only_work`)), run before the in-use sweep and again just before `--force`, whatever `allow_dirty` says. The price: such a tree is never pruned automatically while its submodule has no primary module store (the main checkout never initialised it) or that store lacks the checked-out commit, pushed upstream or not; and the proof reads object presence, not reachability, so an unreachable object in the store can later be collected by `gc` there. Holes left open, each needing a deliberate write into the operator's own module store or the agent's own clone: pack files or loose-object directories symlinked into the store from the tree are not detected, and a forged remote-tracking ref or `objects/info/commit-graph` in the doomed clone can still vouch for a commit. | A removal is wanted for trees whose submodules the main checkout never initialised — then fetch into the module store first, never force without the proof |
 | A **`git worktree add --force` self-heal** for a stale registration — the forced add clears the registration for exactly its own path, in place of a repository-wide `git worktree prune` | harness's adds are attached — `git worktree add -b agent/<id>`, or onto the task's existing branch — and there `--force` also overrides git's branch-in-use guard: verified on git 2.56, `git worktree add --force <path> <branch>` succeeds with that branch already checked out in another worktree, leaving two trees on one branch. harness clears the one stale registration first instead — `git worktree remove` of its exact registered path, read back (`WorktreeManager._clear_missing_registration`), or the one admin dir whose backlink names a tree that lost its `.git` marker (`WorktreeManager._drop_lost_marker_registration`) — and lets the add keep every guard git has (see *No repository-wide `git worktree prune`* under [§ Operating a fleet: supervise & prune](#operating-a-fleet-supervise--prune)). Nor is `git worktree prune --expire <time>` a substitute: it spares an unreachable foreign tree only by age, and keeps harness's own just-stale registration, so the add still fails. | git's `worktree add --force` stops overriding the branch-in-use check for an attached add, or harness's adds become detached-only |
 | **What path-scoped registration clearing and the registration proof leave open** (see *No repository-wide `git worktree prune`* under [§ Operating a fleet: supervise & prune](#operating-a-fleet-supervise--prune), and the *Worktrees* bullet under [§ How a run is isolated and resumable](#how-a-run-is-isolated-and-resumable)) | Accepted. (1) A registration no path-scoped step reaches stays until something clears that path, or `git gc` expires it (three months by default): a validation-baseline probe tree whose `worktree remove --force` failed — detached, so it pins no branch — and the original registration of a tree an operator renamed and harness then reclaimed with `prune_orphans`, which **does** pin the old task's branch (`git branch -D` refuses it as "used by worktree") until `pipeline prune`'s reconcile pass (once that branch has landed), a done pass or an `ensure` of that task id clears it. (2) The proof reads git's own files, so a git dir forged to look like the tree's own passes the plain proof: a `.git` directory or separate git dir whose `refs` are links into another repository (the old `git-new-workdir` layout; `linked=True` refuses it), and an admin dir whose backlink was written to name the tree (`linked=True` does not). (3) The strict proof establishes a shape, not whose tree it is: crash recovery (`Supervisor._clean_worktree`) still stashes and resets a recorded path that is a linked worktree whose admin dir's backlink names it — of this repository or any other, the task's or not, its work parked on that repository's stash — and so it does for a forged admin dir. (4) The loops' in-run helpers (`gitutil._refuse_unowned`) and the push guard (`pr._unowned_push`) take the plain proof, which passes a gitfile into another checkout's `--separate-git-dir` repository not named `.git` (there is no backlink to check), and a `.git` linked to another checkout's `.git` that is itself a link to that checkout's separate git dir (judged on what it resolves to, where the gitfile spelling is refused). (5) The proof is a point-in-time check: a link swapped in between it and the git command is still followed (confinement pins discovery, not the chdir). (6) An operator checkout whose `.git` is a symlink to a `.git` directory elsewhere fails the plain proof — the only harness code that runs a guarded helper on the main checkout is `WorktreeManager.integrate`, a library surface with no in-repo caller — and a degenerate `--separate-git-dir=<x>/.git` checkout is refused, though git treats `<x>` as a second work tree of that git dir. (7) A registration matched only through a bind-mount alias (`os.path.samefile`) is reused, but `remove` fails closed on it ("left … registered"), as it does for a missing tree under a worktree root that was moved, left behind as a symlink and then deleted — a registration `ensure` clears through git's listed spelling. (8) An admin dir whose `gitdir` file this user cannot read fails the proof, closed; and Windows is untested by construction — Git-for-Windows `C:/…` spellings are compared with `os.path.samefile`, and a junction at the worktree path or at `.git` is not flagged as a link. | a forged registration, a path swapped mid-command or a stale registration pinning a task branch is seen in practice — then the in-run sites take `linked=True` too, and recovery also requires a recorded tree's admin dir to be one of this repository's (`gitutil.worktree_admin_dirs`) |
@@ -2955,12 +3119,12 @@ says when, if ever, the decision should be revisited.
 | One long review wait for **a reset longer than one `quota_wait_cap_seconds`** | A stated reset past one cap is reached the way the implement loop reaches it: one capped wait per refusal, then a relaunch that reads the refusal afresh. So the whole review is relaunched after each capped wait, and each relaunch re-runs validation and the mutation gate before the verifier is refused again — 3.5 h with a 1 h cap is four refused reviews, 14 h at the defaults three. | a review can resume at its verifier without re-running the gates before it — then one long, slice-beating wait can replace the relaunches |
 | Reading the CLI's **time-only reset clause** right on a 23-hour spring-forward day | `resets 3pm (Zone)` names no date. On the day a DST change skips an hour, a time-only reset 23 to 24 hours away reads as today's occurrence, under an hour ahead: a short wait and a refused relaunch (on the review path, up to `max_quota_waits` refused reviews), after which the clause reads correctly. This and the gap case under [§ Usage limits](#usage-limits) are ambiguities of the CLI's own format. | the CLI states the reset with a date or an offset in the result envelope |
 | The control-character pass run **first** in the publication scrub — and its cost, an escape sequence that eats a redaction anchor | Accepted. Running `sanitize.neutralize_controls` before the marker, secret and home-path passes is what keeps an escape that *splits* a marker, a `ghp_` token or a home path from re-joining it after those passes looked. Its price: dropping a sequence consumes what it ends on, so a short escape placed against a redaction anchor eats it — a keyword (`\x1b[api_key:…` loses its `a`), a `ghp_`, `sk-` or `eyJ` prefix, a PEM `BEGIN` or `END` line, a home-path or `file://` prefix — an OSC can swallow one up to a BEL on its line, and two credentials separated only by an escape are joined; the value, a whole PEM private-key body included, is then published. It needs a raw escape sequence placed against a credential. A redaction pre-pass before the control pass would reopen the split home path, so closing this is a design change, not a pattern fix. | a redact → neutralise → redact double pass is shown to reopen none of the split-marker, split-token and split-home-path shapes the ordering closes |
-| The force-push lease (see *Force-push safety* under [§ Trust & safety](#trust--safety-gating-work-you-didnt-write)) under **a forced push refspec** in the repository's own config — and **what the push config still decides** | A push refspec configured with `+` (`remote.origin.push = +refs/heads/*:refs/heads/*`) made harness's plain `git push -u origin <branch>` a force push by itself — verified on git 2.56: "(forced update)" over a reviewer's commit — so the push never failed, no retry ran, and neither the lease nor `gitutil.clobber_check` was ever consulted. The config is the operator's — or an agent's, since the shared `.git/config` is writable under the default `Bash(git:*)`. That is closed: every harness push names its refspec in full and unforced, `refs/heads/<branch>:refs/heads/<branch>` (the plain push in `pr.GitHubPR.open`, both retries in `gitutil.force_push_with_lease`), so git consults neither `remote.origin.push` nor `push.default`. Verified on git 2.56 with the full refspec: the plain push is "[rejected] (fetch first)" and both leases are "[rejected] (stale info)", where the colon-less form went out "(forced update)". An unforced redirect was not safe either: it published `refs/heads/elsewhere/<branch>` (an unforced mapping, `refs/heads/*:refs/heads/elsewhere/*`) or fast-forwarded origin's `main` (`push.default=upstream` with upstream `refs/heads/main`); the full refspec closes both. Open residuals, all config an agent can write and all the same for both refspec forms: (a) where the push goes — `remote.origin.url`, `remote.origin.pushurl`, `url.<base>.insteadOf` / `pushInsteadOf`; (b) `push.followTags=true` — annotated tags reachable from the pushed branch go out too, and `pr._unpublishable_messages` never reads their messages (verified end to end: a tag message carrying a `ghp_` token reached origin, while the same text in a commit message is refused); (c) `push.recurseSubmodules=on-demand` — a submodule's same-named branch is pushed to the submodule's own remote; otherwise that push fails closed. Separately, `remote.origin.mirror=true` fails every push ("--mirror can't be combined with refspecs"). The cheap fix for (b) and (c) is `--no-follow-tags` and `--recurse-submodules=check` on the two push argvs. | a push is seen landing on a URL or ref the operator did not mean, or a tag or submodule push is seen riding on a harness publish |
+| The force-push lease (see *Force-push safety* under [§ Trust & safety](#trust--safety-gating-work-you-didnt-write)) under **a forced push refspec** in the repository's own config — and **what the push config still decides** | A push refspec configured with `+` (`remote.origin.push = +refs/heads/*:refs/heads/*`) made harness's plain `git push -u origin <branch>` a force push by itself — verified on git 2.56: "(forced update)" over a reviewer's commit — so the push never failed, no retry ran, and neither the lease nor `gitutil.clobber_check` was ever consulted. The config is the operator's — or an agent's, since the shared `.git/config` is writable under the default `Bash(git:*)`. That is closed: every harness push names its refspec in full and unforced, `refs/heads/<branch>:refs/heads/<branch>` (the plain push in `pr.GitHubPR.open`, both retries in `gitutil.force_push_with_lease`), so git consults neither `remote.origin.push` nor `push.default`. Verified on git 2.56 with the full refspec: the plain push is "[rejected] (fetch first)" and both leases are "[rejected] (stale info)", where the colon-less form went out "(forced update)". An unforced redirect was not safe either: it published `refs/heads/elsewhere/<branch>` (an unforced mapping, `refs/heads/*:refs/heads/elsewhere/*`) or fast-forwarded origin's `main` (`push.default=upstream` with upstream `refs/heads/main`); the full refspec closes both. Open residuals, config an agent can write and the same for both refspec forms: (a) where the push goes — `remote.origin.url`, `remote.origin.pushurl`, `url.<base>.insteadOf` / `pushInsteadOf`; and (d) push options — `push.pushOption`, multi-valued and agent-writable, is transmitted to a server that advertises push-options (verified with a local bare remote and `receive.advertisePushOptions=true`: a `ghp_`-shaped value reached its pre-receive hook; against a server that does not advertise them the push fails, "the receiving end does not support push options"), and `--no-push-option` does not clear configured values, while `-c push.pushOption=` does. **(b) and (c) are closed** by `--no-follow-tags` and `--recurse-submodules=check`, in that order right after `push`, on all three push forms: the plain push in `pr.GitHubPR.open` and both leases in `gitutil.force_push_with_lease` (pinned by `tests/test_push_config_isolation.py`, and (b) also by `tests/test_publish_followed_tags.py`). (b) was `push.followTags=true`: annotated tags reachable from the pushed branch went out too, and `pr._unpublishable_messages` never reads their messages (verified end to end: a tag message carrying a `ghp_` token reached origin, while the same text in a commit message is refused). Verified on git 2.56: before the fix the tag reached origin through the plain push, either lease, and a push whose branch was rejected; now it reaches origin through none of them. (c) was the submodule push: under `push.recurseSubmodules=on-demand`, and under `submodule.recurse=true`, which push reads as on-demand, the submodule's same-named branch moved on the submodule's own remote, and `push.recurseSubmodules=only` pushed only the submodule and exited 0. Now no submodule is pushed: a changed gitlink naming a commit no remote-tracking ref of its populated submodule reaches makes git refuse the whole push, under any config, none included, with nothing reaching origin or the submodule's remote, and an operator's own `check` stays in force. What `check` cannot do (see *Force-push safety*): it trusts what an agent can write — the superproject's own `refs/remotes/origin/*`, which decide which pushed commits are examined, and the submodule's `refs/remotes/*`, so a forged one passes — and it skips a submodule with no remote-tracking refs, one the worktree never populated, a populated one that lacks the gitlink's commit, and one git cannot open at its path (a broken gitfile, a symlinked path). Those gitlinks are published unchecked, with nothing pushed to the submodule's remote. Pinned by tests: a forged submodule tracking ref and no tracking refs (`test_the_residual_check_trusts_the_submodules_own_tracking_refs`), and an unpopulated submodule with a changed or an unchanged gitlink (`test_a_changed_gitlink_on_an_unpopulated_submodule_is_published_unchecked`, `test_an_unpopulated_submodule_with_an_unchanged_gitlink_is_nothing_to_check`). Verified but not pinned: a superproject tracking ref, a populated submodule lacking the commit, a broken gitfile or symlinked path, and the lazy fetch by which a partial-clone submodule asks its promisor remote for a gitlink commit it lacks (residual (a)'s class; `GIT_NO_LAZY_FETCH=1` stops it). And `check` refuses some commits a remote does have, when no remote-tracking ref reaches them — one published only under a tag, or fetched by name while the tracking refs are stale — verified: these published before and are refused now. Separately, `remote.origin.mirror=true` still fails every push, all three forms ("--mirror can't be combined with refspecs"). | a push is seen landing on a URL or ref the operator did not mean, or a tag or submodule push is seen riding on a harness publish, or a push option is seen reaching a remote, or git starts or stops checking one of those shapes (the pinned tests fail) |
 | The exit rule (see *Judged on exit, not on pipe EOF* under [§ Surviving an unattended run](#surviving-an-unattended-run)) for **runs no sweep follows** and **git output a leftover holds** | Accepted. Two validation runs have no post-return sweep: the mutation gate's suite runs (`mutation.py`, through `base.run_validation`) and the diff-base runs (`base._baseline_legs`, behind `--validation-baseline` and the could-not-run adjudication). There a pipe holder in the command's own process group is no longer killed: the run returns about 2 s after the command exits, with its real exit code, and the holder keeps running in that tree — a suite that leaves a server behind leaves one per mutant. Before, each such run hung to its timeout, the timeout ladder's group kill took the holder, and the run read as a timeout (a mutant counted as killed). By design: no group signal follows a held drain — the sweep decides, and these runs have none. And `gitutil.git` drains stderr on every call but stdout only for `push`, so a process holding git's stdout on another subcommand (an `!` alias, an external diff driver) still holds that call until its timeout. | those runs gain a sweep (the mutation gate is handed an `ImplementContext` to sweep with), or a held git subcommand other than `push` is seen in practice |
 | The process scan's re-scan (see *Quiet tree after every return* under [§ Surviving an unattended run](#surviving-an-unattended-run)) for **a longer handoff chain** | Accepted. The scan stops after `procutil._SCAN_PASSES` (3) passes, and running out of passes is accepted as the last pass's answer, never read as busy or unprovable — or every sweep on a fork-busy host would stop. So a handoff chain longer than the classic double fork, or one landing on the third pass, can still be missed. The bound's cost: a persistent zombie, or processes exiting during passes, costs up to two more passes — one pass is about 6–7 ms on a desktop of some 700 processes, a quiet one with a zombie usually takes two (about 12–13 ms), and during concurrent builds 41 of 60 scans took three (median 20 ms). | a successor the scan missed is seen in practice — then raise the bound, or settle before the last pass |
 | The packet's path pass (see *The committed packet carries no absolute path of harness's own* under [§ Trust & safety](#trust--safety-gating-work-you-didnt-write)) — **what it does not cover** | Accepted. Review rounds (`append_feedback_round`) get the worktree, worktree-root and main-checkout roots but no `{designs}` root — their one caller does not hand it over — so a design path outside both the repository and `$HOME` quoted in a review round stays verbatim; a spelling reached through an unrelated symlink is not recognised; and the description's `From design '…' (<path>)` line still takes the secret pass, as the PR body does, while the Source design row skips it — so a design *file name* shaped like a credential is published as written there. A NUL byte in a directory component of a recorded design path, which only a hand-edited plan can carry, no longer makes `IdeHandoffBackend._render_packet` raise `ValueError` (see the packet's designs roots in that same paragraph). | a review round or a design name is seen publishing a path or a credential shape — then the orchestrator hands `append_feedback_round` the designs root, and the row gets a secret pass of its own |
 | An **agent commit-message rewrite** — the agent's commits re-committed with a configured message through `commit-tree` / `update-ref` | A rewrite runs no `commit-msg` hook — a hook-free plumbing write, the `--no-verify` row's class — and breaks the binding to the reviewed commit, so harness refuses instead of rewriting: `GitHubPR.open`'s pre-push guard (`pr._unpublishable_messages`) refuses a commit message that carries terminal control characters or a high-confidence credential shape (`sanitize.publication_hazards`), naming the commit and the kind, and the operator rewords it (see *Pre-push message guard* under [§ Trust & safety](#trust--safety-gating-work-you-didnt-write)). The guard's residuals, accepted: it reads what origin has from the local `refs/remotes/origin/*` refs and never contacts the network, so a ref naming commits the real remote no longer has (its branch deleted or rewound since the last fetch), or one written locally — refs are shared, so an agent can write one, a symref such as `refs/remotes/origin/HEAD` → `refs/heads/<branch>` included, which empties the range — narrows the range, and what it reaches is published unchecked; fetches fill those refs from origin's URL, so with `remote.origin.pushurl` naming a different repository, history the fetch repository has and the push destination lacks is published unread; git shows a hand-made commit's message only up to a NUL byte (`git commit` refuses one, and `git fsck --strict` reports it as nulInCommit); a commit whose encoding header maps a raw C1 byte to a printable (CP437 0x9b → '¢') is read as that printable, as git displays it; and a home or worktree path in a message is only logged. | an operator asks for scrubbed agent messages and accepts a hook-free rewrite before the freeze (weighed with the `--no-verify` row), or the guard is seen refusing innocent history |
-| The agent CLI's **per-call caps** (`--max-turns` / `--max-budget-usd`), as harness hands them over on the legacy flag family, and Gemini CLI's own session-turn limit (exit 53), which harness reads the same way | Accepted costs of reading a cap as the CLI's own cut, never as an agent failure (see *Per-call caps* under [§ Surviving an unattended run](#surviving-an-unattended-run)): (1) a flag probe that timed out or could not start refuses the launch rather than guess — one failed task, nothing touched, and not cached, so the next run asks again — while any other non-zero answer that does not name the flag's missing value (a crash) is cached as a refusal for the life of the process; (2) a long task whose failure reason does not change across `no_progress_window` capped calls still abstains, and under `reset_on_failure` loses the kept work with that stop's cleanup; (3) `_cli_budget_flags` hands the balance formatted to cents: after a budget cap whose cost cannot be read, a sub-cent remainder can leave the total just under `max_cost_usd`, and one more call is handed the $0.01 floor (verified: launches handed 1.00, 0.33, 0.01; stopped at $1.0070); (4) feedback is not reset when the oracle goes green: a commit repair after a green call that followed a kept capped call still opens with that capped call's note and red verdict, and the note's worktree claim is true there; (5) on Gemini CLI, whose help lists neither flag, a set `max_agent_turns` refuses every task rather than run one without the cap, and `max_cost_usd` is checked only between calls: one call can spend past the balance, a call whose stats cannot be read counts $0, and a call ended at the session-turn limit is charged only the usage it reported, which is none: Gemini CLI prints no stats with its exit-53 error, so neither budget advances on such a call, and only `max_iters` and the no-progress guard bound a run of them. What the reading does not cost: a failed call's discard drops the cap note with the kept work (`AgentCliBackend._implement_loop`'s `cap_note`), and a budget-capped call is charged at least its handed balance (`agent_cli._capped_call_cost`). That a capped call neither counts toward nor resets the failure streak is pinned by `test_a_capped_call_neither_counts_toward_nor_resets_the_failure_streak`. | any of them is seen in a real run |
+| The agent CLI's **per-call caps** (`--max-turns` / `--max-budget-usd`), as harness hands them over on the legacy flag family, and Gemini CLI's own session-turn limit (exit 53), which harness reads the same way | Accepted costs of reading a cap as the CLI's own cut, never as an agent failure (see *Per-call caps* under [§ Surviving an unattended run](#surviving-an-unattended-run)): (1) a flag probe that timed out or could not start refuses the launch rather than guess — one failed task, nothing touched, and not cached, so the next run asks again — while any other non-zero answer that does not name the flag's missing value (a crash) is cached as a refusal for the life of the process; (2) a long task whose failure reason does not change across `no_progress_window` capped calls still abstains, and under `reset_on_failure` loses the kept work with that stop's cleanup; (3) the feedback reset on a green verdict also drops a nested-repository note (`gitutil.NESTED_NOTE_PREFIX`) left by an earlier red discard: a commit repair refused by a surviving repository then hears only the unregistered-gitlink refusal, which suggests deleting the directory, and a repair after a first-iteration green never heard that note; (4) on Gemini CLI, whose help lists neither flag, a set `max_agent_turns` refuses every task rather than run one without the cap, and `max_cost_usd` is checked only between calls: one call can spend past the balance, a call whose stats cannot be read counts $0, and a call ended at the session-turn limit is charged only the usage it reported, which is none: Gemini CLI prints no stats with its exit-53 error, so neither budget advances on such a call, and only `max_iters` and the no-progress guard bound a run of them. What the reading does not cost: a failed call's discard drops the cap note with the kept work (`AgentCliBackend._implement_loop`'s `cap_note`), and a budget-capped call is charged at least its handed balance (`agent_cli._capped_call_cost`). Two costs this row used to accept are closed. The balance went over formatted to cents, so after a budget cap whose cost could not be read, a sub-cent remainder left the total just under `max_cost_usd`, and one more call was handed the $0.01 floor (verified: launches handed 1.00, 0.33, 0.01; stopped at $1.0070). And feedback was kept past a green verdict: a commit repair after a green call that followed a kept capped call still opened with that capped call's note and red verdict. Now `agent_cli._cli_budget_flags` hands the balance floored to the cent (`_handed_balance`); `agent_cli._capped_call_cost` charges a budget-capped call at least the exact budget left as it launched, and `_exhaust_cost_budget` raises the total to the cap against float rounding, so no call follows a budget cap; and the loop's green path (`AgentCliBackend._implement_loop`) drops `feedback` and `cap_note` before the commit step, so a commit repair's feedback is the commit failure alone. Pinned by `test_a_budget_capped_call_is_charged_what_was_left_and_no_call_follows`, `test_a_budget_capped_call_is_charged_at_least_the_budget_left_as_it_launched`, `test_the_balance_goes_over_floored_to_the_cent_never_above_it` and `test_a_commit_repair_after_a_kept_capped_call_is_told_the_commit_failure_only`. That a capped call neither counts toward nor resets the failure streak is pinned by `test_a_capped_call_neither_counts_toward_nor_resets_the_failure_streak`. | any of them is seen in a real run |
 | `--approval-mode yolo` (or `--yolo`) for Gemini CLI implement calls | It lifts neither limit harness meets: build files stay denied to the edit tools in every mode, and a command an allow rule's prefix matches still loses its redirection unless that rule allows it. What it adds is every tool beyond the allow rules — skills, MCP and discovered tools — and an administrator's `security.disableYoloMode` turns it into exit 52 on every launch. `auto_edit` is the least privilege at launch, which is what the legacy family's `acceptEdits` grants; a headless model can reach `yolo` itself through `enter_plan_mode`/`exit_plan_mode`, which harness denies at admin tier. | Gemini CLI gains a mode between the two, or `auto_edit` stops approving edits |
 | `--skip-trust` instead of `GEMINI_CLI_TRUST_WORKSPACE=true` | The flag sets that variable only while arguments are parsed, after settings were loaded, so one run can get two trust answers — a worktree's `.gemini/settings.json` may not load while the headless trust gate passes. Hanging the untrusted-design suppression on that gap would rest a security property on behaviour a proposed Gemini CLI change set out to remove. | Gemini CLI documents a single trust answer for both |
 | Escaping `@` in the prompt so Gemini CLI does not expand `@path` references | Gemini CLI does not unescape a `\@` handed to `-p`, so the agent would read `\@dataclass` in the task text, the design and the failure output it must act on. The expansion it would prevent only reads in workspace files the agent may read anyway. | A Gemini CLI flag or setting turns `@` processing off for a headless prompt |

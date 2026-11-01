@@ -61,6 +61,14 @@ from harness.pipeline.spec import PipelineConfig, Task
 from harness.pipeline.trace import Tracer, read_spans
 from harness.pipeline.worktree import WorktreeManager
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
 _LINUX = sys.platform.startswith("linux")
 pytestmark = pytest.mark.skipif(not _LINUX, reason="needs a cwd-scannable /proc")
 
@@ -168,7 +176,7 @@ def _interrupt_when(path: Path) -> threading.Thread:
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
 

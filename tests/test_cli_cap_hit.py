@@ -47,6 +47,7 @@ from harness.pipeline.backends.agent_cli import AgentCliBackend
 from harness.pipeline.backends.base import ImplementContext, OracleResult
 from harness.pipeline.grounding_gate import GateResult
 from harness.pipeline.notes import RunLog
+from harness.pipeline.trace import Tracer, read_spans
 from harness.pipeline.worktree import WorktreeManager
 
 #: A stand-in agent CLI, scripted by fake.json beside it. Its option parser
@@ -246,7 +247,19 @@ def _no_shutdown_leak():
     shutdown.reset_for_tests()
 
 
-_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false")
+#: The fixtures' own git calls, pinned the way the rest of the suite pins them
+#: (tests/test_hardening.py): the autouse GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM
+#: above do not reach an inherited GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS,
+#: and core.ignoreStat=true or status.showUntrackedFiles=no there would rewrite
+#: the repositories these tests build and hide what they read back. Only the
+#: fixture helper is pinned; harness's own git calls get no pins from here.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never",
+                     "-c", "core.hooksPath=/dev/null",
+                     "-c", "commit.gpgsign=false")
 
 #: The cap envelope's words for --max-turns 5, as _cli_cap_text renders them.
 _TURNS_5 = "error_max_turns: Reached maximum number of turns (5)"
@@ -258,8 +271,8 @@ _CAP_NOTE = ("Note: the previous attempt was ended by its per-call cap before it
 
 
 def _git(args, cwd) -> str:
-    return subprocess.run([*_GIT, *args], cwd=cwd, check=True, capture_output=True,
-                          text=True).stdout
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
 
 
 def _ctx(tmp_path: Path, **cfg_kw) -> ImplementContext:
@@ -524,6 +537,50 @@ def test_the_cap_note_goes_with_the_work_a_failed_calls_discard_takes(tmp_path, 
                                   "work of launch 1\nwork of launch 2\nwork of launch 3\n"]
 
 
+@pytest.mark.parametrize("refusal", ["pre-commit-hook", "protected-path"])
+def test_a_commit_repair_after_a_kept_capped_call_is_told_the_commit_failure_only(
+        tmp_path, refusal):
+    """A red capped call is kept, its cap note and red verdict the next call's
+    feedback. That call goes green, and its commit is refused (a pre-commit hook
+    that exits 1, or a protected path). Green answers every verdict before it:
+    the commit-repair prompt carries the commit failure, and neither the cap
+    note nor the earlier red verdict. PRE-FIX the feedback was not reset on
+    green, so the repair prompt still carried "the previous attempt was ended
+    by its per-call cap … continue from it" and that red verdict, although the
+    attempt before it had finished green."""
+    protected = refusal == "protected-path"
+    fake = _FakeCli(tmp_path, [{"kind": "turns"},
+                               {"kind": "ok", "write": {"secret.key": "k\n"} if protected
+                                else {}},
+                               {"kind": "ok"}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_iters=3,
+               protected_paths=["*.key"] if protected else [])
+    if not protected:
+        hook = tmp_path / "repo" / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho 'pre-commit: lint rejected the change' >&2\n"
+                        "exit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+    backend = _Judged(fake.path, [False, True, True], distinct=True)
+
+    out = backend.implement(ctx)
+
+    prompts = [argv[1] for argv in fake.launches()]
+    assert len(prompts) == 3, out.detail
+    # True then: the capped call's work was in the tree, its verdict unanswered.
+    assert _CAP_NOTE.format(_TURNS_5) in prompts[1] and "assert kkkk" in prompts[1]
+    repair = prompts[2]
+    assert "## Previous commit failure (fix this first)" in repair
+    assert ("protected path refusal: secret.key" if protected
+            else "pre-commit: lint rejected the change") in repair
+    assert "ended by its per-call cap" not in repair
+    assert "assert kkkk" not in repair and "test_aaa" not in repair
+    assert "## What is still failing" not in repair
+    # The green work waits for its repair, as before: nothing was discarded.
+    assert out.status == "failed" and "commit never landed" in out.detail, out.detail
+    assert (Path(ctx.worktree) / "agent_work.txt").read_text() == (
+        "work of launch 1\nwork of launch 2\nwork of launch 3\n")
+
+
 # ── the budget cap: one launch, never the whole balance again ────────────────────
 
 
@@ -607,6 +664,60 @@ def test_a_budget_capped_calls_readable_cost_is_kept(tmp_path):
     assert fake.flag("--max-budget-usd") == ["1.00"], out.detail
     assert "stopped on budget — cost budget reached ($1.3700 ≥ $1.00)" in out.detail, \
         out.detail
+
+
+@pytest.mark.parametrize("max_cost, first, handed, reached, charged", [
+    pytest.param(1.0, 0.667, ["1.00", "0.33"], "$1.0000 ≥ $1.00", [0.667, 0.333],
+                 id="sub-cent-remainder"),
+    pytest.param(0.21, 0.047, ["0.21", "0.16"], "$0.2100 ≥ $0.21", [0.047, 0.163],
+                 id="an-ulp-short-in-floats"),
+])
+def test_a_budget_capped_call_is_charged_what_was_left_and_no_call_follows(
+        tmp_path, max_cost, first, handed, reached, charged):
+    """A red call with a readable cost, then a red call the CLI stops at its
+    budget with a cost that cannot be read (null). That call is handed what is
+    left floored to the cent and charged what was left, exactly — the `agent`
+    span shows the charge — and the next budget check stops the run: no third
+    launch. PRE-FIX it was charged only the cents it was handed (0.33 of the
+    0.333 left), the total stayed under max_cost_usd, and a third call went out
+    at the $0.01 floor: 1.00, 0.33, 0.01, stopped at $1.0070. In the second
+    case the remainder (0.21 - 0.047), added back, lands an ulp short of the
+    cap in floats — 0.20999999999999996 — which would leave room for that third
+    launch as well."""
+    fake = _FakeCli(tmp_path, [{"kind": "ok", "cost": first}, {"kind": "budget", "cost": None}])
+    ctx = _ctx(tmp_path, max_cost_usd=max_cost, max_iters=6)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [False], distinct=True)
+
+    out = backend.implement(ctx)
+
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    assert out.status == "failed" and out.iterations == 3, out.detail
+    assert f"stopped on budget — cost budget reached ({reached})" in out.detail, out.detail
+    spans = read_spans(ctx.config.state_dir, span_type="agent")
+    assert [span["cost_usd"] for span in spans] == charged
+
+
+def test_a_budget_capped_call_is_charged_at_least_the_budget_left_as_it_launched():
+    """The charge, unit by unit, given the exact remainder the call launched with
+    (the balance it was handed is that remainder floored to the cent): a
+    readable figure at or past both is kept, and anything else is the larger of
+    the two. The flag-only call shape still charges the balance handed, and the
+    turn cap still costs what its envelope reports."""
+    from harness.pipeline.backends.agent_cli import _capped_call_cost
+
+    flags = ["--max-budget-usd", "0.33", "--max-turns", "5"]
+    budget = "error_max_budget_usd: Reached maximum budget ($0.33)"
+    assert _capped_call_cost(budget, flags, 0.0, 0.333) == 0.333         # unreadable
+    assert _capped_call_cost(budget, flags, float("nan"), 0.333) == 0.333
+    assert _capped_call_cost(budget, flags, 0.331, 0.333) == 0.333       # short of the rest
+    assert _capped_call_cost(budget, flags, 0.34, 0.333) == 0.34         # past both: kept
+    assert _capped_call_cost(budget, flags, 0.0, float("nan")) == 0.33
+    assert _capped_call_cost(budget, flags, 0.0) == 0.33                 # flag-only shape
+    assert _capped_call_cost(budget, flags, 0.0, None) == 0.33
+    floor = ["--max-budget-usd", "0.01"]                       # under a cent left
+    assert _capped_call_cost("error_max_budget_usd", floor, 0.0, 0.004) == 0.01
+    assert _capped_call_cost(_TURNS_5, flags, 0.1, 0.333) == 0.1
 
 
 def test_a_retry_is_handed_only_what_the_earlier_attempts_left(tmp_path):

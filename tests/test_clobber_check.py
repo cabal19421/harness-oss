@@ -32,6 +32,15 @@ from harness.pipeline.pr import GitHubPR
 
 _REAL_GIT = shutil.which("git") or "git"
 _TRACKING = "refs/remotes/origin/agent/t1"
+#: The fixtures' own git calls, pinned against whatever config the run has (the
+#: suite also runs under a hostile global/system config); harness's calls — and
+#: the PATH wrappers below, which stand in for harness's git — are not.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +59,7 @@ def _hermetic_git(monkeypatch):
 
 
 def _run(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([_REAL_GIT, "-c", "init.defaultBranch=main",
+    return subprocess.run([_REAL_GIT, *_FIXTURE_GIT_PINS, "-c", "init.defaultBranch=main",
                            "-c", "core.autocrlf=false", *args],
                           cwd=str(cwd), capture_output=True, check=False)
 
@@ -237,11 +246,11 @@ def _lines(*marks: tuple[int, bytes]) -> bytes:
 def _verbatim_id(repo: Path, commit: str, *opts: str,
                  env: dict[str, str] | None = None) -> str:
     """*commit*'s ``patch-id --verbatim`` over ``diff-tree -p <opts>`` — the premises."""
-    diff = subprocess.run([_REAL_GIT, "diff-tree", "-p", *opts, commit], cwd=str(repo),
-                          capture_output=True, check=True,
+    diff = subprocess.run([_REAL_GIT, *_FIXTURE_GIT_PINS, "diff-tree", "-p", *opts, commit],
+                          cwd=str(repo), capture_output=True, check=True,
                           env=None if env is None else {**os.environ, **env})
-    ids = subprocess.run([_REAL_GIT, "patch-id", "--verbatim"], input=diff.stdout,
-                         cwd=str(repo), capture_output=True, check=True)
+    ids = subprocess.run([_REAL_GIT, *_FIXTURE_GIT_PINS, "patch-id", "--verbatim"],
+                         input=diff.stdout, cwd=str(repo), capture_output=True, check=True)
     return ids.stdout.decode().split()[0]
 
 

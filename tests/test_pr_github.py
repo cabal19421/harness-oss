@@ -43,6 +43,10 @@ def _cp(argv, rc=0, out="", err=""):
 #: The refspec every harness push of ``agent/t1`` names: in full and unforced,
 #: so git consults neither ``remote.origin.push`` nor ``push.default``.
 _REFSPEC = "refs/heads/agent/t1:refs/heads/agent/t1"
+#: What every harness push leads with, in this order, right after ``push``: no
+#: followed tag and no submodule push, whatever the repository's config says
+#: (real repositories: tests/test_push_config_isolation.py).
+_ONLY_THE_REFSPEC = ("--no-follow-tags", "--recurse-submodules=check")
 
 
 class _Gh:
@@ -566,7 +570,8 @@ def test_patch_id_check_is_skipped_when_there_is_no_remote_tracking_ref(monkeypa
     assert not asked
     assert leased == [(tmp_path, "origin", "agent/t1", "")]
     assert [args for args, _kw in ran] == [
-        ["push", "--force-with-lease=refs/heads/agent/t1:", "origin", _REFSPEC]]
+        ["push", *_ONLY_THE_REFSPEC, "--force-with-lease=refs/heads/agent/t1:", "origin",
+         _REFSPEC]]
     [(_args, kw)] = ran
     assert kw["cwd"] == tmp_path and kw["confine"] is True
 
@@ -1141,9 +1146,10 @@ def test_the_lease_guarded_retry_push_runs_confined_like_the_plain_push(tmp_path
 
     pushes = [(argv[1:], env, rc) for argv, env, rc in ran if argv[1:2] == ["push"]]
     assert [(argv, rc == 0) for argv, _env, rc in pushes] == [
-        (["push", "-u", "origin", _REFSPEC], False),                  # rejected…
+        (["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC], False),     # rejected…
         # …retried, leased on the remote commit the clobber check validated
-        (["push", f"--force-with-lease=agent/t1:{first}", "origin", _REFSPEC], True),
+        (["push", *_ONLY_THE_REFSPEC, f"--force-with-lease=agent/t1:{first}", "origin",
+          _REFSPEC], True),
     ]
     plain, retry = (env.get("GIT_CEILING_DIRECTORIES") for _argv, env, _rc in pushes)
     assert plain and plain.split(os.pathsep)[0] == str(wt.resolve().parent)
@@ -1199,7 +1205,9 @@ def test_force_push_with_lease_never_pushes_on_a_bare_lease(monkeypatch, tmp_pat
     (``--force-with-lease=refs/heads/<branch>:``), refused wherever the remote
     branch exists; a SHA anchors the lease to it. Either way the refspec is
     named in full and unforced — no ``remote.origin.push`` mapping can turn
-    the push into a forced one — and the push is confined to the worktree."""
+    the push into a forced one — nothing rides on it (``--no-follow-tags``,
+    ``--recurse-submodules=check``, right after ``push``), and the push is
+    confined to the worktree."""
     ran = []
     monkeypatch.setattr(gitutil, "git", lambda args, **kw: ran.append((list(args), kw))
                         or gitutil.GitResult(0, "", ""))
@@ -1209,7 +1217,7 @@ def test_force_push_with_lease_never_pushes_on_a_bare_lease(monkeypatch, tmp_pat
     lease = (f"--force-with-lease=agent/t1:{expected}" if expected
              else "--force-with-lease=refs/heads/agent/t1:")
     [(args, kw)] = ran
-    assert args == ["push", lease, "origin", _REFSPEC]
+    assert args == ["push", *_ONLY_THE_REFSPEC, lease, "origin", _REFSPEC]
     assert "--force-with-lease" not in args and "--force" not in args
     assert not any(arg.startswith("+") for arg in args)
     assert kw["cwd"] == tmp_path and kw["confine"] is True and kw["timeout"] == 300
@@ -1286,7 +1294,7 @@ def test_the_retry_never_force_pushes_away_a_commit_the_branch_lacks(tmp_path, m
     assert f"refs/remotes/origin/agent/t1 ({sha['fixup'][:12]})" in res.detail
     assert f"refs/heads/agent/t1 ({sha['reviewed'][:12]})" in res.detail
     pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [["push", "-u", "origin", _REFSPEC]]         # no retry ran
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC]]   # no retry ran
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == sha["fixup"]
     assert not fake.argv_for("pr", "create")
 
@@ -1314,9 +1322,9 @@ def test_the_retry_of_an_amended_rerun_does_not_depend_on_where_head_is(tmp_path
 
     assert res.ok and res.url == "https://github.com/o/r/pull/7", res.detail
     pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [(["push", "-u", "origin", _REFSPEC], False),          # rejected…
-                      (["push", f"--force-with-lease=agent/t1:{first}", "origin",
-                        _REFSPEC], True)]
+    assert pushes == [(["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC], False),  # rejected…
+                      (["push", *_ONLY_THE_REFSPEC, f"--force-with-lease=agent/t1:{first}",
+                        "origin", _REFSPEC], True)]
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == reviewed
 
 
@@ -1352,7 +1360,7 @@ def test_a_republish_never_force_pushes_away_a_reviewers_whitespace_amend(tmp_pa
     assert f"refs/remotes/origin/agent/t1 ({fix[:12]})" in res.detail
     assert "whitespace-exact" in res.detail
     pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [["push", "-u", "origin", _REFSPEC]]         # no retry ran
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC]]   # no retry ran
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == fix
     assert not fake.argv_for("pr", "create")
 
@@ -1417,7 +1425,8 @@ def test_a_forced_push_refspec_cannot_make_the_plain_push_overwrite_a_reviewers_
     assert not res.ok and "refusing --force-with-lease retry" in res.detail, res.detail
     assert f"refs/remotes/origin/agent/t1 ({fix[:12]})" in res.detail
     pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [(["push", "-u", "origin", _REFSPEC], False)]   # no retry ran
+    assert pushes == [(["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC],
+                       False)]                                       # no retry ran
     assert not fake.argv_for("pr", "create")
 
 
@@ -1448,7 +1457,8 @@ def test_a_forced_push_refspec_cannot_force_the_anchored_retry_past_its_lease(
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == fix
     assert not res.ok and "stale info" in res.err, res
     pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [["push", f"--force-with-lease=agent/t1:{first}", "origin", _REFSPEC]]
+    assert pushes == [["push", *_ONLY_THE_REFSPEC, f"--force-with-lease=agent/t1:{first}",
+                       "origin", _REFSPEC]]
 
 
 @pytest.mark.parametrize("mapping", [
@@ -1485,7 +1495,7 @@ def test_a_push_mapping_in_the_config_never_redirects_the_publish(tmp_path, monk
     assert _ok(["rev-parse", "--symbolic-full-name", "agent/t1@{upstream}"], wt) == (
         "refs/remotes/origin/agent/t1")
     pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [(["push", "-u", "origin", _REFSPEC], True)]
+    assert pushes == [(["push", *_ONLY_THE_REFSPEC, "-u", "origin", _REFSPEC], True)]
     assert fake.argv_for("pr", "create")
 
 

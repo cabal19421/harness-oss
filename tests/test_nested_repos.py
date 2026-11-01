@@ -85,8 +85,17 @@ def _attempts_begin_after_their_snapshot(monkeypatch):
     monkeypatch.setattr(gitutil, "untracked_nested_repos", snapshot_then_wait)
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false")
+
+
 def _git(args, cwd, *, check: bool = True) -> str:
-    res = subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=str(cwd),
+    res = subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
                          capture_output=True, text=True, check=False)
     if check and res.returncode:
         raise AssertionError(f"git {' '.join(args)} failed in {cwd}: {res.stderr}")

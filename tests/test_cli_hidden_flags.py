@@ -198,6 +198,35 @@ def test_a_hidden_cost_flag_is_taken_as_well(tmp_path):
     assert (flags, refusal) == (["--max-budget-usd", "2.50"], "")
 
 
+def test_the_balance_goes_over_floored_to_the_cent_never_above_it(tmp_path):
+    """Rounded to the nearest cent, a 0.336 balance went over as 0.34, and the
+    CLI could spend past the budget. Floored, it goes over as 0.33. Float noise
+    is not a cent (1.0 - 0.67 is 0.32999999999999996, and 0.29 * 100 is
+    28.999999999999996), and a remainder below one cent goes over as 0.01: the
+    hand-over is in whole cents, and the CLI refuses a balance that is not
+    above 0."""
+    from harness.pipeline.backends.agent_cli import _cli_budget_flags
+
+    fake = _FakeCli(tmp_path)
+
+    def handed(max_cost: float, spent: float = 0.0) -> str:
+        flags, refusal = _cli_budget_flags(
+            str(fake.path), types.SimpleNamespace(),
+            LoopBudget(max_cost_usd=max_cost, cost_usd=spent))
+        assert refusal == "", refusal
+        return flags[flags.index("--max-budget-usd") + 1]
+
+    assert handed(1.0, 0.664) == "0.33"            # 0.336 left: never above it
+    assert handed(1.0, 0.667) == "0.33"            # 0.333 left
+    assert handed(0.339999) == "0.33"
+    assert handed(1.0, 0.67) == "0.33"             # float noise is not a cent
+    assert handed(0.29) == "0.29"
+    assert handed(5.0, 1.25) == "3.75"
+    assert handed(1.0, 0.996) == "0.01"            # below one cent: the $0.01 floor
+    assert handed(1.0, 1.0) == "0.01"
+    assert handed(float("inf")) == "inf"           # rendered as it always was
+
+
 # ── a cap that cannot be shown to reach the CLI refuses the launch ───────────────
 
 

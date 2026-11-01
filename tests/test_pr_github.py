@@ -17,9 +17,9 @@ Three families of test live here:
   bind the branch they publish, not HEAD; the review gate in front of them
   binds that branch too, requires it to have BEEN the commit it froze, and
   still binds HEAD, which its own gates read. A force-push retry that would
-  orphan remote commits — judged on the branch it pushes and the
-  remote-tracking ref its lease is held on — is refused, and that retry runs
-  confined to the worktree exactly like the plain push.
+  orphan remote commits — judged on the branch it pushes and the commit the
+  remote-tracking ref names, which its lease is anchored to — is refused, and
+  that retry runs confined to the worktree exactly like the plain push.
 """
 from __future__ import annotations
 
@@ -38,6 +38,11 @@ from harness.pipeline.pr import GitHubPR, LocalBranchPR, head_bound_to_review
 
 def _cp(argv, rc=0, out="", err=""):
     return subprocess.CompletedProcess(list(argv), rc, out, err)
+
+
+#: The refspec every harness push of ``agent/t1`` names: in full and unforced,
+#: so git consults neither ``remote.origin.push`` nor ``push.default``.
+_REFSPEC = "refs/heads/agent/t1:refs/heads/agent/t1"
 
 
 class _Gh:
@@ -316,17 +321,20 @@ def test_version_parser_handles_all_three_cli_shapes():
 
 
 def test_go_floor_knows_about_both_live_release_branches():
-    """1.27.0 is NEWER than 1.26.9 yet misses the GO-2026-6601/6602 fix — a
-    single `>=` against one floor would green-light it — and 1.25 is
-    end-of-life: never fixed, so no 1.25.x passes."""
+    """1.27.2 is NEWER than 1.26.10 yet misses the GO-2026-6809 fix (1.27.0 and
+    1.27.1 the GO-2026-6601/6602 one as well) — a single `>=` against one floor
+    would green-light it — and 1.25 is end-of-life: never fixed, so no 1.25.x
+    passes."""
     from harness.config import _meets_floor
 
-    assert _meets_floor("go", (1, 26, 9))
+    assert _meets_floor("go", (1, 26, 10))
+    assert not _meets_floor("go", (1, 26, 9))
     assert not _meets_floor("go", (1, 26, 8))
     assert not _meets_floor("go", (1, 26, 3))
     assert not _meets_floor("go", (1, 27, 0))
     assert not _meets_floor("go", (1, 27, 1))
-    assert _meets_floor("go", (1, 27, 2))
+    assert not _meets_floor("go", (1, 27, 2))
+    assert _meets_floor("go", (1, 27, 3))
     assert _meets_floor("go", (1, 28, 0))
     assert not _meets_floor("go", (1, 25, 10))
     assert not _meets_floor("go", (1, 25, 14))
@@ -404,7 +412,7 @@ def test_status_prints_the_detected_vs_required_pair(monkeypatch, capsys):
     monkeypatch.setattr(config, "_probe_version_text",
                         lambda name, cli_bin: {
                             "gh": "gh version 2.40.0 (2024-01-01)",
-                            "go": "go version go1.26.9 linux/amd64",
+                            "go": "go version go1.26.10 linux/amd64",
                         }.get(name, ""))
     config.tool_version.cache_clear()
     try:
@@ -413,7 +421,7 @@ def test_status_prints_the_detected_vs_required_pair(monkeypatch, capsys):
         config.tool_version.cache_clear()
     out = capsys.readouterr().out
     assert "2.40.0 (require >= 2.97.0)" in out          # installed, too old
-    assert "1.26.9 (require >= 1.26.9 / 1.27.2)" in out  # installed, fine: both branches
+    assert "1.26.10 (require >= 1.26.10 / 1.27.3)" in out  # installed, fine: both branches
 
 
 def test_the_outdated_warning_is_emitted_once_per_process(monkeypatch, caplog):
@@ -478,18 +486,27 @@ def test_github_pr_refuses_to_push_a_diverged_head(gh, tmp_path, monkeypatch):
     assert not gh.argv_for("pr", "create")
 
 
+def _tracking_ref_reads(monkeypatch, answer: tuple[str, str]) -> list[str]:
+    """``gitutil.tracking_ref_tip`` answering *answer*; returns the refs it was asked."""
+    read: list[str] = []
+    monkeypatch.setattr(gitutil, "tracking_ref_tip",
+                        lambda cwd, ref: read.append(ref) or answer)
+    return read
+
+
 def test_force_push_retry_is_refused_when_it_would_orphan_remote_commits(monkeypatch, tmp_path):
-    """A BARE lease only refuses advances our remote-tracking ref has not seen;
-    if it is already current the lease passes and remote-only commits vanish.
-    unlanded_by_patch_id is the question the lease cannot ask — about the
-    branch the retry pushes, against the remote-tracking ref its lease is held
-    on, both spelled in full (real repositories: the retry tests below)."""
+    """A lease only refuses advances our remote-tracking ref has not seen; if
+    it is already current the lease passes and remote-only commits vanish.
+    clobber_check is the question the lease cannot ask — about the branch the
+    retry pushes, against the commit the remote-tracking ref names (read in
+    full, once), which its lease is anchored to (real repositories: the retry
+    tests below and tests/test_clobber_check.py)."""
     pushed, asked = [], []
     monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "local1")
-    monkeypatch.setattr(gitutil, "ref_exists", lambda cwd, ref: True)
-    monkeypatch.setattr(gitutil, "unlanded_by_patch_id",
+    read = _tracking_ref_reads(monkeypatch, ("remote0", ""))
+    monkeypatch.setattr(gitutil, "clobber_check",
                         lambda cwd, new_head, remote: asked.append((new_head, remote))
-                        or ["remote1aaa", "remote2bbb"])
+                        or gitutil.ClobberCheck(unlanded=("remote1aaa", "remote2bbb")))
     monkeypatch.setattr(gitutil, "force_push_with_lease",
                         lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
 
@@ -498,46 +515,150 @@ def test_force_push_retry_is_refused_when_it_would_orphan_remote_commits(monkeyp
 
     assert not res.ok and not pushed, "must not force-push over unlanded work"
     assert "remote1aaa" in res.err and "remote2bbb" in res.err
-    assert asked == [("local1", "refs/remotes/origin/agent/t1")]
+    assert read == ["refs/remotes/origin/agent/t1"]
+    assert asked == [("local1", "remote0")]
 
 
 def test_force_push_retry_proceeds_when_nothing_would_be_orphaned(monkeypatch, tmp_path):
+    """…and then the lease is anchored to the very commit the check validated:
+    a fetch landing in between cannot move what the push is leased on."""
     pushed, asked = [], []
     monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "local1")
-    monkeypatch.setattr(gitutil, "ref_exists", lambda cwd, ref: True)
-    monkeypatch.setattr(gitutil, "unlanded_by_patch_id",
-                        lambda cwd, new_head, remote: asked.append((new_head, remote)) or [])
+    _tracking_ref_reads(monkeypatch, ("remote0", ""))
+    monkeypatch.setattr(gitutil, "clobber_check",
+                        lambda cwd, new_head, remote: asked.append((new_head, remote))
+                        or gitutil.ClobberCheck())
     monkeypatch.setattr(gitutil, "force_push_with_lease",
                         lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
 
     rejected = gitutil.GitResult(1, "", "! [rejected] (non-fast-forward)")
     assert GitHubPR._safe_repush(tmp_path, "agent/t1", rejected).ok
-    assert asked == [("local1", "refs/remotes/origin/agent/t1")]
-    assert pushed and pushed[0][3] == "", "still a BARE lease, still no fetch"
+    assert asked == [("local1", "remote0")]
+    assert pushed == [(tmp_path, "origin", "agent/t1", "remote0")], \
+        "anchored to the checked remote commit, still no fetch"
 
 
 def test_patch_id_check_is_skipped_when_there_is_no_remote_tracking_ref(monkeypatch, tmp_path):
-    """No observed remote state ⇒ nothing to compare; the bare lease (and git's
-    own refusal) remains the protection rather than a manufactured abort."""
-    pushed, asked, probed = [], [], []
+    """No observed remote state (git says the ref does not resolve) ⇒ nothing to
+    compare. The retry's lease then expects the remote branch to be ABSENT
+    (``--force-with-lease=refs/heads/<branch>:``, an empty expected value), so
+    git refuses it wherever that branch exists — never the bare lease, which
+    git checks against whatever tracking ref its own fetch refspec maps the
+    branch to (real repositories: tests/test_expect_absent_lease.py). Confined
+    like the plain push, the refspec in full and unforced (it goes through
+    gitutil.force_push_with_lease with no expected SHA), and still no fetch."""
+    leased, ran, asked = [], [], []
     monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "local1")
-    monkeypatch.setattr(gitutil, "ref_exists", lambda cwd, ref: probed.append(ref) or False)
-    monkeypatch.setattr(gitutil, "unlanded_by_patch_id",
-                        lambda cwd, new_head, remote: asked.append(remote) or ["x"])
+    probed = _tracking_ref_reads(monkeypatch, ("", ""))
+    monkeypatch.setattr(gitutil, "clobber_check",
+                        lambda cwd, new_head, remote: asked.append(remote)
+                        or gitutil.ClobberCheck(unlanded=("x",)))
+    real_lease = gitutil.force_push_with_lease
     monkeypatch.setattr(gitutil, "force_push_with_lease",
-                        lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
+                        lambda *a, **kw: leased.append(a) or real_lease(*a, **kw))
+    monkeypatch.setattr(gitutil, "git",
+                        lambda args, **kw: ran.append((list(args), kw))
+                        or gitutil.GitResult(0, "", ""))
 
     rejected = gitutil.GitResult(1, "", "! [rejected] (fetch first)")
     assert GitHubPR._safe_repush(tmp_path, "agent/t1", rejected).ok
     assert probed == ["refs/remotes/origin/agent/t1"]
-    assert pushed and not asked
+    assert not asked
+    assert leased == [(tmp_path, "origin", "agent/t1", "")]
+    assert [args for args, _kw in ran] == [
+        ["push", "--force-with-lease=refs/heads/agent/t1:", "origin", _REFSPEC]]
+    [(_args, kw)] = ran
+    assert kw["cwd"] == tmp_path and kw["confine"] is True
+
+
+def test_force_push_retry_is_refused_when_the_tracking_ref_cannot_be_read(monkeypatch,
+                                                                         tmp_path):
+    """A read that FAILED is not an absent ref: it used to skip the check and
+    retry on the bare lease alone — held on a ref that may well be current."""
+    pushed, asked = [], []
+    monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "local1")
+    _tracking_ref_reads(monkeypatch, ("", ("`git rev-parse --verify refs/remotes/origin/"
+                                           "agent/t1` failed (exit 128): fatal: simulated")))
+    monkeypatch.setattr(gitutil, "clobber_check",
+                        lambda cwd, new_head, remote: asked.append(remote)
+                        or gitutil.ClobberCheck())
+    monkeypatch.setattr(gitutil, "force_push_with_lease",
+                        lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
+
+    rejected = gitutil.GitResult(1, "", "! [rejected] (non-fast-forward)")
+    res = GitHubPR._safe_repush(tmp_path, "agent/t1", rejected)
+
+    assert not res.ok and not pushed and not asked
+    assert ("refusing --force-with-lease retry: cannot tell whether it would clobber "
+            "commits on refs/remotes/origin/agent/t1 — `git rev-parse --verify "
+            "refs/remotes/origin/agent/t1` failed (exit 128): fatal: simulated. "
+            "Inspect refs/remotes/origin/agent/t1 and push by hand.") in res.err
+
+
+def test_force_push_retry_is_refused_when_the_branch_tip_cannot_be_read(monkeypatch,
+                                                                       tmp_path):
+    pushed, asked = [], []
+    monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "")
+    _tracking_ref_reads(monkeypatch, ("remote0", ""))
+    monkeypatch.setattr(gitutil, "clobber_check",
+                        lambda cwd, new_head, remote: asked.append(remote)
+                        or gitutil.ClobberCheck())
+    monkeypatch.setattr(gitutil, "force_push_with_lease",
+                        lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
+
+    rejected = gitutil.GitResult(1, "", "! [rejected] (non-fast-forward)")
+    res = GitHubPR._safe_repush(tmp_path, "agent/t1", rejected)
+
+    assert not res.ok and not pushed and not asked
+    assert ("cannot tell whether it would clobber commits on refs/remotes/origin/"
+            "agent/t1 — refs/heads/agent/t1, the branch the retry would push, "
+            "cannot be read.") in res.err
+
+
+@pytest.mark.parametrize(("code", "remedy"), [
+    (128, "Inspect refs/remotes/origin/agent/t1 and push by hand."),
+    (129, "Inspect refs/remotes/origin/agent/t1 and push by hand, or upgrade git."),
+], ids=["git-failed", "git-without-verbatim-patch-ids"])
+def test_force_push_retry_is_refused_when_the_clobber_check_cannot_run(monkeypatch, tmp_path,
+                                                                      code, remedy):
+    """Unknown is never a proof: a check that could not run used to come back
+    as no output, which read as "nothing would be orphaned"."""
+    pushed = []
+    monkeypatch.setattr(gitutil, "branch_tip", lambda cwd, branch: "local1")
+    _tracking_ref_reads(monkeypatch, ("remote0", ""))
+    monkeypatch.setattr(gitutil, "clobber_check", lambda cwd, new_head, remote:
+                        gitutil.ClobberCheck(error="git said no", git_code=code))
+    monkeypatch.setattr(gitutil, "force_push_with_lease",
+                        lambda *a, **kw: pushed.append(a) or gitutil.GitResult(0, "", ""))
+
+    rejected = gitutil.GitResult(1, "", "! [rejected] (non-fast-forward)")
+    res = GitHubPR._safe_repush(tmp_path, "agent/t1", rejected)
+
+    assert not res.ok and not pushed
+    assert ("refusing --force-with-lease retry: cannot tell whether it would clobber "
+            "commits on refs/remotes/origin/agent/t1 — git said no. ") in res.err
+    assert remedy in res.err and "(non-fast-forward)" in res.err
 
 
 # ── end-to-end: the review verdict is bound to a commit ─────────────────────
 
+# The fixtures' own git, pinned against the run's global config: the suite
+# also runs under a hostile one (see tests/test_publication_guards.py), which
+# proves HARNESS's calls survive it and must not rewrite the repositories the
+# tests build. Unpinned, core.ignoreStat=true made every entry these helpers'
+# `git add` wrote assume-unchanged, so a test's later edit to a tracked file
+# never reached its `git add -A` / `git commit` and the scenario was never set
+# up. Only the fixtures are pinned: harness's calls still face the run's config.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never")
+
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
+                          capture_output=True, text=True, check=False)
 
 
 def _ok(args, cwd) -> str:
@@ -1010,6 +1131,7 @@ def test_the_lease_guarded_retry_push_runs_confined_like_the_plain_push(tmp_path
     origin = _origin(tmp_path, repo)
     _commit_file(wt, "a.py", "a = 1\n", "first take")
     _ok(["push", "-q", "-u", "origin", "agent/t1"], wt)    # an earlier run published it
+    first = _ok(["rev-parse", "refs/remotes/origin/agent/t1"], wt)
     _ok(["commit", "-q", "--amend", "-m", "the reviewed take"], wt)
     reviewed = _ok(["rev-parse", "HEAD"], wt)
     _fake, ran = _gh_over_real_git(monkeypatch)
@@ -1019,8 +1141,9 @@ def test_the_lease_guarded_retry_push_runs_confined_like_the_plain_push(tmp_path
 
     pushes = [(argv[1:], env, rc) for argv, env, rc in ran if argv[1:2] == ["push"]]
     assert [(argv, rc == 0) for argv, _env, rc in pushes] == [
-        (["push", "-u", "origin", "agent/t1"], False),                # rejected…
-        (["push", "--force-with-lease", "origin", "agent/t1"], True),  # …retried
+        (["push", "-u", "origin", _REFSPEC], False),                  # rejected…
+        # …retried, leased on the remote commit the clobber check validated
+        (["push", f"--force-with-lease=agent/t1:{first}", "origin", _REFSPEC], True),
     ]
     plain, retry = (env.get("GIT_CEILING_DIRECTORIES") for _argv, env, _rc in pushes)
     assert plain and plain.split(os.pathsep)[0] == str(wt.resolve().parent)
@@ -1035,7 +1158,9 @@ def test_a_marker_lost_after_the_proof_cannot_send_the_retry_to_an_enclosing_rep
     """The ceiling alone, as for the destructive helpers: the proof passed, then
     the marker vanished. Unconfined, the retry resolved the repository that
     encloses the worktree and force-pushed THAT repository's same-named branch
-    to its own origin."""
+    to its own origin. The retry here is the expect-absent one (no expected
+    SHA: ``--force-with-lease=refs/heads/agent/t1:``) — the outer origin lacks
+    the branch, so unconfined that lease would have let it through."""
     outer = tmp_path / "outer"                            # the enclosing repository
     outer.mkdir()
     _ok(["init", "-q", "-b", "main"], outer)
@@ -1064,12 +1189,38 @@ def test_a_marker_lost_after_the_proof_cannot_send_the_retry_to_an_enclosing_rep
     assert _git(["ls-remote", str(outer_origin)], tmp_path).stdout == ""
 
 
+@pytest.mark.parametrize("expected", ["", "0123456789abcdef0123456789abcdef01234567"],
+                         ids=["expect-absent", "anchored"])
+def test_force_push_with_lease_never_pushes_on_a_bare_lease(monkeypatch, tmp_path,
+                                                            expected):
+    """harness never pushes on a bare ``--force-with-lease``: git checks that
+    against whatever remote-tracking ref the fetch refspec maps the branch to.
+    No expected SHA is the expect-absent lease
+    (``--force-with-lease=refs/heads/<branch>:``), refused wherever the remote
+    branch exists; a SHA anchors the lease to it. Either way the refspec is
+    named in full and unforced — no ``remote.origin.push`` mapping can turn
+    the push into a forced one — and the push is confined to the worktree."""
+    ran = []
+    monkeypatch.setattr(gitutil, "git", lambda args, **kw: ran.append((list(args), kw))
+                        or gitutil.GitResult(0, "", ""))
+
+    assert gitutil.force_push_with_lease(tmp_path, "origin", "agent/t1", expected).ok
+
+    lease = (f"--force-with-lease=agent/t1:{expected}" if expected
+             else "--force-with-lease=refs/heads/agent/t1:")
+    [(args, kw)] = ran
+    assert args == ["push", lease, "origin", _REFSPEC]
+    assert "--force-with-lease" not in args and "--force" not in args
+    assert not any(arg.startswith("+") for arg in args)
+    assert kw["cwd"] == tmp_path and kw["confine"] is True and kw["timeout"] == 300
+
+
 # ── the retry's clobber check reads the refs the retry involves ─────────────
 
 
 def _rerun_over_a_remote_fixup(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     """An earlier run pushed ``agent/t1``; someone pushed a fixup onto it, and
-    the worktree fetched it — so the bare lease, held on a current
+    the worktree fetched it — so the lease, anchored to a current
     remote-tracking ref, lets a force-push through and the patch-id check is
     all that stands in the way. The re-run then amended the branch: that
     commit is what the review judged. Returns ``repo, wt, origin, shas``."""
@@ -1112,9 +1263,9 @@ def _head_on_the_branch(wt: Path, sha: dict[str, str]) -> None:
                               "tag-named-like-the-tracking-ref", "control-head-on-the-branch"])
 def test_the_retry_never_force_pushes_away_a_commit_the_branch_lacks(tmp_path, monkeypatch,
                                                                      shape):
-    """The retry force-pushes ``refs/heads/agent/t1`` under a bare lease held on
-    ``refs/remotes/origin/agent/t1``, so its patch-id check must compare exactly
-    those two refs. It compared HEAD with the short ``origin/agent/t1``: a HEAD
+    """The retry force-pushes ``refs/heads/agent/t1`` under a lease anchored to
+    what ``refs/remotes/origin/agent/t1`` names, so its patch-id check must
+    compare exactly those two. It compared HEAD with the short ``origin/agent/t1``: a HEAD
     detached on the fetched tip or carrying the fixup's patch, or a tag of that
     name on the reviewed commit, read as "nothing would be orphaned", and the
     fixup was force-pushed off the remote. The branch binding lets all three
@@ -1123,8 +1274,8 @@ def test_the_retry_never_force_pushes_away_a_commit_the_branch_lacks(tmp_path, m
     shape(wt, sha)
     # The premise, so no shape can rot into a vacuous pass: read the old way,
     # only the control found the fixup it would orphan.
-    old = gitutil.unlanded_by_patch_id(wt, gitutil.head_sha(wt), "origin/agent/t1")
-    assert old == ([sha["fixup"]] if shape is _head_on_the_branch else []), old
+    old = gitutil.clobber_check(wt, gitutil.head_sha(wt), "origin/agent/t1")
+    assert old.unlanded == ((sha["fixup"],) if shape is _head_on_the_branch else ()), old
     fake, ran = _gh_over_real_git(monkeypatch)
 
     res = GitHubPR().open(repo=repo, worktree=wt, branch="agent/t1", base="main",
@@ -1135,7 +1286,7 @@ def test_the_retry_never_force_pushes_away_a_commit_the_branch_lacks(tmp_path, m
     assert f"refs/remotes/origin/agent/t1 ({sha['fixup'][:12]})" in res.detail
     assert f"refs/heads/agent/t1 ({sha['reviewed'][:12]})" in res.detail
     pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [["push", "-u", "origin", "agent/t1"]]       # no retry ran
+    assert pushes == [["push", "-u", "origin", _REFSPEC]]         # no retry ran
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == sha["fixup"]
     assert not fake.argv_for("pr", "create")
 
@@ -1154,8 +1305,8 @@ def test_the_retry_of_an_amended_rerun_does_not_depend_on_where_head_is(tmp_path
     reviewed = _ok(["rev-parse", "HEAD"], wt)
     _ok(["checkout", "-q", "--detach", "main"], wt)
     first = _ok(["rev-parse", "refs/remotes/origin/agent/t1"], wt)
-    assert gitutil.unlanded_by_patch_id(wt, gitutil.head_sha(wt),     # the premise
-                                        "origin/agent/t1") == [first]
+    assert gitutil.clobber_check(wt, gitutil.head_sha(wt),            # the premise
+                                 "origin/agent/t1").unlanded == (first,)
     _fake, ran = _gh_over_real_git(monkeypatch)
 
     res = GitHubPR().open(repo=repo, worktree=wt, branch="agent/t1", base="main",
@@ -1163,9 +1314,179 @@ def test_the_retry_of_an_amended_rerun_does_not_depend_on_where_head_is(tmp_path
 
     assert res.ok and res.url == "https://github.com/o/r/pull/7", res.detail
     pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
-    assert pushes == [(["push", "-u", "origin", "agent/t1"], False),        # rejected…
-                      (["push", "--force-with-lease", "origin", "agent/t1"], True)]
+    assert pushes == [(["push", "-u", "origin", _REFSPEC], False),          # rejected…
+                      (["push", f"--force-with-lease=agent/t1:{first}", "origin",
+                        _REFSPEC], True)]
     assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == reviewed
+
+
+def test_a_republish_never_force_pushes_away_a_reviewers_whitespace_amend(tmp_path,
+                                                                          monkeypatch):
+    """The whole publisher, end to end: a ``requeue --force``d task re-runs on
+    its branch and re-publishes it, after a reviewer amended the published
+    commit — a YAML dedent, whitespace only — and the agent's own ``git
+    fetch`` (``Bash(git:*)``) refreshed the ref the lease is read from.
+    The branch binding passes (the branch IS the reviewed commit); git's
+    internal patch-id called the reviewer's commit replayed and the PR opened
+    over a silent revert of the fix. Refused now, and no PR is opened."""
+    repo, wt = _task_worktree(tmp_path)
+    origin = _origin(tmp_path, repo)
+    _commit_file(wt, "cfg.yaml", "svc:\n  port: 80\n", "first take")
+    _ok(["push", "-q", "-u", "origin", "agent/t1"], wt)
+    other = tmp_path / "reviewer"
+    _ok(["clone", "-q", "-b", "agent/t1", str(origin), str(other)], tmp_path)
+    _ok(["config", "user.email", "h@h"], other)
+    _ok(["config", "user.name", "h"], other)
+    (other / "cfg.yaml").write_text("svc:\nport: 80\n")
+    _ok(["commit", "-q", "--amend", "-am", "first take (reviewer's YAML fix)"], other)
+    fix = _ok(["rev-parse", "HEAD"], other)
+    _ok(["push", "-q", "--force", "origin", "agent/t1"], other)
+    _ok(["fetch", "-q", "origin"], wt)                         # the agent's own fetch
+    reviewed = _commit_file(wt, "README.md", "# repo, re-run\n", "the re-run's work")
+    fake, ran = _gh_over_real_git(monkeypatch)
+
+    res = GitHubPR().open(repo=repo, worktree=wt, branch="agent/t1", base="main",
+                          title="Do the thing [t1]", body="b\n", reviewed_sha=reviewed)
+
+    assert not res.ok and "refusing --force-with-lease retry" in res.detail, res.detail
+    assert f"refs/remotes/origin/agent/t1 ({fix[:12]})" in res.detail
+    assert "whitespace-exact" in res.detail
+    pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
+    assert pushes == [["push", "-u", "origin", _REFSPEC]]         # no retry ran
+    assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == fix
+    assert not fake.argv_for("pr", "create")
+
+
+# ── a push mapping in the repository's config never reshapes harness's push ──
+#
+# remote.origin.push and push.default sit in the repository's config — the
+# shared common dir, which an agent can write — and apply to a colon-less
+# refspec only. git mapped harness's `git push -u origin <branch>` through
+# them: a FORCED mapping (+refs/heads/*:refs/heads/*) made the plain push and
+# both lease-guarded retries forced pushes (force overrides a lease), and an
+# unforced one sent the push to another ref — under push.default=upstream with
+# the branch's upstream naming main, onto origin's main. Every harness push
+# names refs/heads/<branch>:refs/heads/<branch> itself now.
+
+_FORCED_PUSH_REFSPEC = "+refs/heads/*:refs/heads/*"
+
+
+def _forced_by_the_config(wt: Path) -> bool:
+    """The premise, so no test rots into a vacuous pass: a colon-less push of
+    ``agent/t1`` from *wt* would go out as a forced update."""
+    dry = _ok(["push", "--dry-run", "--porcelain", "origin", "agent/t1"], wt)
+    return any(line.startswith("+\t") for line in dry.splitlines())
+
+
+def _reviewer_pushes_a_fix(tmp_path: Path, origin: Path) -> str:
+    """A reviewer's clone commits a value fix onto the published ``agent/t1``
+    and pushes it. Returns the reviewer's commit."""
+    other = tmp_path / "reviewer"
+    _ok(["clone", "-q", "-b", "agent/t1", str(origin), str(other)], tmp_path)
+    _ok(["config", "user.email", "h@h"], other)
+    _ok(["config", "user.name", "h"], other)
+    fix = _commit_file(other, "cfg.yaml", "svc:\n  port: 81\n", "the reviewer's fix")
+    _ok(["push", "-q", "origin", "agent/t1"], other)
+    return fix
+
+
+def test_a_forced_push_refspec_cannot_make_the_plain_push_overwrite_a_reviewers_commit(
+        tmp_path, monkeypatch):
+    """A reviewer pushed a fix onto the published branch, the agent's own fetch
+    recorded it, and the repository's config carries a forced push mapping.
+    PRE-FIX the colon-less plain push went out as a forced update: the
+    reviewer's commit was overwritten before any retry, clobber check or lease
+    ran, and the PR opened. Now the plain push is rejected, the clobber check
+    finds the reviewer's commit the branch does not replay, and the retry is
+    refused: the commit survives and no PR is opened."""
+    repo, wt = _task_worktree(tmp_path)
+    origin = _origin(tmp_path, repo)
+    _commit_file(wt, "cfg.yaml", "svc:\n  port: 80\n", "first take")
+    _ok(["push", "-q", "-u", "origin", "agent/t1"], wt)
+    fix = _reviewer_pushes_a_fix(tmp_path, origin)
+    _ok(["fetch", "-q", "origin"], wt)                         # the agent's own fetch
+    reviewed = _commit_file(wt, "README.md", "# repo, re-run\n", "the re-run's work")
+    _ok(["config", "--add", "remote.origin.push", _FORCED_PUSH_REFSPEC], repo)
+    assert _forced_by_the_config(wt)
+    fake, ran = _gh_over_real_git(monkeypatch)
+
+    res = GitHubPR().open(repo=repo, worktree=wt, branch="agent/t1", base="main",
+                          title="Do the thing [t1]", body="b\n", reviewed_sha=reviewed)
+
+    assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == fix
+    assert not res.ok and "refusing --force-with-lease retry" in res.detail, res.detail
+    assert f"refs/remotes/origin/agent/t1 ({fix[:12]})" in res.detail
+    pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
+    assert pushes == [(["push", "-u", "origin", _REFSPEC], False)]   # no retry ran
+    assert not fake.argv_for("pr", "create")
+
+
+def test_a_forced_push_refspec_cannot_force_the_anchored_retry_past_its_lease(
+        tmp_path, monkeypatch):
+    """The lease-guarded retry under the same config. This worktree never
+    fetched the reviewer's commit, so the clobber check — against the commit
+    the stale tracking ref names — finds nothing the branch would drop, and the
+    retry goes out leased on that commit. git refuses the stale lease ("stale
+    info"); PRE-FIX the forced mapping turned the retry into a forced push,
+    which no lease holds, and the reviewer's commit was overwritten."""
+    repo, wt = _task_worktree(tmp_path)
+    origin = _origin(tmp_path, repo)
+    first = _commit_file(wt, "cfg.yaml", "svc:\n  port: 80\n", "first take")
+    _ok(["push", "-q", "-u", "origin", "agent/t1"], wt)
+    fix = _reviewer_pushes_a_fix(tmp_path, origin)
+    _commit_file(wt, "README.md", "# repo, re-run\n", "the re-run's work")
+    _ok(["config", "--add", "remote.origin.push", _FORCED_PUSH_REFSPEC], repo)
+    assert _forced_by_the_config(wt)
+    assert _ok(["rev-parse", "refs/remotes/origin/agent/t1"], wt) == first   # stale
+    rejected = gitutil.git(["push", "-u", "origin", _REFSPEC], cwd=wt, timeout=60,
+                           confine=True)
+    assert not rejected.ok and "rejected" in rejected.err, rejected
+    _fake, ran = _gh_over_real_git(monkeypatch)
+
+    res = GitHubPR._safe_repush(wt, "agent/t1", rejected)
+
+    assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == fix
+    assert not res.ok and "stale info" in res.err, res
+    pushes = [argv[1:] for argv, _env, _rc in ran if argv[1:2] == ["push"]]
+    assert pushes == [["push", f"--force-with-lease=agent/t1:{first}", "origin", _REFSPEC]]
+
+
+@pytest.mark.parametrize("mapping", [
+    {"remote.origin.push": _FORCED_PUSH_REFSPEC},
+    {"remote.origin.push": "refs/heads/*:refs/heads/elsewhere/*"},
+    {"push.default": "upstream", "branch.agent/t1.remote": "origin",
+     "branch.agent/t1.merge": "refs/heads/main"},
+], ids=["forced-mapping", "redirecting-mapping", "push-default-upstream-naming-main"])
+def test_a_push_mapping_in_the_config_never_redirects_the_publish(tmp_path, monkeypatch,
+                                                                  mapping):
+    """Nothing on the remote to overwrite: the plain push publishes
+    refs/heads/agent/t1 itself, whatever the repository's config maps a
+    colon-less refspec to, and ``-u`` still records origin/agent/t1 as its
+    upstream. PRE-FIX an unforced mapping published refs/heads/elsewhere/agent/t1
+    instead, and push.default=upstream with the branch's upstream naming main
+    fast-forwarded origin's main with the task's work — no PR between it and
+    the base. (Under the forced mapping a new branch was published either way.)"""
+    repo, wt = _task_worktree(tmp_path)
+    origin = _origin(tmp_path, repo)
+    _ok(["push", "-q", "origin", "main"], repo)
+    base = _ok(["rev-parse", "refs/heads/main"], origin)
+    reviewed = _commit_file(wt, "a.py", "a = 1\n", "the reviewed commit")
+    for key, value in mapping.items():
+        _ok(["config", "--add", key, value], repo)
+    fake, ran = _gh_over_real_git(monkeypatch)
+
+    res = GitHubPR().open(repo=repo, worktree=wt, branch="agent/t1", base="main",
+                          title="Do the thing [t1]", body="b\n", reviewed_sha=reviewed)
+
+    assert _ok(["rev-parse", "refs/heads/main"], origin) == base        # main untouched
+    assert _git(["for-each-ref", "refs/heads/elsewhere/"], origin).stdout == ""
+    assert _ok(["rev-parse", "refs/heads/agent/t1"], origin) == reviewed
+    assert res.ok and res.url == "https://github.com/o/r/pull/7", res.detail
+    assert _ok(["rev-parse", "--symbolic-full-name", "agent/t1@{upstream}"], wt) == (
+        "refs/remotes/origin/agent/t1")
+    pushes = [(argv[1:], rc == 0) for argv, _env, rc in ran if argv[1:2] == ["push"]]
+    assert pushes == [(["push", "-u", "origin", _REFSPEC], True)]
+    assert fake.argv_for("pr", "create")
 
 
 # ── classifier: dated permanent-failure bodies (retrying cannot help) ────────

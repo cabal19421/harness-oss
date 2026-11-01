@@ -1,4 +1,4 @@
-"""The agent-cli backend's Gemini CLI flag family: detection, argv, rules, env.
+"""The agent-cli backend's Gemini CLI flag family: detection, argv, rules, env, caps.
 
 The Gemini CLI stand-in below is written to the test's tmp_path and launched
 for real: its ``--help``, a strict argument parser that takes only the flags
@@ -81,7 +81,8 @@ _FAKE_GEMINI = r'''#!{python} -I
 """A stand-in Gemini CLI 0.64.0: its --help, a strict argument parser, its
 folder-trust gate, its JSON envelope on stdout, its error object on stderr and
 its exit codes. Its behaviour is read from its own state directory; every launch
-the parser accepts is recorded there."""
+the parser accepts is recorded there, and a mode with a `<mode>.hold` file there
+leaves a process holding its stdout past its exit."""
 import json, os, re, sys
 state = {state}
 def read(name, default=""):
@@ -181,6 +182,15 @@ if (os.environ.get("GEMINI_RESTRICTED_MODE") == "true"
                      "`GEMINI_CLI_TRUST_WORKSPACE=true` environment variable, or trust "
                      "this directory in interactive mode.\x1b[0m\n")
     sys.exit(55)
+if os.path.exists(os.path.join(state, mode + ".hold")):
+    # A process the call leaves behind, cwd'd in the worktree, in a session of
+    # its own and holding the CLI's stdout past its exit.
+    import subprocess
+    kid = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"],
+                           start_new_session=True, stdin=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+    with open(os.path.join(state, "leftovers.pid"), "a", encoding="utf-8") as fh:
+        fh.write("%d\n" % kid.pid)
 if mode == "ok":
     sys.stdout.write(read("envelope.json")); sys.exit(0)
 if mode == "quiet":
@@ -289,6 +299,10 @@ class StandIn:
     def reject(self, spec: str) -> None:
         (self.state / "reject").write_text(spec, encoding="utf-8")
 
+    def hold(self, name: str) -> None:
+        """Mode *name* leaves a process holding the CLI's stdout past its exit."""
+        (self.state / f"{name}.hold").write_text("", encoding="utf-8")
+
     def accepts(self, help_text: str) -> None:
         """Take the flags *help_text* lists, whatever ``--help`` prints."""
         (self.state / "accepts").write_text(help_text, encoding="utf-8")
@@ -299,6 +313,13 @@ class StandIn:
             return []
         return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines()
                 if line.strip()]
+
+    def leftovers(self) -> list[int]:
+        """The pids of the processes a held mode left behind."""
+        f = self.state / "leftovers.pid"
+        if not f.exists():
+            return []
+        return [int(pid) for pid in f.read_text(encoding="utf-8").split()]
 
     def backend(self) -> ac.AgentCliBackend:
         return ac.AgentCliBackend(cli=self.cli)
@@ -1115,6 +1136,101 @@ def test_a_policy_path_with_a_comma_is_never_passed(gem, tmp_path, caplog):
     assert "--admin-policy" not in launch["argv"]
     assert warnings_matching(caplog, "comma")
     assert not res.ran and res.abstain and "comma" in res.detail
+
+
+# ── per-call caps ───────────────────────────────────────────────────────────────
+
+
+def _help_listing(flag: str) -> str:
+    """Gemini CLI's help with a per-call cap *flag* added, as a fork might list one."""
+    return GEMINI_HELP.replace("  -v, --version",
+                               f"      {flag}  A per-call cap  [number]\n  -v, --version")
+
+
+def test_max_agent_turns_refuses_a_gemini_task_before_any_launch(gem, tmp_path,
+                                                                 monkeypatch):
+    """Gemini CLI takes no per-call turn flag, so a set max_agent_turns would never
+    reach it: the task is refused before anything runs, through the refusal the
+    legacy family's caps use, and the legacy dry run of the CLI's own parser is
+    never asked (it proves nothing on Gemini CLI). PRE-FIX the cap was left out
+    without a word and the agent ran without it. The control: a help that lists
+    --max-turns is handed the cap, and nothing refuses."""
+    asked: list[tuple] = []
+    monkeypatch.setattr(ac, "_cli_takes", lambda *a: asked.append(a) or (True, ""))
+    monkeypatch.setattr(ac, "_cli_parse_probe", lambda *a: asked.append(a) or (1, ""))
+    cli = gem.stand_in()
+    ctx = make_ctx(tmp_path, max_agent_turns=12)
+    backend = cli.backend()
+
+    out = backend.implement(ctx)
+
+    refusal = backend.cap_refusal(ctx.config)
+    assert out.status == "failed" and out.iterations == 0, out.detail
+    assert out.detail == refusal
+    assert refusal.startswith("max_agent_turns (HARNESS_MAX_TURNS) is set, but it has no "
+                              "effect with this CLI: Gemini CLI takes no per-call turn "
+                              "flag"), refusal
+    assert ("the session-turn limit in its settings file (`model.maxSessionTurns`)"
+            in refusal), refusal
+    assert "without the max_agent_turns cap" in refusal
+    assert refusal.endswith("unset max_agent_turns to run without it."), refusal
+    assert cli.launches() == []
+    assert not (ctx.config.state_dir / "gemini").exists()     # no policy file either
+
+    listed = gem.stand_in(help_text=_help_listing("--max-turns"))
+    assert listed.backend().cap_refusal(ctx.config) == ""
+    run = listed.backend()._run_agent(ctx, "")
+    assert run.ok, run.detail
+    [launch] = listed.launches()
+    assert launch["argv"][launch["argv"].index("--max-turns") + 1] == "12"
+    assert asked == []
+
+
+def test_max_cost_usd_on_gemini_cli_is_said_once_per_binary_and_never_refuses(
+        gem, tmp_path, monkeypatch, caplog):
+    """Gemini CLI takes no per-call budget flag, so harness's own cost bound — the
+    estimate it adds up between calls — is the only one, and it cannot see a
+    drifted envelope. That is said at WARNING once per binary, and the call still
+    launches: the Python bound applies as before. PRE-FIX nothing said the
+    CLI-side half of the bound was missing. The controls: a help that lists
+    --max-budget-usd is handed the balance, and nothing is said; and with no
+    max_cost_usd set, nothing is said either."""
+    asked: list[tuple] = []
+    monkeypatch.setattr(ac, "_cli_takes", lambda *a: asked.append(a) or (True, ""))
+    cli = gem.stand_in()
+    other = gem.stand_in(name="gemini-nightly")
+    listed = gem.stand_in(help_text=_help_listing("--max-budget-usd"))
+    ctx = make_ctx(tmp_path, max_cost_usd=5.0)
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        for stand_in in (cli, cli, other, listed):
+            backend = stand_in.backend()
+            assert backend.cap_refusal(ctx.config) == ""
+            run = backend._run_agent(ctx, "", budget=LoopBudget(max_cost_usd=5.0))
+            assert run.ok, run.detail
+
+    said = [r.getMessage() for r in warnings_matching(caplog, "per-call budget flag")]
+    assert len(said) == 2, said
+    assert f"`{cli.cli}`" in said[0] and f"`{other.cli}`" in said[1]
+    assert "harness's own cost bound" in said[0] and "drifted envelope" in said[0]
+    assert len(cli.launches()) == 2 and len(other.launches()) == 1
+    for launch in cli.launches() + other.launches():
+        assert "--max-budget-usd" not in launch["argv"]
+    [handed] = listed.launches()
+    assert handed["argv"][handed["argv"].index("--max-budget-usd") + 1] == "5.00"
+    assert asked == []
+
+    # No cost cap set: nothing to say, with an empty budget or none at all.
+    quiet = gem.stand_in(name="gemini-quiet")
+    bare = make_ctx(tmp_path / "nocap")
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        assert quiet.backend().cap_refusal(bare.config) == ""
+        for budget in (LoopBudget(), None):
+            run = quiet.backend()._run_agent(bare, "", budget=budget)
+            assert run.ok, run.detail
+    assert len(quiet.launches()) == 2
+    assert not [r for r in warnings_matching(caplog, "per-call budget flag")
+                if quiet.cli in r.getMessage()]
 
 
 # ── the legacy family stays byte-for-byte ───────────────────────────────────────

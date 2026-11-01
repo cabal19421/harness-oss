@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from harness.log import fmt_cmd, get_logger, redact, step, trunc
+from harness.log import fmt_cmd, get_logger, redact, redact_home_paths, step, trunc
 
 from . import gitutil
-from .sanitize import _HARNESS_MARKER_RE
+from .sanitize import _HARNESS_MARKER_RE, publication_hazards
 
 logger = get_logger(__name__)
 
@@ -192,6 +194,153 @@ def _unowned_push(worktree: Path, branch: str) -> PrResult | None:
         return None
     detail = (f"refusing to push {branch!r} from {worktree}: it is not provably "
               f"its own repository — {proof.reason}")
+    logger.error("github PR not opened: %s", detail)
+    return PrResult(ok=False, detail=detail)
+
+
+#: The variables that make ``gh`` address a repository or host other than the
+#: one a call is about: ``GH_REPO`` outranks the repository gh finds from the
+#: git remotes of its working directory — for ``pr list`` and ``pr create``
+#: alike — and ``GH_HOST`` picks its default host. Exported for another project
+#: (a direnv ``.envrc`` in the shell's directory while ``--repo`` points
+#: elsewhere), they made harness adopt THAT repository's open PR for the same
+#: branch and task id, overwrite its body and record the task done. The gh half
+#: of :data:`gitutil.REPO_LOCATION_ENV`: a repository is addressed by the
+#: directory a call names. Operator auth (``GH_TOKEN``, ``GITHUB_TOKEN``,
+#: ``GH_ENTERPRISE_TOKEN``) is kept; the only call that names a host passes it
+#: (``gh api --hostname``, :func:`_pull_endpoint`).
+_GH_LOCATION_ENV: tuple[str, ...] = ("GH_REPO", "GH_HOST")
+
+
+def _gh_env() -> dict[str, str]:
+    """The environment of every ``gh`` call harness makes.
+
+    :func:`gitutil.inherited_env` (no repository-location variable for the git
+    gh runs) minus :data:`_GH_LOCATION_ENV`.
+    """
+    return {key: value for key, value in gitutil.inherited_env().items()
+            if key not in _GH_LOCATION_ENV}
+
+
+def _unpublishable_messages(repo: Path, worktree: Path, branch_rev: str,
+                            branch: str) -> PrResult | None:
+    """The refusal to push *branch* for what its commit messages carry, or ``None``.
+
+    harness scrubs the commit messages it writes itself; the agent commits its
+    own work, and those messages are published as written. They are never
+    rewritten here — a rewrite would skip the repository's ``commit-msg`` hook
+    and break the binding to the reviewed commit — so this guard only refuses
+    (report, never take). It reads every commit the push would publish: all
+    that *branch_rev* reaches and no ``refs/remotes/origin/*`` ref reaches
+    (``git log <branch_rev> --not --remotes=origin``). That is more than the
+    task's own commits: a push sends every ancestor origin lacks — the
+    operator's unpushed commits on the base, agent commits merged into the base
+    in local mode, a base ref an agent moved (refs are shared) — and
+    ``<base>..<branch>``, bounded by the LOCAL base, left all of those unread.
+    On current git an unreadable tracking ref refuses the push outright;
+    a git that skips a broken ref instead (older gits with a warning,
+    ``GIT_REF_PARANOIA=0`` on any git) walks a range that ref does not bound —
+    wider, never narrower — so a hazardous commit origin lacks still refuses.
+    Each message is checked with
+    :func:`~harness.pipeline.sanitize.publication_hazards`: terminal control
+    characters or a high-confidence credential shape refuse the push — nothing
+    rewritten, nothing pushed — naming each commit and the kind, never the
+    matched text. A message naming the operator's home or the worktree path is
+    reported in the log and published: prose names paths legitimately.
+    Messages that cannot be read are no proof of clean ones, so that refuses
+    too.
+
+    What origin has is read from the local remote-tracking refs; the guard
+    never contacts the network. History they reach is not read again: it is
+    published already, and must not block every later push for good. With no
+    ``refs/remotes/origin/*`` ref at all (origin never fetched, or a fetch
+    refspec that maps its branches elsewhere) nothing records what origin has,
+    and unknown is never a proof: the branch's whole history is read — once,
+    until a fetch or a push records origin's branches there, and on every push
+    under such a refspec. A tracking ref that names commits the real remote no
+    longer has (its branch deleted or rewound since the last fetch, or a ref
+    written locally) narrows the range: what it reaches is taken as published.
+    So does one that describes another repository: fetches fill the tracking
+    refs from origin's URL, so with ``remote.origin.pushurl`` naming a
+    different repository, history the fetch repository has and the push
+    destination lacks is published unread. Every ``refs/remotes/origin/*`` ref
+    is read, and one git cannot read (garbage in a loose ref, a ref naming an
+    object the repository lacks, a loose ref this user cannot open) fails the
+    walk on current git: every push is refused, with git's own diagnosis, until
+    that ref is repaired or removed — fail closed, so such a ref can only block
+    publication, never widen it. A git that skips the ref instead walks the
+    wider range above. A dangling
+    ``refs/remotes/origin/HEAD`` symref (common after a default-branch rename)
+    is skipped.
+
+    The messages are read as the objects are stored — what a push sends —
+    whatever the repository says, and all of what it says is agent-writable
+    (``refs/replace/*``, ``info/grafts`` and the config sit in the shared common
+    dir). A push sends the real objects, so neither replace refs nor grafts are
+    followed (:data:`gitutil._REAL_HISTORY`): one replace ref put a clean
+    stand-in in front of a hazardous commit, one graft hid it from the range
+    walk. ``--encoding=UTF-8`` outranks ``i18n.logOutputEncoding``, which made an
+    innocent Japanese message read as control characters (ISO-2022-JP's ESC
+    shifts) and turned a real C1 control into an undecodable byte
+    (ISO-8859-1); ``--no-show-signature`` keeps signature checks out of the
+    records (under ``log.showSignature`` gpg's lines landed in a record's SHA
+    field). Decoded losslessly: a hand-made commit's raw bytes are printed
+    unconverted, and a stray C1 byte among them still counts as a control
+    character (:data:`~harness.pipeline.sanitize._RAW_C1_RE`).
+    """
+    why = ""
+    fields: list[str] = []
+    try:
+        # fs_paths: the codec that round-trips every byte (os.fsencode undoes
+        # it exactly), so the bytes git wrote — UTF-8, by --encoding — are
+        # decoded here, with surrogate escapes, whatever the locale is.
+        res = gitutil.git(["log", "--no-show-signature", "--encoding=UTF-8", "-z",
+                           "--format=%H%x00%B", branch_rev, "--not", "--remotes=origin"],
+                          cwd=repo, strip=False, fs_paths=True,
+                          env=gitutil._REAL_HISTORY)
+    except UnicodeError as exc:            # a filesystem codec that cannot carry a byte
+        why = f"its output did not decode ({type(exc).__name__})"
+    else:
+        if not res.ok:
+            # git's own words only: stdout holds message text (raw bytes too).
+            why = f"git log rc={res.code}: {trunc(redact(res.err or 'no error text'), 200)}"
+        else:
+            fields = os.fsencode(res.out).decode("utf-8", "surrogateescape").split("\x00")
+            if fields and fields[-1] == "":
+                fields.pop()              # the terminator after the last record
+            if len(fields) % 2:
+                why = "its output did not parse"
+    if why:
+        detail = (f"refusing to push {branch!r}: the messages of the commits it "
+                  f"would publish could not be read ({why}) — a message that could "
+                  f"not be checked is not published")
+        logger.error("github PR not opened: %s", detail)
+        return PrResult(ok=False, detail=detail)
+    spellings = {str(worktree)}
+    with suppress(OSError, RuntimeError):
+        spellings.add(str(worktree.resolve()))
+    hazards: list[str] = []
+    for sha, message in zip(fields[0::2], fields[1::2], strict=True):
+        found = publication_hazards(message)
+        if found:
+            hazards.append(f"{sha[:12]} ({', '.join(found)})")
+        elif redact_home_paths(message) != message or any(s in message for s in spellings):
+            logger.warning("commit %s on %r names a home or worktree path in its "
+                           "message — published as written (a path in prose is "
+                           "reported, not refused)", sha[:12], branch)
+    if not hazards:
+        return None
+    shown = "; ".join(hazards[:8]) + (f" (+{len(hazards) - 8} more)" if len(hazards) > 8 else "")
+    detail = (f"refusing to push {branch!r}: commit message(s) it would publish "
+              f"carry what harness never publishes as written — {shown}. Nothing "
+              f"was pushed. Read: every commit {branch_rev} reaches that no "
+              f"refs/remotes/origin/* ref reaches — the task's own, and any on its "
+              f"base that origin lacks (one origin already has counts until a fetch "
+              f"records it there). harness does not rewrite commits (that would "
+              f"skip the repository's commit-msg hook and break the binding to the "
+              f"reviewed commit): reword them (git commit --amend for the last one, "
+              f"git rebase -i for older ones), then run the task's review again so "
+              f"it judges the reworded commits")
     logger.error("github PR not opened: %s", detail)
     return PrResult(ok=False, detail=detail)
 
@@ -429,15 +578,29 @@ class GitHubPR(PrCreator):
             logger.warning("github PR not opened: branch %r has no commits "
                            "ahead of %r — nothing to push", branch, base)
             return PrResult(ok=False, detail=f"branch '{branch}' has no commits ahead of '{base}'.")
+        # The agent's own commit messages are published as written, never
+        # rewritten: refused here, BEFORE the push, when one carries what must
+        # not reach the remote.
+        refused = _unpublishable_messages(repo, worktree, branch_rev, branch)
+        if refused is not None:
+            return refused
 
         refused = _unowned_push(worktree, branch)
         if refused is not None:
             return refused
-        logger.debug("%s", fmt_cmd(["git", "push", "-u", "origin", branch],
+        # The refspec in full and unforced, so git consults neither
+        # remote.origin.push nor push.default. A colon-less `<branch>` went
+        # through that mapping, and a FORCED one in the repository's config
+        # (`+refs/heads/*:refs/heads/*`, in the shared common dir an agent can
+        # write) made this plain push a force push: a reviewer's commit was
+        # overwritten before any retry, clobber check or lease ran. `-u` still
+        # records the upstream.
+        refspec = f"refs/heads/{branch}:refs/heads/{branch}"
+        logger.debug("%s", fmt_cmd(["git", "push", "-u", "origin", refspec],
                                    cwd=worktree))
         # Confined like the destructive helpers: a marker lost after the proof
         # above still cannot send the push to an enclosing repository.
-        push = gitutil.git(["push", "-u", "origin", branch], cwd=worktree,
+        push = gitutil.git(["push", "-u", "origin", refspec], cwd=worktree,
                            timeout=300, confine=True)
         if not push.ok:
             logger.warning("push of %r rejected (rc=%d): %s — evaluating safe "
@@ -488,8 +651,10 @@ class GitHubPR(PrCreator):
                     capture_output=True, timeout=120, check=False,
                     # gh runs git in *repo* to find the remote: an inherited
                     # GIT_DIR would hand it another repository's (see
-                    # gitutil.REPO_LOCATION_ENV) — so on every gh call here.
-                    env=gitutil.inherited_env(),
+                    # gitutil.REPO_LOCATION_ENV), and an inherited GH_REPO
+                    # outranks that remote altogether (_GH_LOCATION_ENV) — so
+                    # on every gh call here.
+                    env=_gh_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("gh pr create failed to execute (%s: %s) — PR not "
@@ -522,10 +687,19 @@ class GitHubPR(PrCreator):
 
         A plain ``git push`` is rejected when the remote branch advanced (e.g. the
         pipeline rebased and re-ran). Rather than a blind ``--force`` (which would
-        clobber a concurrent push), use a **bare** ``--force-with-lease``: it
-        leases against our *stored* remote-tracking ref — i.e. the last state we
-        actually observed — so a legitimate replay succeeds while a remote that
-        advanced out-of-band since we last looked is refused.
+        clobber a concurrent push), the retry is a ``--force-with-lease`` anchored
+        to the commit our *stored* remote-tracking ref names — the last state we
+        actually observed, read once — so a legitimate replay succeeds while a
+        remote that advanced out-of-band since we last looked is refused. When
+        ``refs/remotes/origin/<branch>`` does not resolve there is no observed
+        state to anchor to, and the lease expects the remote branch to be ABSENT
+        (``--force-with-lease=refs/heads/<branch>:``, an empty expected value):
+        git refuses it wherever the remote branch exists, whatever the fetch
+        refspec maps that branch to. Both pushes — the plain one and this
+        retry — name their refspec in full and unforced
+        (``refs/heads/<branch>:refs/heads/<branch>``), so a forced
+        ``remote.origin.push`` in the repository's config cannot make either a
+        force push, which would override the lease.
 
         Crucially we do **not** ``git fetch`` first: fetching would update the
         remote-tracking ref to the diverged tip and lease the force-push to *that*,
@@ -533,12 +707,15 @@ class GitHubPR(PrCreator):
         failures (auth, network) are returned unchanged.
 
         The lease is necessary but not sufficient, so it is paired with
-        :func:`gitutil.unlanded_by_patch_id`: any remote commit whose *content*
-        is missing from what the retry would push aborts the retry outright (see
-        below). Both sides of that check are the refs the retry involves, fully
-        qualified — ``refs/heads/<branch>``, which is what it pushes, and
-        ``refs/remotes/origin/<branch>``, which its bare lease is held on — never
-        HEAD, and never the short ``origin/<branch>``.
+        :func:`gitutil.clobber_check`: any remote commit that what the retry
+        would push does not replay byte for byte (``git patch-id --verbatim``)
+        aborts the retry outright, and so does a check that cannot run — a git
+        command failing, a git older than 2.39 with no ``--verbatim``, a
+        remote-tracking ref or a branch tip that cannot be read (see below).
+        Both sides of that check are what the retry involves, fully qualified —
+        ``refs/heads/<branch>``, which is what it pushes, and the commit
+        ``refs/remotes/origin/<branch>`` names, which its lease is anchored to —
+        never HEAD, and never the short ``origin/<branch>``.
         """
         msg = (failed.err or failed.out or "").lower()
         if not any(s in msg for s in ("non-fast-forward", "rejected", "fetch first", "stale info")):
@@ -547,64 +724,124 @@ class GitHubPR(PrCreator):
                          "original failure: %s",
                          branch, trunc(redact(msg), 200))
             return failed
-        # A bare lease alone is not enough. It refuses only advances our stored
+        # A lease alone is not enough. It refuses only advances our stored
         # remote-tracking ref has not observed — so if refs/remotes/origin/<branch>
         # is already current (an earlier push this run, or any concurrent fetch)
         # the lease passes and remote-only commits are dropped silently. Ask the
-        # question the lease cannot: does the remote carry work whose patch-id is
-        # absent from what we are about to push? If so, abort the retry — a
-        # failed push leaves the PR unopened, which is recoverable; clobbering
-        # someone's commits is not.
+        # question the lease cannot: does the remote carry work that what we are
+        # about to push does not replay byte for byte? If so — or if that cannot
+        # be told — abort the retry: a failed push leaves the PR unopened, which
+        # is recoverable; clobbering someone's commits is not. Whitespace-exact,
+        # because whitespace is content: git's own patch-id ignores it, and a
+        # reviewer's YAML dedent or Makefile tab was force-pushed away as
+        # "already replayed".
         #
-        # (Anchoring the lease to our own reviewed SHA would NOT help:
-        # ``--force-with-lease=<ref>:<sha>`` asserts what the REMOTE ref holds,
-        # and the remote can never be at the local commit we are pushing.)
+        # The remote side is read ONCE, to a commit, and the check and the lease
+        # both use that commit. A bare lease re-read the ref at push time, so a
+        # fetch landing between the check and the push (an IDE's autofetch, the
+        # agent's own `git fetch`) leased the push on remote commits the check
+        # never saw, and they were force-pushed away. (Anchoring the lease to our
+        # own LOCAL commit would not help: ``--force-with-lease=<ref>:<sha>``
+        # asserts what the REMOTE ref holds, and the remote can never be at the
+        # commit we are about to push.)
         #
-        # Both sides are the refs the retry involves, spelled in full. The local
+        # Both sides are what the retry involves, spelled in full. The local
         # side is refs/heads/<branch>, what the retry pushes — not HEAD, which a
         # detached checkout parks anywhere: one carrying the remote commits'
         # patches (the fetched tip checked out, a cherry-pick) read as "nothing
         # would be orphaned" while the branch lacked them, and one parked on the
-        # base refused a routine re-run. The remote side is
-        # refs/remotes/origin/<branch>, what the bare lease is held on — not
-        # `origin/<branch>`, a revision: git resolves it to
-        # refs/tags/origin/<branch> ahead of refs/remotes/origin/<branch>, so a
-        # tag of that name answered for the ref the lease is held on.
+        # base refused a routine re-run. The remote side is read from
+        # refs/remotes/origin/<branch> — not `origin/<branch>`, a revision: git
+        # resolves it to refs/tags/origin/<branch> ahead of
+        # refs/remotes/origin/<branch>, so a tag of that name answered for the
+        # ref the lease is read from.
         local_ref = f"refs/heads/{branch}"
         remote_ref = f"refs/remotes/origin/{branch}"
+
+        def cannot_tell(why: str, *, upgrade: bool = False) -> gitutil.GitResult:
+            # Unknown is never a proof: refuse, and say what to do by hand.
+            remedy = (f"inspect {remote_ref} and push by hand"
+                      + (", or upgrade git" if upgrade else ""))
+            logger.error("REFUSING the force-push retry of %r: cannot tell "
+                         "whether it would clobber commits on %s — %s. A "
+                         "failed push is recoverable, a clobbered commit is "
+                         "not: %s.", branch, remote_ref, why, remedy)
+            return gitutil.GitResult(
+                failed.code or 1, failed.out,
+                (f"refusing --force-with-lease retry: cannot tell whether it "
+                 f"would clobber commits on {remote_ref} — {why}. "
+                 f"{remedy[:1].upper()}{remedy[1:]}. Original push error: "
+                 f"{failed.err or failed.out}"),
+            )
+
+        # Three-state: a failed read is not an absent ref (it used to skip the
+        # check and retry on the bare lease alone, held on a ref that was current).
+        remote, unreadable = gitutil.tracking_ref_tip(worktree, remote_ref)
+        if unreadable:
+            return cannot_tell(unreadable)
+        if not remote:
+            # It does not resolve (rev-parse exit 1: absent, or a loose ref git
+            # cannot read): no observed remote state to run the clobber check
+            # against. A bare lease does not stand in for one: git checks it
+            # against whatever tracking ref ITS fetch refspec maps the branch
+            # to, and under a remote.origin.fetch that maps origin's branches
+            # elsewhere (+refs/heads/*:refs/remotes/mirror/*) that ref is current
+            # after a fetch — the bare-leased retry force-pushed over a
+            # reviewer's commit with the check never run. So the retry asserts
+            # the one remote state it can stand behind, no branch at all: an
+            # EMPTY expected value, which git checks against the remote's own
+            # ref and refuses ("stale info") wherever the branch exists there,
+            # whatever the fetch refspec says — and a fetch racing the push
+            # changes nothing.
+            lease = f"--force-with-lease=refs/heads/{branch}:"
+            logger.warning("push of %r rejected and %s does not resolve — nothing "
+                           "to run the clobber check against; retrying once with "
+                           "%s, which expects the remote branch to be ABSENT, so "
+                           "git refuses it wherever that branch exists (no fetch)",
+                           branch, remote_ref, lease)
+            # force_push_with_lease with no expected SHA sends exactly that
+            # lease, with the refspec in full and unforced, confined to the
+            # worktree like the plain push.
+            return gitutil.force_push_with_lease(worktree, "origin", branch, "")
         local = gitutil.branch_tip(worktree, branch)
-        have_remote_ref = gitutil.ref_exists(worktree, remote_ref)
-        if not local or not have_remote_ref:
-            logger.warning("cannot run the patch-id clobber check for %r (%s=%r, "
-                           "%s resolves=%s) — falling back to the bare lease "
-                           "alone", branch, local_ref, local[:12], remote_ref,
-                           have_remote_ref)
-        else:
-            orphans = gitutil.unlanded_by_patch_id(worktree, local, remote_ref)
-            if orphans:
-                shown = ", ".join(c[:12] for c in orphans[:8])
-                logger.error("REFUSING the force-push retry of %r: %d commit(s) on "
-                             "%s have no patch-id equivalent in %s (at %s), the "
-                             "branch the retry would push, and would be "
-                             "destroyed: %s. Fetch and rebase them in, or push by "
-                             "hand once you have decided what to keep.",
-                             branch, len(orphans), remote_ref, local_ref,
-                             local[:12], shown)
-                return gitutil.GitResult(
-                    failed.code or 1, failed.out,
-                    (f"refusing --force-with-lease retry: {len(orphans)} commit(s) on "
-                     f"{remote_ref} ({shown}) are not present by patch-id in "
-                     f"{local_ref} ({local[:12]}), the branch the retry would push, "
-                     f"and would be clobbered. Original push error: "
-                     f"{failed.err or failed.out}"),
-                )
+        if not local:
+            return cannot_tell(f"{local_ref}, the branch the retry would push, "
+                               "cannot be read")
+        check = gitutil.clobber_check(worktree, local, remote)
+        if check.error:
+            return cannot_tell(check.error, upgrade=check.git_code == 129)
+        if check.unlanded:
+            orphans = check.unlanded
+            shown = ", ".join(c[:12] for c in orphans[:8])
+            never = [f"{len(group)} {what}" for group, what in
+                     ((check.merges, "merge commit(s)"),
+                      (check.empty, "commit(s) with no patch"))
+                     if group]
+            unproven = (f" ({' and '.join(never)} among them, which can never be "
+                        f"shown replayed)" if never else "")
+            logger.error("REFUSING the force-push retry of %r: %d commit(s) on "
+                         "%s (at %s) have no whitespace-exact patch-id equivalent "
+                         "in %s (at %s), the branch the retry would push, and "
+                         "would be destroyed: %s%s. Fetch and rebase them in, "
+                         "or push by hand once you have decided what to keep.",
+                         branch, len(orphans), remote_ref, remote[:12], local_ref,
+                         local[:12], shown, unproven)
+            return gitutil.GitResult(
+                failed.code or 1, failed.out,
+                (f"refusing --force-with-lease retry: {len(orphans)} commit(s) on "
+                 f"{remote_ref} ({shown}) have no whitespace-exact patch-id "
+                 f"equivalent in {local_ref} ({local[:12]}), the branch the "
+                 f"retry would push, and would be clobbered{unproven}. "
+                 f"Original push error: {failed.err or failed.out}"),
+            )
         logger.warning("push of %r rejected as non-fast-forward — retrying once "
-                       "with bare --force-with-lease (leased on the stored "
-                       "remote-tracking ref, no fetch, so an out-of-band remote "
-                       "advance is still refused)", branch)
-        # Bare lease (no explicit SHA, no fetch) → anchored to refs/remotes/origin/<branch>,
-        # and confined to the worktree like the plain push (see force_push_with_lease).
-        return gitutil.force_push_with_lease(worktree, "origin", branch, "")
+                       "with --force-with-lease anchored to %s, the commit %s "
+                       "named when the clobber check validated it (no fetch: a "
+                       "remote that moved past it since is still refused)",
+                       branch, remote[:12], remote_ref)
+        # The refspec in full and unforced, confined to the worktree like the
+        # plain push (see force_push_with_lease).
+        return gitutil.force_push_with_lease(worktree, "origin", branch, remote)
 
     @staticmethod
     def _auth_ok(repo: Path) -> tuple[bool, str]:
@@ -629,7 +866,7 @@ class GitHubPR(PrCreator):
                 proc = subprocess.run(
                     ["gh", "auth", "status", "--json", "hosts"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False, env=gitutil.inherited_env(),
+                    check=False, env=_gh_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("gh auth preflight swallowed %s: %s — proceeding "
@@ -686,7 +923,7 @@ class GitHubPR(PrCreator):
             try:
                 plain = subprocess.run(["gh", "auth", "status"], cwd=str(repo),
                                        capture_output=True, text=True, timeout=60,
-                                       check=False, env=gitutil.inherited_env())
+                                       check=False, env=_gh_env())
             except (OSError, subprocess.TimeoutExpired) as exc:
                 logger.warning("plain gh auth preflight swallowed %s: %s — "
                                "proceeding (fail-open)", type(exc).__name__, exc)
@@ -728,7 +965,7 @@ class GitHubPR(PrCreator):
                     ["gh", "pr", "list", "--head", branch, "--state", "open",
                      "--json", "url,headRefName,isCrossRepository,headRepositoryOwner"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False, env=gitutil.inherited_env(),
+                    check=False, env=_gh_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("existing-PR probe for %r swallowed %s: %s — "
@@ -888,7 +1125,7 @@ class GitHubPR(PrCreator):
                 proc = subprocess.run(argv, cwd=str(repo),
                                       input=json.dumps({"body": body}), text=True,
                                       capture_output=True, timeout=120, check=False,
-                                      env=gitutil.inherited_env())
+                                      env=_gh_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("gh api PATCH failed to execute (%s: %s) — adopted PR "
                            "%s NOT refreshed; failing closed", type(exc).__name__,
@@ -919,7 +1156,7 @@ class GitHubPR(PrCreator):
                 view = subprocess.run(
                     ["gh", "pr", "view", url, "--json", "title,body"],
                     cwd=str(repo), capture_output=True, text=True, timeout=60,
-                    check=False, env=gitutil.inherited_env(),
+                    check=False, env=_gh_env(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("adopted-PR probe for %s swallowed %s: %s — live body "

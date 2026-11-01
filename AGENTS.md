@@ -25,6 +25,11 @@ to load this file automatically.)
   from it (Gemini CLI's `--approval-mode`/`--allowed-tools`, or the legacy
   `--permission-mode`/`--allowedTools`; neither, both or no readable help → by
   binary name, whose family flags are then passed as listed) and passes
-  optional flags only when advertised (a pinned `--model` is the one
-  exception); never add another unprobed optional flag, and never change the
-  legacy family's argv.
+  optional flags only when advertised (a pinned `--model` is the one unprobed
+  exception; on the legacy family the per-call caps `--max-turns` /
+  `--max-budget-usd` are also passed when a dry run of the CLI's own option
+  parser proves a flag its help hides, and a set cap that cannot be shown to
+  reach the CLI refuses the task; Gemini CLI gets a cap flag only when its help
+  lists it — an unlisted turn cap refuses the task, an unlisted cost cap is
+  left to harness's own bound, with a WARNING); never add another unprobed
+  optional flag, and never change the legacy family's argv.

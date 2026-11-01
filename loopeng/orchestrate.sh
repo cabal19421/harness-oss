@@ -26,7 +26,7 @@ base="$(git rev-parse --abbrev-ref HEAD)"
 if git branch --list 'agent/*' --format '%(refname:short)' | grep -q .; then
   echo "error: agent/* branches already exist from a previous run." >&2
   echo "  Integrate or delete them first, e.g.:  git branch -D \$(git branch --list 'agent/*' --format '%(refname:short)')" >&2
-  echo "  and remove leftover worktrees:  git worktree prune" >&2
+  echo "  after removing each leftover worktree by its path (inspect git worktree list first):  git worktree remove ../wt-<id>" >&2
   exit 2
 fi
 

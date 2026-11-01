@@ -16,7 +16,9 @@ and clean teardown.
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,7 +49,10 @@ class WorktreeInUse(GitError):
     so the worktree cannot be proven quiet; ``"unverified"`` marks a directory
     whose content cannot be proven to be this repository's worktree — an
     orphan whose backing repo is gone, a registered worktree that lost its
-    ``.git`` marker, or one git does not resolve to the directory itself.
+    ``.git`` marker, one git does not resolve to the directory itself, or one
+    whose ``.git`` names a registration that is not its own — and a worktree
+    path holding what harness never creates there: a symbolic link, or
+    anything else that is not a directory.
     """
 
     def __init__(self, message: str, *, reason: str, path: Path,
@@ -77,6 +82,24 @@ class _Registration:
     # git's own reason when it reports the entry prunable — for a directory
     # still on disk, that its ``.git`` marker is gone.
     prunable: str | None = None
+
+
+def _file_kind(mode: int) -> str:
+    """What an lstat ``st_mode`` that is neither a directory nor a link is, in words."""
+    for test, name in ((stat.S_ISREG, "regular file"), (stat.S_ISFIFO, "FIFO"),
+                       (stat.S_ISSOCK, "socket"), (stat.S_ISCHR, "character device"),
+                       (stat.S_ISBLK, "block device")):
+        if test(mode):
+            return name
+    return "file of an unknown type"
+
+
+def _same_directory(a: str | Path, b: str | Path) -> bool:
+    """Do *a* and *b* name the same directory on disk? An unanswerable stat is a no."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):      # ValueError: a NUL in a path git printed
+        return False
 
 
 class WorktreeManager:
@@ -171,22 +194,59 @@ class WorktreeManager:
 
         * live processes inside it are reclaimed first (``in_use``, as in
           :meth:`remove`) so the removal can't race a live writer;
-        * its content is classified — if the ``.git`` pointer is missing or its
-          backing repo is gone, the content **cannot be verified** and removal
-          needs the explicit ``prune_orphans`` opt-in.
+        * its content is classified (:meth:`_classify_orphan`) — if the
+          ``.git`` pointer is missing or its backing repo is gone, the content
+          **cannot be verified** and removal needs the explicit
+          ``prune_orphans`` opt-in; a directory whose content cannot even be
+          listed is refused, naming it;
+        * a linked worktree whose registration names it — registered to
+          another repository, since git lists no entry for it here — is no
+          orphan at all, and is refused whatever ``prune_orphans`` says.
+
+        "Unregistered" is read from ``git worktree list`` by the file system
+        (:meth:`_registration`), so a tree git lists under another spelling of
+        the same directory — a root moved and left behind as a symlink — is
+        reused as registered, never classified as an orphan; and a listing
+        git cannot give raises :class:`~harness.pipeline.gitutil.GitError`
+        before anything is touched.
 
         Reuse needs positive proof that git run inside the directory acts on
         the directory itself, not just a registration
-        (:func:`~harness.pipeline.gitutil.worktree_owner_proof`). A registered
+        (:func:`~harness.pipeline.gitutil.worktree_owner_proof` with
+        ``linked=True``: the tree's ``.git`` must name a linked worktree's
+        admin dir whose backlink names this very directory). A registered
         directory that lost its ``.git`` file is one git reports *prunable*,
         and every git command run inside it resolves whatever repository
         encloses it — for a submodule target, the superproject its default
-        ``worktree_root`` sits in. Its stale registration is pruned, which
+        ``worktree_root`` sits in. Its stale registration is deleted — that
+        one admin dir only, only when the marker is really gone (lstat finds
+        nothing there: git also calls a registration prunable when it merely
+        cannot reach the marker, a tree this user cannot read), and only when
+        exactly one unlocked admin dir names the directory
+        (:meth:`_drop_lost_marker_registration`) — which unpins its branch and
         drops it into the orphan path above: unverified, so refused without
-        ``prune_orphans``. A registration git does NOT call prunable whose
-        directory still fails the proof (a locked worktree without its marker,
-        a ``.git`` git cannot use) is refused outright as ``"unverified"`` —
-        it is registered here, so it is nobody's orphan to delete.
+        ``prune_orphans``. A registration that is kept (locked, named by two
+        admin dirs, or a marker out of reach), or one git does NOT call
+        prunable whose directory still fails the proof (a locked worktree
+        without its marker, a ``.git`` git cannot use), is refused outright as
+        ``"unverified"`` — it is registered here, so it is nobody's orphan to
+        delete.
+
+        A registration whose directory is gone is cleared path-scoped
+        (:meth:`_clear_missing_registration`: ``git worktree remove`` of that
+        exact registered path, then read back), never with a
+        repository-wide ``git worktree prune``: that deregisters every
+        worktree git cannot reach at that moment — an operator's on an
+        unmounted drive or behind a permission harness lacks, one moved with
+        ``mv``, one created inside a container — and their staged index,
+        detached commits and branch pins go with it.
+
+        Anything at the worktree path that is not a plain directory — a
+        symbolic link (to an operator's worktree, say), a regular file — is
+        refused as ``"unverified"`` before any registration is consulted:
+        harness only ever creates a directory there, and git, the ownership
+        proof and the registration lookup would all follow a link to the tree
+        it names.
 
         A create whose base does not resolve is refused with a
         :class:`~harness.pipeline.gitutil.GitError` *before* either recovery
@@ -208,35 +268,42 @@ class WorktreeManager:
         branch = self.branch_for(task_id)
         wt = self.path_for(task_id)
         self.root.mkdir(parents=True, exist_ok=True)
+        # lstat, before any registration is consulted: a symlink here would be
+        # followed to the tree it names by every check below.
+        self._refuse_odd_leaf(task_id, wt, "use")
 
         lost_marker = ""
         reg = self._registration(wt)
         if reg is not None and reg.prunable is not None and wt.is_dir():
+            logger.warning("task %s: worktree %s is registered and on disk, but git "
+                           "reports it prunable (%s) — its .git marker is gone or "
+                           "out of git's reach, and git run inside a tree without "
+                           "one acts on whatever repository encloses it; deleting "
+                           "that one registration if the marker is really gone, "
+                           "and treating the directory as an unverified orphan",
+                           task_id, wt, reg.prunable)
+            kept = self._drop_lost_marker_registration(task_id, wt)
             lost_marker = (f"it was registered as task {task_id}'s worktree but "
                            f"git reports the registration prunable "
-                           f"({reg.prunable}) — its .git marker is gone; ")
-            logger.warning("task %s: worktree %s is registered and on disk, but git "
-                           "reports it prunable (%s) — its .git marker is gone, so "
-                           "git run inside it would act on whatever repository "
-                           "encloses it; pruning the stale registration and "
-                           "treating the directory as an unverified orphan",
-                           task_id, wt, reg.prunable)
-            gitutil.git(["worktree", "prune"], cwd=self.repo)
+                           f"({reg.prunable}); "
+                           + (f"its registration was kept ({kept}); " if kept else
+                              "its .git marker is gone, so that one registration "
+                              "was deleted; "))
             reg = self._registration(wt)
 
         # Registered, present on disk AND git provably resolves it to itself → reuse.
         if reg is not None and wt.is_dir():
-            proof = gitutil.worktree_owner_proof(wt)
+            proof = gitutil.worktree_owner_proof(wt, linked=True)
             if not proof.ok:
-                logger.warning("task %s: refusing to reuse worktree %s — %s; git "
+                logger.warning("task %s: refusing to reuse worktree %s — %s%s; git "
                                "run inside it does not provably act on the "
                                "worktree itself, so nothing is reused, reset or "
-                               "deleted", task_id, wt, proof.reason)
+                               "deleted", task_id, wt, lost_marker, proof.reason)
                 raise WorktreeInUse(
-                    f"refusing to reuse worktree '{wt}': {proof.reason}. It is "
-                    f"registered to {self.repo}, but git run inside it does not "
-                    f"provably act on the worktree itself — inspect it and move "
-                    f"it aside.",
+                    f"refusing to reuse worktree '{wt}': {lost_marker}{proof.reason}. "
+                    f"It is registered to {self.repo}, but git run inside it does "
+                    f"not provably act on the worktree itself — inspect it and "
+                    f"move it aside.",
                     reason="unverified", path=wt,
                 )
             logger.info("task %s: reusing existing worktree %s (registered, "
@@ -265,27 +332,57 @@ class WorktreeManager:
         if not resuming:
             gitutil.require_base(self.repo, self.base_rev, name=self.base)
 
-        # Stale registration (dir gone) → prune, then recreate.
+        # Stale registration (dir gone) → clear exactly that one, then recreate.
         if self._is_registered(wt) and not wt.is_dir():
             logger.warning("task %s: worktree %s is registered but missing on "
-                           "disk — pruning stale registration and recreating",
+                           "disk — clearing that one registration and recreating",
                            task_id, wt)
-            gitutil.git(["worktree", "prune"], cwd=self.repo)
+            self._clear_missing_registration(task_id, wt)
 
         # Unregistered directory squatting on the target path → recover, or
         # `git worktree add` would fail with "already exists". An empty dir is
-        # fine for `add`; only a non-empty orphan needs removing.
+        # fine for `add`; only a non-empty orphan needs removing. No prune
+        # first: a registration the leftover's .git names is not this path's,
+        # and _classify_orphan's backlink check is what tells the two apart.
         if wt.exists() and not self._is_registered(wt):
             logger.debug("task %s: %s exists but is not a registered worktree — "
-                         "pruning, then removing it if still blocking",
-                         task_id, wt)
-            gitutil.git(["worktree", "prune"], cwd=self.repo)
-            if wt.exists() and not self._is_registered(wt) and any(wt.iterdir()):
+                         "removing it if it blocks the create", task_id, wt)
+            try:
+                squatted = any(wt.iterdir())
+            except OSError as exc:
+                logger.warning("task %s: refusing to use %s — it is not a "
+                               "registered worktree and its content could not be "
+                               "listed (%s: %s)", task_id, wt, type(exc).__name__,
+                               exc)
+                raise WorktreeInUse(
+                    f"refusing to use worktree path '{wt}': {lost_marker}it is not "
+                    f"a registered worktree and its content could not be listed "
+                    f"({type(exc).__name__}: {exc}) — inspect it and move it "
+                    f"aside; nothing was deleted.",
+                    reason="unverified", path=wt,
+                ) from exc
+            if squatted:
                 # Classify BEFORE destroying: a directory whose backing repo is
                 # gone (or which was never a worktree) holds content we cannot
                 # verify is disposable, so deleting it needs an explicit opt-in.
                 kind, detail = self._classify_orphan(wt)
                 detail = lost_marker + detail
+                if kind == "worktree":
+                    # A registration names it, yet git lists none for it here:
+                    # another repository's worktree. Not an orphan of this one,
+                    # so no opt-in deletes it — report, never take.
+                    logger.warning("task %s: refusing to delete %s — %s, but this "
+                                   "repository has no registration for it: it is "
+                                   "a worktree of another repository", task_id, wt,
+                                   detail)
+                    raise WorktreeInUse(
+                        f"refusing to delete '{wt}': {detail}, yet {self.repo} has "
+                        f"no registration for it — it is another repository's "
+                        f"worktree, not an orphan of this one. Remove it from the "
+                        f"repository it belongs to, or move it aside; no opt-in "
+                        f"deletes it.",
+                        reason="unverified", path=wt,
+                    )
                 if kind == "unverified" and not prune_orphans:
                     logger.warning("task %s: refusing to delete %s — %s; its "
                                    "content cannot be verified as a disposable "
@@ -340,15 +437,28 @@ class WorktreeManager:
         git refuses: the branch is still pinned by the worktree).
 
         A directory on disk that is not a registered worktree git provably
-        resolves to itself (:func:`~harness.pipeline.gitutil.worktree_owner_proof`)
-        is refused as ``"unverified"`` BEFORE the dirty check and the in-use
-        sweep: git run inside a tree that lost its ``.git`` marker reads — and
-        a discard would act on — whatever repository encloses it. A registration git
-        reports *prunable* (the marker is gone) is pruned first, which unpins
+        resolves to itself (:func:`~harness.pipeline.gitutil.worktree_owner_proof`
+        with ``linked=True``) is refused as ``"unverified"`` BEFORE the dirty
+        check and the in-use sweep: git run inside a tree that lost its
+        ``.git`` marker reads — and a discard would act on — whatever
+        repository encloses it. A registration git reports *prunable* (the
+        marker is gone) has that one registration deleted first
+        (:meth:`_drop_lost_marker_registration`; a locked or ambiguous one, or
+        one whose marker is only out of git's reach, is kept), which unpins
         its branch, and the directory is then an unverified orphan: kept
         unless ``prune_orphans`` opts in to deleting its unverifiable content,
         as :meth:`ensure` does. A registration git keeps whose directory still
-        fails the proof is refused whatever the opt-ins say.
+        fails the proof is refused whatever the opt-ins say. So is a worktree
+        path that is a symbolic link, or anything else but a directory —
+        checked first, by lstat, and never followed, ``prune_orphans``
+        included — and an unregistered directory that is another repository's
+        linked worktree (its ``.git`` names a registration that names it):
+        that is no orphan of this repository.
+
+        No repository-wide ``git worktree prune`` runs, before or after: a
+        directory that is already gone has its OWN registration removed
+        (``git worktree remove`` of that exact path), and the removal reports
+        success only once git no longer lists the path at all.
 
         Two *unrelated* risks, two separate opt-ins — a single ``force`` flag
         would conflate them:
@@ -395,17 +505,33 @@ class WorktreeManager:
         logger.debug("remove worktree: task=%s path=%s delete_branch=%s "
                      "allow_dirty=%s allow_unlanded=%s in_use=%s", task_id, wt,
                      delete_branch, allow_dirty, allow_unlanded, in_use)
+        # Before anything else: `git worktree remove` resolves a symlink to
+        # the tree it names, and would remove THAT one.
+        self._refuse_odd_leaf(task_id, wt, "remove")
 
-        # Guard BEFORE we remove the worktree: refuse to lose unmerged work.
-        if delete_branch and not allow_unlanded and self._branch_exists(branch) \
-                and not self.is_landed(task_id):
-            logger.warning("task %s: refusing to delete branch %r — its work has "
-                           "not landed in %r (fail closed; allow_unlanded=True "
-                           "overrides)", task_id, branch, self.base)
-            raise GitError(
-                f"refusing to delete branch '{branch}': its work has not landed in "
-                f"'{self.base}'. Merge it, or pass allow_unlanded=True to discard it."
-            )
+        # Guard BEFORE we remove the worktree: refuse to lose unmerged work —
+        # naming which refusal it is. A branch whose landing git could not
+        # prove (no `merge-tree --write-tree` before git 2.38) is not unmerged
+        # work, and the opt-in that discards it is not its remedy.
+        if delete_branch and not allow_unlanded and self._branch_exists(branch):
+            proof = self.landed_proof(task_id)
+            if proof.landed is None:
+                logger.warning("task %s: refusing to delete branch %r — whether its "
+                               "work landed in %r cannot be proven: %s (fail closed)",
+                               task_id, branch, self.base, proof.detail)
+                raise GitError(
+                    f"refusing to delete branch '{branch}': whether its work landed "
+                    f"in '{self.base}' cannot be proven — {proof.detail}. Nothing "
+                    "was deleted; check the branch by hand."
+                )
+            if proof.landed is False:
+                logger.warning("task %s: refusing to delete branch %r — its work has "
+                               "not landed in %r (fail closed; allow_unlanded=True "
+                               "overrides)", task_id, branch, self.base)
+                raise GitError(
+                    f"refusing to delete branch '{branch}': its work has not landed in "
+                    f"'{self.base}'. Merge it, or pass allow_unlanded=True to discard it."
+                )
 
         # Ownership BEFORE dirtiness: the dirty check runs git inside the
         # directory, and in one that lost its .git marker it reads the ENCLOSING
@@ -417,7 +543,6 @@ class WorktreeManager:
                 if not self._delete_orphan(task_id, wt, in_use=in_use, detail=detail):
                     raise GitError(f"could not delete orphan directory '{wt}' "
                                    f"({detail}) — it is still on disk")
-                gitutil.git(["worktree", "prune"], cwd=self.repo)
                 self._delete_branch_if_asked(task_id, branch, delete_branch=delete_branch,
                                              allow_unlanded=allow_unlanded)
                 logger.info("task %s: orphan directory %s deleted (prune_orphans)",
@@ -426,12 +551,16 @@ class WorktreeManager:
             logger.warning("task %s: refusing to remove %s — %s; nothing was "
                            "removed or killed%s", task_id, wt, detail,
                            " (prune_orphans=True deletes it)" if kind == "orphan" else "")
+            advice = {
+                "orphan": "move it aside, or pass prune_orphans=True to delete it.",
+                "registered": "it is still registered there, so inspect it and "
+                              "move it aside.",
+                "foreign": "it is another repository's worktree — remove it from "
+                           "the repository it belongs to; no opt-in removes it.",
+            }.get(kind, "inspect it and move it aside; no opt-in removes it.")
             raise WorktreeInUse(
                 f"refusing to remove '{wt}': {detail}. Its content cannot be "
-                f"verified as a worktree of {self.repo} — "
-                + ("move it aside, or pass prune_orphans=True to delete it."
-                   if kind == "orphan" else
-                   "it is still registered there, so inspect it and move it aside."),
+                f"verified as a worktree of {self.repo} — {advice}",
                 reason="unverified", path=wt,
             )
 
@@ -513,7 +642,16 @@ class WorktreeManager:
             logger.debug("task %s: worktree %s already gone (%s) — removal is "
                          "idempotent, treating as success",
                          task_id, wt, trunc(res.err, 120))
-        gitutil.git(["worktree", "prune"], cwd=self.repo)
+        # Read back, never a repository-wide `git worktree prune` (which would
+        # deregister every worktree git cannot reach right now, the operator's
+        # included): a removal is reported only once THIS path is no longer
+        # registered — whatever git's exit code or "is not a working tree" said.
+        if self._is_registered(wt):
+            logger.warning("task %s: `git %s` left %s registered (rc=%s: %s)",
+                           task_id, " ".join(rm), wt, res.code,
+                           trunc(res.err or res.out, 200))
+            raise GitError(f"git {' '.join(rm)} left '{wt}' registered "
+                           f"(rc={res.code}): {res.err or res.out or 'no output'}")
         self._delete_branch_if_asked(task_id, branch, delete_branch=delete_branch,
                                      allow_unlanded=allow_unlanded)
         logger.info("task %s: worktree %s removed", task_id, wt)
@@ -776,67 +914,90 @@ class WorktreeManager:
     def _classify_orphan(self, wt: Path) -> tuple[str, str]:
         """Classify an unregistered directory squatting on a worktree path.
 
-        Returns ``(kind, detail)`` where *kind* is ``"worktree"`` (a git worktree
-        whose backing repo still exists — its content is recoverable from the
-        object store, so deleting the directory is safe) or ``"unverified"``
-        (no ``.git`` pointer, an unreadable one, or a dangling ``gitdir:`` — the
-        content cannot be proven disposable, so deletion needs an opt-in).
+        Returns ``(kind, detail)``. *kind* is ``"unverified"`` — no ``.git``
+        pointer, an unreadable one, a dangling ``gitdir:``, or one naming a
+        registration that is not this directory's own: the content cannot be
+        proven disposable, so deletion needs an opt-in — or ``"worktree"``: a
+        linked worktree whose registration names this very directory
+        (:func:`~harness.pipeline.gitutil.registration_mismatch` with
+        ``linked=True``: a gitfile into an admin dir whose backlink names this
+        path). git lists no registration for it in THIS repository — that is
+        what makes it a leftover, and :meth:`_registration` matches through
+        the file system — so the registration naming it is ANOTHER
+        repository's: callers refuse it, whatever the opt-ins say. It is
+        nobody's orphan.
+
+        A leftover whose ``.git`` names ANOTHER tree's admin dir — a tree the
+        operator renamed with ``mv``, a copy, a reused name — or an admin dir
+        that lost its ``gitdir`` file, or a repository's own git dir, or one
+        that is a symbolic link, is ``"unverified"``: its uncommitted work is
+        not this task's to throw away, and the registration it names stays
+        repairable.
+
+        ``.git`` is examined by lstat and read without blocking, as a regular
+        file only (:func:`~harness.pipeline.gitutil.registration_mismatch`), so
+        a FIFO planted there is refused, never waited on.
         """
         dot_git = wt / ".git"
-        if dot_git.is_dir():
+        try:
+            mode = os.lstat(dot_git).st_mode
+        except FileNotFoundError:
+            return "unverified", f"{dot_git} does not exist — this is not a git worktree"
+        except (OSError, ValueError) as exc:
+            return ("unverified",
+                    f"could not examine {dot_git} ({type(exc).__name__}: {exc})")
+        if stat.S_ISDIR(mode):
             return ("unverified",
                     (f"{dot_git} is a real .git directory — this is a full "
                      f"repository, not a worktree"))
-        if not dot_git.exists():
-            return "unverified", f"{dot_git} does not exist — this is not a git worktree"
-        try:
-            text = dot_git.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return "unverified", f"could not read {dot_git} ({type(exc).__name__}: {exc})"
-        pointer = ""
-        for line in text.splitlines():
-            if line.startswith("gitdir:"):
-                pointer = line[len("gitdir:"):].strip()
-                break
-        if not pointer:
-            return "unverified", f"{dot_git} has no 'gitdir:' pointer"
-        target = Path(pointer)
-        if not target.is_absolute():
-            target = (wt / target).resolve()
-        if not target.exists():
-            return "unverified", f"its backing git dir {target} is gone"
-        return "worktree", f"a git worktree backed by {target}"
+        why = gitutil.registration_mismatch(wt, linked=True)
+        if why:
+            return "unverified", why
+        target = gitutil.gitfile_target(wt)
+        named = gitutil.display_path(target) if target else "(unreadable now)"
+        return "worktree", f"it is a linked worktree, and the registration {named} names it"
 
     def _removal_verdict(self, task_id: str, wt: Path) -> tuple[str, str] | None:
         """Why :meth:`remove` must not treat *wt* as this repo's worktree, if it must not.
 
         ``None`` when nothing is on disk (git and idempotence decide) or the
         directory is a registered worktree that passes the ownership proof.
-        Otherwise ``(kind, detail)``: ``"orphan"`` for a directory git has no
-        registration for — including one whose prunable registration was just
-        pruned here — and ``"registered"`` for one git still has registered
-        that fails the proof.
+        Otherwise ``(kind, detail)``: ``"not-a-directory"`` for a path holding
+        a symbolic link or anything else but a directory (by lstat, before any
+        registration is read; nothing removes it), ``"orphan"`` for a
+        directory git has no registration for — including one whose prunable
+        registration was just deleted here — ``"foreign"`` for one of those
+        that is another repository's linked worktree (:meth:`_classify_orphan`
+        kind ``"worktree"``; nothing removes it), and ``"registered"`` for one
+        git still has registered that fails the proof.
         """
+        odd = self._leaf_problem(wt)
+        if odd:
+            return "not-a-directory", odd
         if not wt.exists():
             return None
         reg = self._registration(wt)
         lost_marker = ""
         if reg is not None and reg.prunable is not None:
-            lost_marker = (f"it lost its .git marker (git reports the registration "
-                           f"prunable: {reg.prunable}), so the stale registration "
-                           f"was pruned; ")
             logger.warning("task %s: worktree %s is on disk but git reports its "
-                           "registration prunable (%s) — its .git marker is gone; "
-                           "pruning the registration (unpins branch %s) and "
+                           "registration prunable (%s) — its .git marker is gone "
+                           "or out of git's reach; deleting that one registration "
+                           "if the marker is really gone (unpins branch %s) and "
                            "treating the directory as an unverified orphan",
                            task_id, wt, reg.prunable, self.branch_for(task_id))
-            gitutil.git(["worktree", "prune"], cwd=self.repo)
+            kept = self._drop_lost_marker_registration(task_id, wt)
+            lost_marker = (f"git reports its registration prunable "
+                           f"({reg.prunable}); "
+                           + (f"its registration was kept ({kept}); " if kept
+                              else "its .git marker is gone, so that one "
+                                   "registration was deleted; "))
             reg = self._registration(wt)
         if reg is None:
-            return "orphan", lost_marker + self._classify_orphan(wt)[1]
-        proof = gitutil.worktree_owner_proof(wt)
+            kind, detail = self._classify_orphan(wt)
+            return ("foreign" if kind == "worktree" else "orphan"), lost_marker + detail
+        proof = gitutil.worktree_owner_proof(wt, linked=True)
         if not proof.ok:
-            return "registered", proof.reason
+            return "registered", lost_marker + proof.reason
         return None
 
     def _delete_orphan(self, task_id: str, wt: Path, *, in_use: str,
@@ -867,6 +1028,146 @@ class WorktreeManager:
             return False
         return True
 
+    # ── the worktree path itself, and its one registration ────────────────────
+    #
+    # Never a repository-wide `git worktree prune`. It deregisters EVERY
+    # unlocked worktree git cannot lstat at that moment: an operator's tree on
+    # an unmounted drive or behind a permission harness lacks, one moved with
+    # `mv`, one created inside a container (and, from a sandboxed harness that
+    # mounts only the repo, every host-side tree) — taking their staged index,
+    # their detached-only commits and their branch pins with them, and leaving
+    # `git worktree repair` nothing to repair. Each method below touches the
+    # registration of one path, harness's own.
+
+    @staticmethod
+    def _leaf_problem(wt: Path) -> str:
+        """Why *wt*, a worktree path, holds what harness never creates; ``""`` when it does not.
+
+        lstat, never stat: a symbolic link there is not the directory it names,
+        yet git (which resolves the link), the ownership proof and the
+        registration lookup would all take it for that directory — an
+        operator's registered worktree, say, which a reuse then commits into,
+        a rollback resets and a removal deletes. Nothing at all is fine: a
+        create, or an idempotent removal, decides. A path that cannot be
+        examined is reported, never assumed empty.
+        """
+        try:
+            st = os.lstat(wt)
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            return f"it could not be examined ({type(exc).__name__}: {exc})"
+        if stat.S_ISDIR(st.st_mode):
+            return ""
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                to = f"to {gitutil.display_path(os.readlink(wt))}"
+            except OSError:
+                to = "whose target cannot be read"
+            return f"it is a symbolic link ({to}), not a directory"
+        return f"it is not a directory but a {_file_kind(st.st_mode)}"
+
+    def _refuse_odd_leaf(self, task_id: str, wt: Path, verb: str) -> None:
+        """Raise :class:`WorktreeInUse` (``"unverified"``) when :meth:`_leaf_problem` names something.
+
+        Whatever the opt-ins say: ``prune_orphans`` deletes unverifiable
+        directory CONTENT, and a link or a file at the path is neither.
+        """
+        why = self._leaf_problem(wt)
+        if not why:
+            return
+        logger.warning("task %s: refusing to %s worktree path %s — %s; harness "
+                       "only ever creates a directory there, so nothing was "
+                       "followed, reused, reset or removed", task_id, verb, wt, why)
+        raise WorktreeInUse(
+            f"refusing to {verb} worktree path '{wt}': {why}. harness only ever "
+            f"creates a directory there, so nothing at that path was followed, "
+            f"reused, reset or removed — inspect it and move it aside.",
+            reason="unverified", path=wt,
+        )
+
+    def _drop_lost_marker_registration(self, task_id: str, wt: Path) -> str:
+        """Delete the registration of *wt*, whose ``.git`` marker is gone; why it was kept, else ``""``.
+
+        What ``git worktree prune`` does to every registration git cannot
+        reach, done to exactly one: the admin dir whose ``gitdir`` backlink
+        names this directory (:func:`~harness.pipeline.gitutil.worktree_admin_dirs`)
+        — only while git still reports the registration prunable, only when
+        the marker is really gone (lstat finds nothing at ``<wt>/.git``), only
+        when exactly one admin dir names the directory, and never when it is
+        locked. That unpins the task's branch (a markerless registration must
+        not pin it forever), and leaves the directory itself untouched. Any
+        other case keeps the registration, and the caller refuses the
+        directory as registered and unproven: fail closed.
+
+        git also reports a registration prunable when its lstat of the marker
+        merely FAILS — a tree this user cannot read (EACCES) — and deleting
+        that admin dir would take the tree's staged index and leave its
+        ``.git`` naming nothing (``git status``: "gitfile does not point to a
+        valid repository"). Only a marker lstat reports missing is gone.
+        """
+        reg = self._registration(wt)
+        if reg is None:
+            return ""
+        if reg.prunable is None:
+            return "git no longer reports it prunable"
+        marker = wt / ".git"
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            return (f"its .git marker could not be examined ({type(exc).__name__}: "
+                    f"{exc}) — git calls a registration prunable when it merely "
+                    f"cannot reach the marker")
+        else:
+            return (f"{marker} is still there — whatever git found prunable, the "
+                    f"marker is not gone")
+        admins = gitutil.worktree_admin_dirs(self.repo, wt)
+        if admins is None:
+            return "the repository's worktree admin dirs could not be listed"
+        if len(admins) != 1:
+            return (f"{len(admins)} admin dirs name it as their worktree, so which "
+                    f"registration is its own cannot be told")
+        admin = admins[0]
+        if os.path.lexists(admin / "locked"):
+            return f"its registration {admin} is locked"
+        logger.info("task %s: deleting the registration of %s (admin dir %s) — "
+                    "that one only", task_id, wt, admin)
+        try:
+            shutil.rmtree(admin)
+        except OSError as exc:
+            return f"its admin dir {admin} could not be deleted ({exc})"
+        if self._registration(wt) is not None:
+            return f"it is still registered after its admin dir {admin} was deleted"
+        return ""
+
+    def _clear_missing_registration(self, task_id: str, wt: Path) -> None:
+        """Deregister *wt* once its directory is gone — that one registration only.
+
+        ``git worktree remove`` of the exact path git registered: with the
+        directory (even its whole parent) gone, git still finds the entry by
+        that spelling, refuses a locked one, and deletes only its admin dir.
+        Read back afterwards rather than trusting git's exit code: a
+        registration that survives raises :class:`GitError` with git's answer
+        — ``git worktree add`` would refuse the path anyway.
+        """
+        reg = self._registration(wt)
+        if reg is None:
+            return
+        res = gitutil.git(["worktree", "remove", reg.path], cwd=self.repo,
+                          env={"LC_ALL": "C"})
+        if self._registration(wt) is not None:
+            logger.warning("task %s: could not clear the stale registration of %s "
+                           "(rc=%s: %s)", task_id, wt, res.code,
+                           trunc(res.err or res.out, 200))
+            raise GitError(f"could not clear the stale registration of '{wt}' "
+                           f"(git worktree remove, rc={res.code}): "
+                           f"{res.err or res.out or 'no output'} — it is still "
+                           f"registered")
+        logger.info("task %s: cleared the stale registration of %s (its directory "
+                    "was gone)", task_id, wt)
+
     # ── reconciliation (what git has registered vs. what the plan knows) ──────
 
     def list_registered(self) -> list[Path]:
@@ -891,6 +1192,29 @@ class WorktreeManager:
                 continue
             out.append(resolved)
         return out
+
+    def occupied(self, task_id: str) -> bool:
+        """Is anything at *task_id*'s worktree path (by lstat), or is it still registered?
+
+        What :meth:`~harness.pipeline.orchestrator.PipelineOrchestrator.prune`'s
+        done pass hands to :meth:`remove`. ``Path.is_dir()`` follows a symlink
+        to the tree it names, and skips a directory that is gone while git
+        still has it registered — a registration that would then pin the
+        task's branch forever, since no repository-wide prune clears it by
+        accident any more. :meth:`remove` decides both: it refuses the first,
+        naming it, and deregisters the second.
+        """
+        wt = self.path_for(task_id)
+        try:
+            os.lstat(wt)
+        except FileNotFoundError:
+            try:
+                return self._is_registered(wt)
+            except GitError:
+                return True                  # cannot tell: remove() names why
+        except OSError:
+            return True                      # cannot tell: remove() names why
+        return True
 
     def task_id_for(self, path: Path) -> str | None:
         """Inverse of :meth:`path_for`, or ``None`` if *path* isn't ours."""
@@ -944,9 +1268,14 @@ class WorktreeManager:
 
         Raises :class:`WorktreeInUse` (``"unverified"``) without resetting
         anything unless git provably resolves the worktree to itself
-        (:func:`~harness.pipeline.gitutil.worktree_owner_proof`): in a tree
-        that lost its ``.git`` marker the reset and clean would land on
-        whatever repository encloses it.
+        (:func:`~harness.pipeline.gitutil.worktree_owner_proof` with
+        ``linked=True``): in a tree that lost its ``.git`` marker the reset and
+        clean would land on whatever repository encloses it, and in one whose
+        ``.git`` names another checkout's repository or another tree's
+        registration they would reset THAT checkout's branch and index. A
+        worktree path that is a symbolic link, or anything else but a
+        directory, is refused the same way before the proof runs — the proof
+        would follow the link.
 
         Raises :class:`WorktreeInUse` (``"dirty"``), also before anything is
         reset, when index flags hide edits in the tree
@@ -957,7 +1286,8 @@ class WorktreeManager:
         read back afterwards, because afterwards the first kind is already gone.
         """
         wt = self.path_for(task_id)
-        proof = gitutil.worktree_owner_proof(wt)
+        self._refuse_odd_leaf(task_id, wt, "reset")
+        proof = gitutil.worktree_owner_proof(wt, linked=True)
         if not proof.ok:
             logger.warning("task %s: refusing to reset worktree %s — %s",
                            task_id, wt, proof.reason)
@@ -1000,19 +1330,27 @@ class WorktreeManager:
         """Delete ``agent/*`` branches whose work has landed; keep the rest.
 
         Safe-by-default, merge-aware pruning: a branch is deleted only
-        when it has no worktree checked out AND its content is already in
-        ``self.base``. Unlanded or still-checked-out branches are reported, not
-        touched. ``allow_unlanded`` deletes unlanded branches too (explicit
+        when it has no worktree checked out AND its content is provably already
+        in ``self.base`` (:func:`gitutil.landed_proof`). The rest is reported,
+        not touched: ``kept_active`` (still checked out), ``kept_unlanded`` (its
+        work has not landed) and ``kept_unproven`` (whether it landed cannot be
+        proven: git could not run the proof — a git older than 2.38 has no
+        ``merge-tree --write-tree`` — and one WARNING per prune names git's exit
+        code and error line, rather than calling squash-landed work unmerged).
+        ``allow_unlanded`` deletes unlanded and unproven branches too (explicit
         opt-in); ``force`` is a deprecated alias for it.
 
-        Returns ``{"deleted", "kept_unlanded", "kept_active"}`` lists of branches.
+        Returns ``{"deleted", "kept_unlanded", "kept_unproven", "kept_active"}``
+        lists of branches.
         """
         if force is not None:
             logger.debug("prune_merged(force=%s) is deprecated — mapping it to "
                          "allow_unlanded=%s", force, force)
             allow_unlanded = allow_unlanded or bool(force)
         pinned = self._checked_out_branches()
-        out: dict[str, list[str]] = {"deleted": [], "kept_unlanded": [], "kept_active": []}
+        out: dict[str, list[str]] = {"deleted": [], "kept_unlanded": [],
+                                     "kept_unproven": [], "kept_active": []}
+        unproven: list[gitutil.LandedProof] = []
         branches = self.list_agent_branches()
         base_rev = self.base_rev      # resolved once, not per branch
         logger.debug("prune_merged: %d agent branch(es), %d pinned by worktrees, "
@@ -1024,31 +1362,60 @@ class WorktreeManager:
                              branch)
                 out["kept_active"].append(branch)
                 continue
-            landed = gitutil.content_landed(self.repo, base_rev,
-                                            self._head_ref(branch))
+            proof = gitutil.landed_proof(self.repo, base_rev, self._head_ref(branch))
+            landed = proof.landed is True
+            kept = "kept_unproven" if proof.landed is None else "kept_unlanded"
             if landed or allow_unlanded:
                 if not landed:
-                    logger.warning("prune: deleting UNLANDED branch %s — commits "
-                                   "not in %s will be lost (allow_unlanded=True "
-                                   "opt-in)", branch, self.base)
+                    logger.warning("prune: deleting %s branch %s — commits not in %s "
+                                   "will be lost (allow_unlanded=True opt-in)",
+                                   "UNLANDED" if proof.landed is False else
+                                   "UNPROVEN", branch, self.base)
                 res = gitutil.git(["branch", "-D", branch], cwd=self.repo)
                 if res.ok:
                     logger.info("prune: deleted branch %s (%s)", branch,
                                 "landed in base" if landed else "forced")
                 else:
                     logger.warning("prune: `branch -D %s` failed (rc=%s): %s — "
-                                   "keeping it (reported as kept_unlanded)",
-                                   branch, res.code, trunc(res.err or res.out, 200))
-                (out["deleted"] if res.ok else out["kept_unlanded"]).append(branch)
+                                   "keeping it (reported as %s)", branch, res.code,
+                                   trunc(res.err or res.out, 200), kept)
+                (out["deleted"] if res.ok else out[kept]).append(branch)
+            elif proof.landed is None:
+                logger.info("prune: keeping %s — whether its work landed in %s "
+                            "cannot be proven: %s", branch, self.base, proof.detail)
+                out["kept_unproven"].append(branch)
+                unproven.append(proof)
             else:
                 logger.info("prune: keeping %s — content not landed in %s "
                             "(safe-by-default; allow_unlanded deletes it anyway)",
                             branch, self.base)
                 out["kept_unlanded"].append(branch)
-        logger.info("prune_merged: deleted=%d kept_unlanded=%d kept_active=%d",
-                    len(out["deleted"]), len(out["kept_unlanded"]),
-                    len(out["kept_active"]))
+        if unproven:
+            others = len({p.detail for p in unproven}) - 1
+            logger.warning("prune: kept %d branch(es) whose landed proof is "
+                           "unavailable — %s%s: %s. They are reported as "
+                           "kept_unproven, not as unlanded work; nothing was "
+                           "deleted for them (allow_unlanded deletes them anyway)",
+                           len(unproven), unproven[0].detail,
+                           f" (and {others} other reason(s))" if others else "",
+                           ", ".join(out["kept_unproven"]))
+        logger.info("prune_merged: deleted=%d kept_unlanded=%d kept_unproven=%d "
+                    "kept_active=%d", len(out["deleted"]), len(out["kept_unlanded"]),
+                    len(out["kept_unproven"]), len(out["kept_active"]))
         return out
+
+    def landed_proof(self, task_id: str) -> gitutil.LandedProof:
+        """:meth:`is_landed`, three-state: has the task's branch landed, and if not, why.
+
+        No branch is landed trivially (nothing to lose, ``how="no-branch"``),
+        as for :meth:`is_landed`; otherwise :func:`gitutil.landed_proof` of
+        the branch against :attr:`base_rev`, whose ``landed is None`` names a
+        proof git could not run instead of calling the work unlanded.
+        """
+        branch = self.branch_for(task_id)
+        if not self._branch_exists(branch):
+            return gitutil.LandedProof(True, "no-branch")
+        return gitutil.landed_proof(self.repo, self.base_rev, self._head_ref(branch))
 
     def _checked_out_branches(self) -> set[str]:
         """Branches currently checked out in any registered worktree."""
@@ -1145,21 +1512,42 @@ class WorktreeManager:
     def _registration(self, wt: Path) -> _Registration | None:
         """*wt*'s ``git worktree list --porcelain`` entry, or ``None`` if unregistered.
 
-        Exact match on each entry's ``worktree <path>`` line — a substring test
-        would false-match prefix collisions (wt-1 vs wt-10) — and the entry's
-        ``prunable`` annotation is kept: it is git saying the registration no
-        longer points at a ``.git`` marker, which a bare "is it listed" test
-        silently reads as a healthy worktree.
+        An entry is *wt*'s when it names the same directory: by the exact path
+        (never a substring test, which would false-match prefix collisions —
+        wt-1 vs wt-10), by the real path of both sides — how ``git worktree
+        remove`` itself finds a registration, so a tree git lists under another
+        spelling of the same directory (a worktree root moved and left behind
+        as a symbolic link, a backlink written through an alias) is found,
+        gone or not — or, on disk, by ``os.path.samefile``. The entry keeps
+        git's own spelling (:meth:`_clear_missing_registration` removes exactly
+        that) and its ``prunable`` annotation: git saying the registration no
+        longer points at a ``.git`` marker it can reach, which a bare "is it
+        listed" test silently reads as a healthy worktree.
+
+        Raises :class:`~harness.pipeline.gitutil.GitError` when git cannot
+        list the worktrees: unknown, never "unregistered" — read as that, a
+        registered tree would be classified, and possibly deleted, as an
+        orphan.
         """
-        listing = gitutil.git(["worktree", "list", "--porcelain"], cwd=self.repo).out
+        res = gitutil.git(["worktree", "list", "--porcelain"], cwd=self.repo,
+                          strip=False, fs_paths=True)
+        if not res.ok:
+            raise GitError(f"could not list the worktrees of {self.repo} to tell "
+                           f"whether '{wt}' is registered (git worktree list, "
+                           f"rc={res.code}): {res.err or res.out or 'no output'}")
         target = str(wt.resolve())
-        for entry in listing.split("\n\n"):
-            lines = entry.splitlines()
-            if not lines or lines[0] != f"worktree {target}":
+        real = os.path.realpath(wt)
+        for entry in res.out.split("\n\n"):
+            lines = entry.split("\n")
+            if not lines[0].startswith("worktree "):
+                continue
+            listed = lines[0][len("worktree "):]
+            if not (listed == target or os.path.realpath(listed) == real
+                    or _same_directory(listed, wt)):
                 continue
             prunable: str | None = None
             for line in lines[1:]:
                 if line == "prunable" or line.startswith("prunable "):
                     prunable = line[len("prunable"):].strip() or "no reason given"
-            return _Registration(target, prunable)
+            return _Registration(listed, prunable)
         return None

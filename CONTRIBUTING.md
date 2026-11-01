@@ -87,7 +87,7 @@ Installing with `[dev]` extras adds:
 |---|---|---|
 | `pytest` | `>=9.1.1` | Test runner |
 | `pytest-cov` | `>=4.0` | Coverage reporting |
-| `pytest-mock` | `>=3.10` | Mocking utilities |
+| `pytest-mock` | `>=3.10` | Mocking utilities — declared, but no test uses it today: the suite patches with pytest's own `monkeypatch` |
 | `mypy` | `>=2.0,<3` | Static type checking (config in `mypy.ini`) |
 | `ruff` | `>=0.1` | Linting (config in `ruff.toml` — pinned families, same reproducibility rationale as `mypy.ini`) |
 | `pre-commit` | `>=3.0` | Git hook framework — installed, but the repository ships no `.pre-commit-config.yaml` for it to run (see [Pre-commit Hooks](#pre-commit-hooks)) |
@@ -186,6 +186,7 @@ harness/
 │       ├── trace.py            # the span vocabulary → .harness/trace.jsonl
 │       ├── supervisor.py       # liveness (supervise) + crash recovery
 │       ├── procutil.py         # terminate processes inside a worktree before teardown
+│       ├── procwait.py         # wait for a child's EXIT, never its pipes' EOF (+ a bounded drain)
 │       ├── shutdown.py         # graceful Ctrl-C/SIGTERM (terminate the detached agent, record it)
 │       ├── nosleep.py          # hold a host sleep inhibitor for the length of a run
 │       ├── sanitize.py         # scrub untrusted design text (secrets + injection)
@@ -218,7 +219,14 @@ harness/
 │   ├── test_shutdown_sighup.py  test_submodule_pointers.py
 │   ├── test_success_exit_leftovers.py  test_trust_runner.py
 │   ├── test_unpopulated_submodules.py  test_validation_runner.py
-│   └── test_validation_shutdown.py  test_verifier_usage_limit.py
+│   ├── test_validation_shutdown.py  test_verifier_usage_limit.py
+│   ├── test_cli_cap_hit.py  test_cli_hidden_flags.py
+│   ├── test_clobber_check.py  test_commit_message_guard.py
+│   ├── test_exit_not_pipe_eof.py  test_expect_absent_lease.py
+│   ├── test_gh_env_isolation.py  test_git_floor.py
+│   ├── test_landed_proof.py  test_lstart_identity.py
+│   ├── test_recovery_owner_proof.py  test_scan_handoff_rescan.py
+│   └── test_verifier_exit_envelope.py  test_worktree_registration_safety.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
 ├── loopeng/                    # Shell-script loop the pipeline grew from
@@ -501,7 +509,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 2465 passing, 1 skipped at the time of writing
+# Run all tests — 2866 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -538,7 +546,16 @@ pytest --cov=harness --cov-report=html --cov-report=term-missing
 - Mark slow tests with `@pytest.mark.slow` — registered in `pytest.toml`, which
   also sets `strict_markers`, so a typo'd mark is a **collection error** rather
   than a mark that silently does nothing. Adding a new mark means adding it to
-  the `markers` list in `pytest.toml` first.
+  the `markers` list in `pytest.toml` first. The same setting governs `-m`: from
+  pytest 9.2 a `-m` expression naming an unregistered marker exits 4 without
+  running a test (under 9.1, `-m 'not slwo'` ran the whole suite and exited 0,
+  while `-m slwo` deselected every test and exited 5), and so do a missing `-p`
+  plugin and a missing `-c` file (exit 1 before). harness's own oracle reads exit
+  4 as a leg that could not run (`backends.base._CANNOT_RUN_RC`), not as the
+  agent's failure — unless the same command, re-run in a checkout of the diff
+  base, ran there (the diff broke it) or never launched there (nothing shows it
+  was broken before): then the leg counts against the diff
+  (`backends.base._unexcuse_diff_broken_legs`).
 
 ### `pytest.toml`
 
@@ -645,7 +662,7 @@ Harness has two observability channels (full guide in **[LOGGING.md](LOGGING.md)
    | a `PipelineConfig` field or `HARNESS_*` var | [PIPELINE.md § Complete configuration reference](PIPELINE.md#complete-configuration-reference) (+ the README env table if it is one most runs touch) |
    | a trace span type or its fields | `harness/pipeline/trace.py`'s module docstring, then [PIPELINE.md § Span traces](PIPELINE.md#span-traces--harnesstracejsonl) — and, when the *number* of types changes, the counts quoted in PIPELINE.md's span-traces intro, ARCHITECTURE.md (the `trace.py` module row **and** § Observability) and LOGGING.md (the channel table **and** the span-types rule in § Conventions) |
    | a CLI flag | ARCHITECTURE.md's subcommand tree + the run-book snippet that uses it |
-   | a version floor or extra | `setup.py`, `harness/config.py`, INSTALL.md, the README (the Prerequisites table **and** the `harness status` sample, which quotes the `TOOLS` rows word for word), PIPELINE.md where it names the floor (git ≥ 2.31, tmux ≥ 2.1) and, for a `[dev]` floor, this file's Development Dependencies table |
+   | a version floor or extra | `setup.py`, `harness/config.py`, `harness/grounding/solver.py` (for the `[z3]` floor: the `Z3Unavailable` install hint in `get_solver` and the comment on `Z3Solver._proved_unsat`), INSTALL.md, the README (the Prerequisites table **and** the `harness status` sample, which quotes the `TOOLS` rows word for word), PIPELINE.md where it names the floor (git's per-feature 2.38 / 2.39 / 2.31, tmux ≥ 2.1, and the `[z3]` extra's `>=4.12` in the do-not-adopt ledger's z3 `Solver.solutions(t)` row) and, for a `[dev]` floor, this file's Development Dependencies table, the floor bullets under it, the `pytest>=9.1.1` quoted in § `pytest.toml` (and in `pytest.toml` itself) and the `>=2.0,<3` quoted in `mypy.ini`; for the Python floor, also the README's python badge, this file's Development Setup prerequisites, `mypy.ini`'s `python_version` and `ruff.toml`'s `target-version` |
    | the test count | the README (the badge, the *Tested* bullet **and** the `tests/` line in Project Structure), INSTALL.md § Verify and the count in this file |
 
    Numbers in docs are claims: quote the real `pytest -q` line, the real

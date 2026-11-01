@@ -546,8 +546,13 @@ class PipelineConfig:
     # Optional fallback model for provider overload — leans less on the
     # hand-rolled retry ladder in `_run_with_retries`.
     agent_fallback_model: str | None = None
-    # Hard per-invocation turn cap handed to the CLI (`--max-turns`), when the
-    # installed CLI supports it. None = no CLI-side turn cap.
+    # Hard per-invocation turn cap handed to the CLI (`--max-turns`); a task is
+    # refused before launch when the installed CLI cannot be shown to take it.
+    # Gemini CLI takes no such flag, so there a set cap refuses the task before
+    # launch (agent_cli._gemini_cap_refusal) unless its help lists --max-turns;
+    # its own turn cap is `model.maxSessionTurns` in its settings, and a call
+    # that reaches it (exit 53) is judged as one ended at its cap. None = no
+    # CLI-side turn cap.
     max_agent_turns: int | None = None
 
     # Where isolated worktrees live (kept OUTSIDE the repo so grounding never

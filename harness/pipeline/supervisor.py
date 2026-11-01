@@ -70,8 +70,9 @@ _ACTIVE = ("implementing", "review")
 
 #: The last heartbeat of a run that left a task at ``review`` and exited cleanly
 #: — its review was interrupted, or its PR could not be opened. A ``review``
-#: task whose heartbeat says this, with that pid dead, was PARKED, not crashed:
-#: there is nothing to roll back, and ``pipeline run`` resumes it review-only.
+#: task whose heartbeat says this, with that pid not proven alive (dead, or its
+#: liveness unknown), was PARKED, not crashed: there is nothing to roll back,
+#: and ``pipeline run`` resumes it review-only.
 #: The one heartbeat status liveness reads (``RunLog.beat``), and only for this.
 PARKED = "parked"
 
@@ -258,15 +259,22 @@ class Supervisor:
                          "(age %.0fs, pid %d %s)", task.id, task.status, age, hb.pid, alive)
             return TaskLiveness(task.id, task.status, "idle", age,
                                 iteration=hb.iteration, detail=f"pid {hb.pid} {alive}")
-        if task.status == "review" and hb.status == PARKED and alive == "dead":
+        if task.status == "review" and hb.status == PARKED and alive != "alive":
             # Parked by a run that exited cleanly, not left by one that crashed:
             # rolling it back would stash and reset a tree nobody abandoned, and
-            # report a crash that never happened.
-            logger.debug("liveness %s: parked at review by pid %d, which exited "
-                         "cleanly → idle (nothing to recover)", task.id, hb.pid)
+            # report a crash that never happened. Only positive proof that the
+            # parker still runs makes it anything else: a pid liveness cannot
+            # bind to it ("unknown" — a pre-upgrade macOS identity read from
+            # another time zone, a ps that cannot run) is no sign of a crash
+            # either, and recovery destroys.
+            logger.debug("liveness %s: parked at review by pid %d (%s — not proven "
+                         "running) → idle (nothing to recover)", task.id, hb.pid, alive)
             return TaskLiveness(task.id, task.status, "idle", age,
                                 iteration=hb.iteration,
-                                detail=f"parked at review by pid {hb.pid} (exited cleanly)")
+                                detail=(f"parked at review by pid {hb.pid} "
+                                        + ("(exited cleanly)" if alive == "dead"
+                                           else f"(liveness {alive}: not proven "
+                                                "running)")))
         fresh = hb.freshness(max_age=self.config.worktree_stale_seconds)
         if alive == "dead":
             state = "stale"                          # positive proof of death
@@ -891,12 +899,26 @@ class Supervisor:
         span and the durable record, so it must never have to infer it from the
         fact that the attempt was made.
 
-        A recorded worktree that is on disk but not provably its own repository
-        (:func:`~harness.pipeline.gitutil.worktree_owner_proof`) is never
-        stashed or reset: with its ``.git`` marker gone, every git command in
-        it resolves the repository that encloses it, and the stash and reset
-        would sweep up THAT repository's uncommitted work. Its outcome is
-        ``unknown`` — its state was not read, nothing was attempted.
+        A recorded worktree that is on disk but not provably a linked worktree
+        in its own right is never stashed or reset. The proof is the strict one
+        harness's task-tree sites take
+        (:func:`~harness.pipeline.gitutil.worktree_owner_proof` with
+        ``linked=True``): every task tree is a linked worktree whose ``.git`` is
+        the gitfile ``git worktree add`` writes, naming its own registration.
+        With its ``.git`` marker gone, every git command in it resolves the
+        repository that encloses it; with a ``.git`` naming another checkout's
+        git dir — a gitfile into another checkout's ``--separate-git-dir``
+        repository passes the plain proof — or a link in its place, they run
+        against THAT checkout's index and stash list. Either way the stash and
+        reset would sweep up another checkout's uncommitted work. Its outcome
+        is ``unknown`` — its state was not read, nothing was attempted.
+
+        The proof establishes that shape, not whose tree it is: a linked
+        worktree whose admin dir's ``gitdir`` backlink names it passes, of this
+        repository or any other, and whether or not it is this task's. A plan
+        recording such a path still has it stashed and reset exactly as a task
+        tree is — its uncommitted work parked on THAT repository's stash — and
+        so does a forged admin dir.
 
         Edits hidden behind index flags (assume-unchanged / skip-worktree) are
         exposed before anything is read, so the stash parks them with the rest
@@ -921,7 +943,7 @@ class Supervisor:
             logger.debug("clean worktree %s: %s is missing — nothing to clean",
                          task.id, wt)
             return WorktreeClean(outcome="no-op", reason=f"{wt} is missing")
-        proof = gitutil.worktree_owner_proof(wt)
+        proof = gitutil.worktree_owner_proof(wt, linked=True)
         if not proof.ok:
             reason = f"not provably the task's own worktree: {proof.reason}"
             logger.warning("clean worktree %s: %s is %s — nothing was stashed and "

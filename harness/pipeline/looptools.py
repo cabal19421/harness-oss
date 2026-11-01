@@ -281,10 +281,11 @@ _UNIT_SECONDS = {"second": 1.0, "minute": 60.0, "hour": 3600.0}
 # does) ends a turn that a usage limit refused with a result envelope it MARKS
 # (``is_error`` true, ``subtype`` success, and ``api_error_status`` 429 — or,
 # on newer CLIs, a typed ``api_error``), whose ``result`` is text the CLI wrote
-# itself: "You've hit your session limit · resets 10:53pm (UTC)". None of the
-# legacy patterns above match that wording; the only marker left in the detail
-# was the envelope's `429`, so a session limit that reopened 37 minutes later
-# was retried as a transient blip until its tasks aborted.
+# itself: "You've hit your session limit · resets 10:53pm (UTC)" (newer CLIs
+# call the same window the "5-hour limit"). None of the legacy patterns above
+# match that wording; the only marker left in the detail was the envelope's
+# `429`, so a session limit that reopened 37 minutes later was retried as a
+# transient blip until its tasks aborted.
 #
 # These patterns are applied ONLY to that CLI-marked text, which the agent-cli
 # backend reads out of the envelope's structured fields (its ``_cli_limit_text``)
@@ -307,13 +308,14 @@ _CLI_LIMIT_PREFIX = re.compile(
     r"|Your group['’]s usage limit is set to \$0"
     r"|This service is disabled for your org"
     r"|[A-Z][\w.-]*(?: [^\u00b7\n]{1,40})? requires usage credits\b)")
-# The names the CLI gives a reopening WINDOW: the five-hour session, the weekly
-# and per-model weekly limits, and its generic "usage limit" / "limit". Hit with
-# no reset stated, these get the bounded default wait; any other limit with no
-# reset needs an operator.
+# The names the CLI gives a reopening WINDOW: the five-hour one (newer CLIs call
+# it the "5-hour limit", older ones the "session limit"), the weekly and
+# per-model weekly limits, and its generic "usage limit" / "limit". Hit with no
+# reset stated, these get the bounded default wait; any other limit with no
+# reset needs an operator — the overage meter ("usage credit limit") among them.
 _CLI_WINDOW_HIT = re.compile(
     r"You['’]ve (?:hit|reached) your "
-    r"(?:(?:session|weekly|[A-Z][\w.-]*(?: \d+(?:\.\d+)?)?|usage) )?limit\b")
+    r"(?:(?:session|5-hour|weekly|[A-Z][\w.-]*(?: \d+(?:\.\d+)?)?|usage) )?limit\b")
 # Text asking an operator to act — raise a cap, add funds or credits, switch
 # models. Nothing reopens on its own, and harness never switches the pinned model.
 _CLI_OPERATOR_ACTION = re.compile(
@@ -324,9 +326,10 @@ _CLI_OPERATOR_ACTION = re.compile(
 # 24h: the NEXT occurrence of that time), "resets Oct 20, 3pm
 # (America/New_York)", and "resets Jan 2, 2027, 8pm (UTC)" — a year only when it
 # is not the current one. Anchored on "resets " rather than " · resets", since a
-# spend-cap refusal carries it as "· your session limit resets <T>". The space
-# before am/pm is optional and may be a no-break or narrow no-break space (an
-# ICU that emits U+202F leaves "10:53 PM"), and am/pm may be in either case.
+# spend-cap refusal carries it as "· your 5-hour limit resets <T>" ("session
+# limit" on older CLIs). The space before am/pm is optional and may be a
+# no-break or narrow no-break space (an ICU that emits U+202F leaves
+# "10:53 PM"), and am/pm may be in either case.
 _CLI_RESET = re.compile(
     r"\bresets (?:(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
     r"(?P<day>\d{1,2}), (?:(?P<year>\d{4}), )?)?"
@@ -512,10 +515,11 @@ def cli_usage_limit_kind(text: str, *, now: float | None = None) -> FailureKind 
     :func:`classify_invocation_failure`.
 
     * ``quota-window`` — a reset is stated, so the window reopens on its own
-      (even beside a spend cap: "· your session limit resets <T>" — the cap
-      only blocked overage); or a named window (session / weekly / per-model /
-      the generic names) is hit with no reset and no operator action named, which
-      gets the bounded default wait.
+      (even beside a spend cap: "· your 5-hour limit resets <T>" — the cap
+      only blocked overage); or a named window (the five-hour one — "5-hour
+      limit" on newer CLIs, "session limit" on older ones — weekly / per-model
+      / the generic names) is hit with no reset and no operator action named,
+      which gets the bounded default wait.
     * ``permanent`` — everything else the CLI refuses with: spend and usage
       caps, credits, seat type, org, allocation, a $0 group, "<Model> requires
       usage credits", "Switch to another model". Only an operator lifts these,

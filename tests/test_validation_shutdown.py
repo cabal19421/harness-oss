@@ -605,13 +605,25 @@ def test_an_interrupted_mutation_gate_is_no_verdict(tmp_path, monkeypatch):
 
 # ── edge cases: timeouts, parking, the verifier, the sweep, mutants ──────────
 
-#: A suite leader whose setsid'd child holds the output pipe for a while after
-#: the leader dies: the group signal ends the leader, and the run then waits on
-#: the pipe until the command's own timeout fires — with the shutdown already
-#: requested.
+#: A suite leader that is still running when its own timeout fires with the
+#: shutdown already requested. It shrugs off the handler's group SIGTERM — the
+#: first one — and dies on the timeout ladder's, the second. (It used to reach
+#: the timeout only because a setsid'd child held the output pipe after the
+#: group signal ended it; the wait is for the exit now, so the child that still
+#: holds the pipe no longer keeps the run open by itself.)
 _PIPE_HOLDER = """
-import os, subprocess, sys, time
+import os, signal, subprocess, sys, time
 from pathlib import Path
+terms = []
+
+
+def on_term(signum, frame):
+    terms.append(signum)
+    if len(terms) > 1:
+        os._exit(143)
+
+
+signal.signal(signal.SIGTERM, on_term)
 subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2.5)"],
                  start_new_session=True)
 Path(sys.argv[1] + ".tmp").write_text("x")
@@ -641,7 +653,7 @@ def test_a_timeout_with_a_shutdown_requested_is_no_verdict(tmp_path):
     assert not report.failed, [lg.detail for lg in report.legs]
     assert getattr(report, "interrupted", False) is True
     assert report.legs == []
-    assert "with a shutdown requested" in report.output
+    assert "timed out after 1s with a shutdown requested" in report.output
 
 
 def test_an_interrupted_baseline_timeout_is_not_memoised(tmp_path, monkeypatch):
@@ -663,21 +675,34 @@ def test_an_interrupted_baseline_timeout_is_not_memoised(tmp_path, monkeypatch):
 
 def test_the_group_stays_registered_through_the_timeout_ladder(tmp_path, monkeypatch):
     """Registration ended before the timeout kill ladder, so a second Ctrl-C
-    inside its TERM window hard-exited with a TERM-ignoring group left running."""
-    registered: list[int] = []
-    real = subprocess.Popen.communicate
+    inside its TERM window hard-exited with a TERM-ignoring group left running.
 
-    def spy(self, *a, **kw):
-        registered.append(len(shutdown._STATE._children))
-        return real(self, *a, **kw)
+    Probed where the wait now happens — procwait reads the pipes itself, so
+    ``communicate()`` is no longer called for a real ``Popen`` — and at the
+    ladder's own signals."""
+    from harness.pipeline import procwait
 
-    monkeypatch.setattr(subprocess.Popen, "communicate", spy)
+    reads: list[int] = []
+    signals: list[int] = []
+    real_pump, real_killpg = procwait._Reading.pump, os.killpg
+
+    def pump_spy(self, timeout):
+        reads.append(len(shutdown._STATE._children))
+        return real_pump(self, timeout)
+
+    def killpg_spy(pgid, sig):
+        signals.append(len(shutdown._STATE._children))
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(procwait._Reading, "pump", pump_spy)
+    monkeypatch.setattr(os, "killpg", killpg_spy)
     with shutdown.guard(), pytest.raises(subprocess.TimeoutExpired):
         _run_grouped([sys.executable, "-c", "import time; time.sleep(30)"],
                      shell=False, cwd=tmp_path, timeout=1)
 
-    assert len(registered) >= 2, registered               # the ladder ran
-    assert all(n == 1 for n in registered), registered
+    assert signals, "the ladder never signalled the group"   # the ladder ran
+    assert all(n == 1 for n in signals), signals
+    assert len(reads) >= 2 and all(n == 1 for n in reads), reads
     assert shutdown._STATE._children == []                # and let go after
 
 

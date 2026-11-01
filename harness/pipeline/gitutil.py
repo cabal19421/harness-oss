@@ -391,16 +391,33 @@ def git(
     encoding = (sys.getfilesystemencoding() if fs_paths
                 else locale.getpreferredencoding(False))
     errors = sys.getfilesystemencodeerrors() if fs_paths else "strict"
+    # Waited on until git EXITS, not until its pipes close: git hands every
+    # hook its stderr, so a target repo's hook that backgrounds a helper
+    # without redirecting it held the read until the timeout — a commit that
+    # landed read as rc 124, a pushed branch as a failed push, a created
+    # worktree as a GitError. stderr is therefore drained on its own,
+    # PIPE_DRAIN_SECONDS past the exit; stdout too for a `push`, whose pre-push
+    # hook alone also gets git's stdout (git 2.56). Every other subcommand
+    # keeps stdout on run()'s own pipe, whose EOF is git's exit — exact, where
+    # draining both would make run() poll for the exit on every quick call.
+    # rc 124 is left for a git still running at its deadline. Imported here,
+    # inside the one function that uses it, to keep the import block as it is.
+    from .procwait import PIPE_DRAIN_SECONDS, run_until_exit
+
     try:
-        proc = subprocess.run(
+        proc, held = run_until_exit(
             ["git", *args],
             cwd=str(cwd),
-            capture_output=True,
             timeout=timeout,
-            check=False,   # non-zero degrades to a GitResult; GitError is raised below
             env=child_env,
-            input=None if stdin is None else stdin.encode(encoding, errors),
+            stdin_bytes=None if stdin is None else stdin.encode(encoding, errors),
+            drain_stdout=sub == "push",
         )
+        if held:
+            logger.warning("git %s exited rc=%s, but a process it started (a "
+                           "hook's helper?) kept its output pipe open — stopped "
+                           "reading %gs after the exit; the exit code stands",
+                           sub, proc.returncode, PIPE_DRAIN_SECONDS)
     except subprocess.TimeoutExpired:
         res = GitResult(124, "", _log_text(f"git {' '.join(args)} timed out after "
                                            f"{timeout}s"))
@@ -527,7 +544,7 @@ class OwnerProof:
     reason: str = ""
 
 
-def worktree_owner_proof(path: Path | str) -> OwnerProof:
+def worktree_owner_proof(path: Path | str, *, linked: bool = False) -> OwnerProof:
     """Positive proof that git run in *path* acts on *path* itself.
 
     A worktree whose ``.git`` file is gone is still a directory full of files,
@@ -535,28 +552,70 @@ def worktree_owner_proof(path: Path | str) -> OwnerProof:
     whatever repository encloses it — for a submodule target that is the
     superproject, whose work tree holds the default ``worktree_root``. Every
     destructive command then lands there instead: a stash and hard reset of
-    the operator's uncommitted work, a catch-all commit on its branch. So both
-    legs below must be answered positively before harness stashes, resets,
-    cleans, stages, commits or merges in a worktree path:
+    the operator's uncommitted work, a catch-all commit on its branch. So
+    *path* must be a directory itself, and all three legs below must be
+    answered positively, before harness stashes, resets, cleans, stages,
+    commits or merges in a worktree path:
 
+    * **path** — examined by lstat first: a symbolic link at *path* is
+      refused, whatever it points at. git, and every leg below, would follow
+      it to the tree it names — an operator's registered worktree passes all
+      three as itself — so an agent that swaps its own tree for a link
+      mid-run would aim the loop's catch-all commit and rollback, and
+      recovery's stash and reset, at that tree. harness resolves its
+      repository and worktree root, so its own paths never end in a link; a
+      symlinked PARENT is fine;
     * **marker** — ``<path>/.git`` exists (a linked worktree's gitfile, or a
       checkout's own ``.git`` directory);
     * **toplevel** — ``git rev-parse --show-toplevel`` run in *path* names
       *path* itself, never a directory above it. The marker alone is not
-      enough: git skips a ``.git`` it cannot use and keeps walking up.
+      enough: git skips a ``.git`` it cannot use and keeps walking up;
+    * **registration** — the git dir ``<path>/.git`` names, as a gitfile or as
+      a symbolic link, is *path*'s own (:func:`registration_mismatch`): a
+      linked worktree's admin dir whose ``gitdir`` backlink names
+      ``<path>/.git``, or a repository's own git dir that is not another
+      checkout's ``.git`` directory; and a ``.git`` directory is one git made
+      (no ``commondir`` in it). The toplevel leg cannot see this: git takes
+      the directory holding ``.git`` as the work tree whatever that ``.git``
+      names, so a ``.git`` rewritten — or replaced by a link — to name the
+      main checkout's ``.git`` directory, or another tree's admin dir,
+      resolves to *path* while every stage, commit and reset there moves THAT
+      checkout's branch and index.
 
-    It establishes where git's discovery lands, not which clone the tree
-    belongs to. A leg that cannot be answered (git absent, a probe that fails,
-    a path that cannot be compared) fails the proof: unknown is never a proof.
-    Read-only, and it never raises.
+    ``linked=True`` — harness's own task trees, every one made by ``git
+    worktree add`` — also requires the linked-worktree shape: a gitfile (not
+    a link) into an admin dir (one holding ``commondir``), the one shape with
+    a backlink to check. A gitfile into another checkout's
+    ``--separate-git-dir`` repository has none, and passes the plain proof.
+
+    It establishes where git's discovery lands and that the registration it
+    lands on is this directory's, not which clone the tree belongs to. A leg
+    that cannot be answered (git absent, a probe that fails, a path that
+    cannot be compared, a file that cannot be read) fails the proof: unknown
+    is never a proof. Read-only, and it never raises.
     """
     p = Path(path)
     dot_git = p / ".git"
     try:
-        if not p.is_dir():
-            return _unproven(p, f"{p} is not a directory")
-        marker = dot_git.exists()
-    except OSError as exc:
+        mode = os.lstat(p).st_mode
+    except FileNotFoundError:
+        return _unproven(p, f"{p} is not a directory")
+    except (OSError, ValueError) as exc:
+        return _unproven(p, f"could not stat {p} ({type(exc).__name__}: {exc})")
+    if stat.S_ISLNK(mode):
+        return _unproven(p, f"{p} is a symbolic link ({_symlink_text(p)}), not a "
+                            f"directory — git run there would act on the tree "
+                            f"it names")
+    if not stat.S_ISDIR(mode):
+        return _unproven(p, f"{p} is not a directory")
+    # os.stat, not Path.exists(): from Python 3.12 that answers False for a
+    # marker it cannot stat (EACCES), which would read as "does not exist".
+    try:
+        os.stat(dot_git)
+        marker = True
+    except FileNotFoundError:
+        marker = False
+    except (OSError, ValueError) as exc:
         return _unproven(p, f"could not stat {dot_git} ({type(exc).__name__}: {exc})")
     # Runs even when the marker is missing, read-only, to name the repository
     # a command here would have hit — the most useful thing a refusal can say.
@@ -573,7 +632,283 @@ def worktree_owner_proof(path: Path | str) -> OwnerProof:
     if not _same_dir(Path(top), p):
         return _unproven(p, f"git run there resolves the repository at {top}, "
                             f"not {p} itself")
+    why = registration_mismatch(p, linked=linked)
+    if why:
+        return _unproven(p, why)
     return OwnerProof(True)
+
+
+#: The most of a ``.git`` gitfile or an admin dir's ``gitdir`` backlink that is
+#: read: one path git wrote, plus slack. Anything longer is no file git wrote.
+_GIT_WRITTEN_MAX = 16 * 1024
+
+
+def _read_git_written(path: str) -> str:
+    """The text of a small file git writes: a ``.git`` gitfile, a ``gitdir`` backlink.
+
+    Opened without blocking — a FIFO planted there would otherwise hang the
+    proof — and refused unless it is a regular file of at most
+    ``_GIT_WRITTEN_MAX`` bytes. Decoded with the file-system codec, so a name
+    that is not UTF-8 round-trips to the path it spells. Raises
+    :class:`OSError` or :class:`ValueError`.
+    """
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("not a regular file")
+        raw = fh.read(_GIT_WRITTEN_MAX + 1)
+    if len(raw) > _GIT_WRITTEN_MAX:
+        raise ValueError(f"longer than {_GIT_WRITTEN_MAX} bytes")
+    return os.fsdecode(raw)
+
+
+def _backlink_of(admin: str) -> str:
+    """The ``.git`` the admin dir *admin*'s ``gitdir`` backlink names; ``""`` when empty.
+
+    Read as git lists a registration: trailing whitespace trimmed, and a
+    relative backlink (``worktree.useRelativePaths``) taken from the admin dir
+    — joined, never normalised, so the kernel resolves every ``..`` exactly as
+    git does. Raises :class:`OSError` or :class:`ValueError` when the backlink
+    cannot be read.
+    """
+    link = _read_git_written(os.path.join(admin, "gitdir")).rstrip()
+    if not link:
+        return ""
+    return link if os.path.isabs(link) else os.path.join(admin, link)
+
+
+def _names_marker(backlink: str, path: Path) -> bool:
+    """Does *backlink* (:func:`_backlink_of`) name ``<path>/.git``, by the file system?"""
+    return (bool(backlink) and os.path.basename(backlink) == ".git"
+            and _same_dir(Path(os.path.dirname(backlink)), path))
+
+
+def registration_mismatch(path: Path | str, *, linked: bool = False) -> str:
+    """Why the git dir *path*'s ``.git`` names is not *path*'s own; ``""`` when it is.
+
+    ``<path>/.git`` is examined by lstat, so a link is never taken for what it
+    names:
+
+    * a **directory** is the checkout's own repository and passes
+      (``linked=True`` refuses it: no task tree is one) — unless it holds a
+      ``commondir`` file. git never makes such a ``.git`` (a linked
+      worktree's is a gitfile), and one that borrows another repository's
+      refs through ``commondir`` has no backlink to check: refused;
+    * a **gitfile** is read the way git reads it — ``gitdir: <pointer>``,
+      trailing CR/LF trimmed, a relative pointer taken from *path* — and the
+      git dir it names is judged below;
+    * a **symbolic link** is judged by what it resolves to, as git uses it: a
+      link to a file is read as that gitfile, and a link to a directory makes
+      that directory, resolved, the git dir — judged below exactly as a
+      gitfile's target is. ``linked=True`` refuses any link outright: ``git
+      worktree add`` writes a gitfile.
+
+    The git dir so named must be *path*'s:
+
+    * an **admin dir** (it holds ``commondir``: a linked worktree's
+      registration) passes only when its ``gitdir`` backlink names
+      ``<path>/.git`` (:func:`_backlink_of`). A backlink naming another
+      directory — a tree moved or copied since git registered it, a
+      hard-linked or rewritten ``.git``, a Windows-style path read here — or
+      one that is missing or unreadable is a mismatch;
+    * a **repository's own git dir** (no ``commondir``) passes when its
+      ``core.worktree`` names *path* (a submodule's module dir names its
+      checkout); with none set, when it is not a ``.git`` directory, as
+      spelled or as resolved — that is another checkout's own repository —
+      so a ``--separate-git-dir`` repository passes. ``linked=True`` refuses
+      this shape outright: it has no backlink to check, and a gitfile into
+      another checkout's separate git dir would pass.
+
+    Paths are compared through the FILE SYSTEM, never lexically: joins are
+    left unnormalised and ``os.path.samefile`` decides, so a relative link
+    under a symlinked parent resolves exactly as git resolves it. Anything
+    that cannot be read or compared is a mismatch. Never raises.
+
+    It reads git's own files, so it cannot see through a git dir someone
+    FORGED to look like *path*'s own: a ``.git`` directory or a separate git
+    dir whose ``refs`` are links into another repository (the old
+    ``git-new-workdir`` layout), or an admin dir whose backlink was written to
+    name *path*, passes. ``linked=True`` refuses the first two shapes, not the
+    third.
+    """
+    p = Path(path)
+    marker = p / ".git"
+    try:
+        mode = os.lstat(marker).st_mode
+    except (OSError, ValueError) as exc:
+        return f"could not examine {marker} ({type(exc).__name__}: {exc})"
+    if stat.S_ISDIR(mode):
+        if linked:
+            return (f"{marker} is a .git directory — a repository of its own, not "
+                    f"a linked worktree")
+        return _dot_git_dir_mismatch(p, marker)
+    if stat.S_ISLNK(mode):
+        return _symlinked_marker_mismatch(p, marker, linked=linked)
+    return _gitfile_mismatch(p, marker, linked=linked)
+
+
+def _dot_git_dir_mismatch(path: Path, marker: Path) -> str:
+    """:func:`registration_mismatch` for a ``.git`` DIRECTORY: one git made holds no ``commondir``."""
+    commondir = marker / "commondir"
+    try:
+        os.lstat(commondir)
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:
+        return f"could not examine {commondir} ({type(exc).__name__}: {exc})"
+    return (f"{marker} is a .git directory that holds commondir — git never makes "
+            f"one (a linked worktree's .git is a gitfile into its registration), "
+            f"and git run in {path} would share the refs of the repository that "
+            f"file names, with no backlink to check")
+
+
+def _symlinked_marker_mismatch(path: Path, marker: Path, *, linked: bool) -> str:
+    """:func:`registration_mismatch` for a ``.git`` that is a symbolic link."""
+    link = f"{marker} is a symbolic link ({_symlink_text(marker)})"
+    if linked:
+        return (f"{link} — a task tree's .git is the gitfile `git worktree add` "
+                f"writes, never a link")
+    try:
+        mode = os.stat(marker).st_mode
+    except (OSError, ValueError) as exc:
+        return f"{link} that does not resolve ({type(exc).__name__}: {exc})"
+    if not stat.S_ISDIR(mode):
+        # git reads a link to a file as that gitfile, a relative pointer in it
+        # taken from <path> — exactly as a gitfile is read here.
+        return _gitfile_mismatch(path, marker, linked=False)
+    # git takes the directory the link resolves to as the git dir and <path>
+    # as the work tree: judged as a gitfile's target is, resolved, so a link to
+    # another checkout's .git directory is named for what it is.
+    return _git_dir_mismatch(path, os.path.realpath(marker),
+                             via=f"{link}, which resolves to", linked=False)
+
+
+def _gitfile_pointer(text: str, path: Path) -> str | None:
+    """The git dir a gitfile's *text* names, a relative one taken from *path*; ``None`` if none."""
+    text = text.rstrip("\r\n")
+    if not text.startswith("gitdir: ") or len(text) == len("gitdir: "):
+        return None
+    pointer = text[len("gitdir: "):]
+    return pointer if os.path.isabs(pointer) else os.path.join(str(path), pointer)
+
+
+def gitfile_target(path: Path | str) -> str | None:
+    """The git dir the gitfile ``<path>/.git`` names, read as git reads it; ``None`` if none.
+
+    ``gitdir: <pointer>`` with trailing CR/LF trimmed, a relative pointer
+    joined to *path* — never normalised, so the kernel resolves every ``..``
+    as git does. Read without blocking, as a regular file of at most
+    ``_GIT_WRITTEN_MAX`` bytes (:func:`_read_git_written`), so a FIFO planted
+    there cannot hang the caller. ``None`` when it cannot be read so, or
+    holds no pointer. Never raises.
+    """
+    p = Path(path)
+    try:
+        text = _read_git_written(str(p / ".git"))
+    except (OSError, ValueError):
+        return None
+    return _gitfile_pointer(text, p)
+
+
+def _gitfile_mismatch(path: Path, marker: Path, *, linked: bool) -> str:
+    """:func:`registration_mismatch` for a ``.git`` gitfile, or a link to one."""
+    try:
+        text = _read_git_written(str(marker))
+    except (OSError, ValueError) as exc:
+        return f"could not read {marker} ({type(exc).__name__}: {exc})"
+    target = _gitfile_pointer(text, path)
+    if target is None:
+        return f"{marker} holds no 'gitdir: ' pointer"
+    return _git_dir_mismatch(path, target, via="its .git file names", linked=linked)
+
+
+def _git_dir_mismatch(path: Path, target: str, *, via: str, linked: bool) -> str:
+    """Why *target*, the git dir ``<path>/.git`` names (*via*), is not *path*'s own; else ``""``."""
+    shown = display_path(target)          # read from a file: printed quoted
+    if not os.path.isdir(target):
+        return f"{via} {shown}, which is not a directory"
+    repair = (f"`git worktree repair {path}` re-links a tree that was moved; "
+              f"otherwise move it aside")
+    if os.path.isfile(os.path.join(target, "commondir")):
+        try:
+            backlink = _backlink_of(target)
+        except (OSError, ValueError) as exc:
+            return (f"{via} the worktree registration {shown}, whose gitdir "
+                    f"backlink could not be read ({type(exc).__name__}: {exc}) "
+                    f"— {repair}")
+        if _names_marker(backlink, path):
+            return ""
+        return (f"{via} the worktree registration {shown}, whose backlink names "
+                f"{display_path(backlink) if backlink else '(nothing)'}, not "
+                f"{path / '.git'} — {repair}")
+    if linked:
+        return (f"{via} {shown}, a repository's own git dir, not a linked "
+                f"worktree's registration — and every task tree is one")
+    return _own_git_dir_mismatch(path, target, via=via)
+
+
+def _own_git_dir_mismatch(path: Path, target: str, *, via: str) -> str:
+    """:func:`registration_mismatch` for a repository's OWN git dir, named by ``<path>/.git``."""
+    shown = display_path(target)
+    res = git(["config", "--file", os.path.join(target, "config"), "--includes",
+               "--get", "core.worktree"], cwd=path, strip=False, fs_paths=True)
+    if res.code == 0:
+        tree = res.out.removesuffix("\n")
+        named = tree if os.path.isabs(tree) else os.path.join(target, tree)
+        if tree and _same_dir(Path(named), path):
+            return ""
+        return (f"{via} the repository {shown}, whose work tree (core.worktree) "
+                f"is {display_path(named)}, not {path}")
+    # rc 1 is git's "no such key" — said silently. A config file git could
+    # not open answers rc 1 too, with a warning: unknown, not absent.
+    if res.code != 1 or res.err:
+        return (f"{via} the repository {shown}, whose core.worktree could not be "
+                f"read (rc={res.code}: {_one_line(res.err or res.out)})")
+    resolved = _resolved(Path(target))
+    if resolved is None:
+        return f"{via} {shown}, which could not be resolved"
+    if Path(target).name == ".git" or resolved.name == ".git":
+        return (f"{via} {shown}, the .git directory of the checkout at "
+                f"{display_path(str(resolved.parent))} — another checkout's own "
+                f"repository, not one of {path}'s own")
+    return ""
+
+
+def worktree_admin_dirs(repo: Path | str, path: Path | str) -> list[Path] | None:
+    """The linked-worktree admin dirs of *repo* whose ``gitdir`` backlink names *path*.
+
+    ``git worktree prune`` keys a registration on exactly this file, for
+    every registration of the repository at once; this asks it of ONE
+    directory, which must exist (the backlink is compared by the file
+    system: :func:`_names_marker`). An entry of ``<common dir>/worktrees``
+    that is not a plain directory, or whose backlink is missing or
+    unreadable, names nothing — git lists no registration for it either.
+    ``None`` when the common dir cannot be resolved or its ``worktrees``
+    directory cannot be listed. Never raises.
+    """
+    res = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo,
+              confine=True, strip=False, fs_paths=True)
+    out = res.out.removesuffix("\n")
+    common = _resolved(Path(out)) if res.ok and out else None
+    if common is None:
+        return None
+    admin_root = common / "worktrees"
+    try:
+        names = sorted(os.listdir(admin_root))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        return None
+    found: list[Path] = []
+    for name in names:
+        admin = admin_root / name
+        try:
+            if (stat.S_ISDIR(os.lstat(admin).st_mode)
+                    and _names_marker(_backlink_of(str(admin)), Path(path))):
+                found.append(admin)
+        except (OSError, ValueError):
+            continue
+    return found
 
 
 def _unproven(path: Path, reason: str) -> OwnerProof:
@@ -589,8 +924,16 @@ def _same_dir(a: Path, b: Path) -> bool:
     """Do *a* and *b* name the same directory? An unanswerable stat is a no."""
     try:
         return os.path.samefile(a, b)
-    except OSError:
+    except (OSError, ValueError):      # ValueError: a NUL in a path read from a file
         return False
+
+
+def _symlink_text(path: Path) -> str:
+    """``to <target>`` for the symbolic link *path*, the target as one printable token."""
+    try:
+        return f"to {display_path(os.readlink(path))}"
+    except (OSError, ValueError):
+        return "whose target cannot be read"
 
 
 def _refuse_unowned(cwd: Path | str, action: str) -> GitResult | None:
@@ -1900,9 +2243,18 @@ def unstageable_dirt_reason(cwd: Path | str, *, limit: int = 5) -> str:
 # sequencer's todo state), which is why the probe tests existence rather than
 # reading a file. They are listed for the conservative direction: mid-rebase,
 # an empty index falls through to the commit attempt, i.e. exactly what harness
-# did before any of this.
+# did before any of this. ``sequencer`` is the multi-commit cherry-pick/revert
+# state, a directory too.
 _IN_PROGRESS_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
-                        "REBASE_HEAD", "rebase-merge", "rebase-apply")
+                        "REBASE_HEAD", "rebase-merge", "rebase-apply", "sequencer")
+# The markers that are pseudorefs. A reftable repository (``git init
+# --ref-format=reftable``) keeps them in its ref store, so no ``--git-path``
+# file for one ever appears there; ``git rev-parse -q --verify
+# --symbolic-full-name`` reads them through whichever backend the repository
+# uses, and names the ref it found — the pseudoref answers with its bare name,
+# while a branch or tag that merely shares it answers ``refs/...``.
+# ``MERGE_HEAD`` stays a file on both backends, as do the directories.
+_IN_PROGRESS_REFS = frozenset({"CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"})
 
 
 def in_progress_operation(cwd: Path | str) -> str | None:
@@ -1921,6 +2273,18 @@ def in_progress_operation(cwd: Path | str) -> str | None:
     worktree the pipeline actually runs in. The answer can be relative
     (``.git/MERGE_HEAD`` in a plain clone) or absolute, which ``Path.__truediv__``
     resolves either way.
+
+    On a reftable repository the cherry-pick, revert and rebase heads are
+    entries in the ref store, not files, so a file probe alone reads a pending
+    cherry-pick as nothing in progress: those three are also read with ``git
+    rev-parse -q --verify --symbolic-full-name`` — rc 1 absent; rc 0 present
+    only when the ref found is the pseudoref itself, by its exact name. git
+    resolves a short name through its ref search path, so a BRANCH or TAG
+    named ``CHERRY_PICK_HEAD`` resolves too: it answers ``refs/heads/...`` or
+    ``refs/tags/...`` and is no operation. An ambiguous name (git names no
+    single ref) and any other answer are ``"unknown"`` — a failed probe is no
+    "absent". Every git version answers this way, unlike ``show-ref
+    --exists`` (2.43), which is above the warn-only floor.
 
     A probe that cannot be answered reports ``"unknown"`` rather than ``None``:
     callers only test truthiness, and an unreadable marker must read as "an
@@ -1943,6 +2307,26 @@ def in_progress_operation(cwd: Path | str) -> str | None:
             logger.warning("in_progress_operation: cannot stat %s in %s (%s) — "
                            "reporting 'unknown'", marker, cwd, exc)
             return "unknown"
+        if marker not in _IN_PROGRESS_REFS:
+            continue
+        ref = git(["rev-parse", "-q", "--verify", "--symbolic-full-name", marker],
+                  cwd=cwd)
+        if ref.code == 1:
+            continue
+        if ref.code == 0 and ref.out == marker:
+            logger.debug("in_progress_operation: %s present in %s (ref store)",
+                         marker, cwd)
+            return marker
+        if ref.code == 0 and ref.out.startswith("refs/"):
+            logger.debug("in_progress_operation: %s in %s is %s, a ref that only "
+                         "shares the name — not an operation in progress",
+                         marker, cwd, ref.out)
+            continue
+        logger.warning("in_progress_operation: cannot read %s in %s (rc=%s%s) — "
+                       "reporting 'unknown', which callers must treat as an "
+                       "operation possibly in progress", marker, cwd, ref.code,
+                       ", ambiguous: it names no single ref" if ref.code == 0 else "")
+        return "unknown"
     return None
 
 
@@ -5245,7 +5629,73 @@ def tree_sha(cwd: Path | str, ref: str) -> str:
     return git(["rev-parse", "--verify", f"{ref}^{{tree}}"], cwd=cwd).out
 
 
-def content_landed(cwd: Path | str, base: str, head: str = "HEAD") -> bool:
+#: The oldest git with ``merge-tree --write-tree`` (v2.38.0), which the
+#: squash-landed proof (:func:`landed_proof`) and :func:`seed_commit` run.
+#: git 2.31-2.37 answers this module's three-argument call with ``fatal:
+#: unknown rev --write-tree`` and exit 128 — the code a modern git uses for
+#: unrelated histories or a missing object too — so an old git is named only
+#: from the probed ``git --version`` (:func:`_git_older_than`), never from an
+#: exit code.
+MERGE_TREE_WRITE_GIT = "2.38.0"
+
+
+def _git_error_line(res: GitResult) -> str:
+    """git's own words for a failure: its ``fatal:``/``error:`` line, else its first."""
+    lines = [ln.strip() for ln in (res.err or res.out).splitlines() if ln.strip()]
+    line = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))),
+                lines[0] if lines else "no error output")
+    return _one_line(line)
+
+
+def _git_older_than(floor: str) -> str:
+    """The probed git version when it is older than *floor*; ``""`` otherwise.
+
+    Read from the cached ``git --version`` probe that ``harness status``
+    reports (:func:`harness.config.tool_version`); a version that cannot be
+    established names nothing.
+    """
+    # Lazy: harness.config is a leaf the grounding layer imports, and its probe
+    # runs through the pipeline's process-group runner.
+    from harness.config import tool_version
+
+    detected = str(getattr(tool_version("git"), "detected", "") or "")
+    try:
+        found = tuple(int(part) for part in detected.split("."))
+        need = tuple(int(part) for part in floor.split("."))
+    except ValueError:
+        return ""
+    return detected if found < need else ""
+
+
+@dataclass(frozen=True)
+class LandedProof:
+    """Has a branch's work landed in a base — or why that cannot be told.
+
+    ``landed`` is three-state:
+
+    * ``True`` — proven: *head* is an ancestor of the base (``how="ancestor"``),
+      or merging it into the base changes nothing (``"tree-equal"``, the
+      squash-merge case);
+    * ``False`` — proven not: the merge brings changes in (``"tree-differs"``)
+      or conflicts (``"conflict"``);
+    * ``None`` — no proof either way: the base does not resolve (``"no-base"``)
+      or git could not run the proof (``"unavailable"``: a git without
+      ``merge-tree --write-tree``, unrelated histories, a missing object).
+      ``git_code`` is git's exit code and ``detail`` its error line, plus the
+      version floor when the probed git is below it.
+
+    A caller about to delete treats anything but ``True`` as "keep it"; one
+    that explains itself names the unavailable proof instead of calling the
+    work unlanded.
+    """
+
+    landed: bool | None
+    how: str
+    git_code: int = 0
+    detail: str = ""
+
+
+def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
     """Has *head*'s content already landed in *base*, even via a squash-merge?
 
     Two ways work counts as landed:
@@ -5255,89 +5705,343 @@ def content_landed(cwd: Path | str, base: str, head: str = "HEAD") -> bool:
       introduces nothing *base* doesn't already have (the squash-merge case,
       where the branch's own commits are reachable from nowhere).
 
-    Returns ``False`` when it cannot be proven (missing ref, merge conflict) so
-    callers fail *closed* — refuse to delete rather than guess.
+    ``merge-tree --write-tree`` exits 1 on a conflict — not landed — and
+    anything else non-zero when it could not merge at all, which is no answer:
+    every such failure used to read as "not landed", so on a git without
+    ``--write-tree`` every squash-merged branch was reported as unmerged work,
+    behind a remedy that discards it. See :class:`LandedProof`.
     """
-    if not git(["rev-parse", "--verify", base], cwd=cwd).ok:
-        logger.debug("content_landed: base %r does not resolve in %s → NOT landed "
-                     "(fail closed)", base, cwd)
-        return False
+    resolved = git(["rev-parse", "--verify", base], cwd=cwd)
+    if not resolved.ok:
+        logger.debug("landed_proof: base %r does not resolve in %s → no proof "
+                     "(rc=%s)", base, cwd, resolved.code)
+        return LandedProof(None, "no-base", resolved.code,
+                           f"the base {base!r} does not resolve "
+                           f"({_git_error_line(resolved)})")
     if is_ancestor(cwd, head, base):
-        logger.debug("content_landed: %s is an ancestor of %s → landed "
+        logger.debug("landed_proof: %s is an ancestor of %s → landed "
                      "(plain merge)", head, base)
-        return True
-    base_tree = tree_sha(cwd, base)
-    if not base_tree:
-        logger.debug("content_landed: cannot resolve tree of base %r → NOT landed "
-                     "(fail closed)", base)
-        return False
+        return LandedProof(True, "ancestor")
+    base_tree = git(["rev-parse", "--verify", f"{base}^{{tree}}"], cwd=cwd)
+    if not base_tree.ok or not base_tree.out:
+        logger.debug("landed_proof: cannot resolve the tree of base %r → no proof",
+                     base)
+        return LandedProof(None, "unavailable", base_tree.code,
+                           f"the tree of {base!r} cannot be read "
+                           f"({_git_error_line(base_tree)})")
     # lenient: see seed_commit — a conflict on a non-UTF-8 name raised out of
     # every prune that asked whether the branch had landed.
     res = git(["merge-tree", "--write-tree", base, head], cwd=cwd, lenient=True)
-    if not res.ok:
-        logger.debug("content_landed: merge-tree --write-tree rc=%s (conflict or "
-                     "git too old) → inconclusive → NOT landed (fail closed)",
-                     res.code)
-        return False  # conflict / old git without --write-tree → inconclusive
-    merged_tree = res.out.splitlines()[0].strip() if res.out else ""
-    landed = bool(merged_tree) and merged_tree == base_tree
-    logger.debug("content_landed: merge-tree(%s, %s)=%s vs base tree %s → %s",
-                 base, head, trunc(merged_tree, 40), trunc(base_tree, 40),
+    if res.code == 1:
+        logger.debug("landed_proof: merge-tree(%s, %s) conflicts → NOT landed",
+                     base, head)
+        return LandedProof(False, "conflict", 1)
+    merged_tree = res.out.splitlines()[0].strip() if res.ok and res.out else ""
+    if not merged_tree:
+        detail = (f"`git merge-tree --write-tree` exited {res.code}: "
+                  f"{_git_error_line(res)}" if not res.ok else
+                  "`git merge-tree --write-tree` printed no tree")
+        old = _git_older_than(MERGE_TREE_WRITE_GIT)
+        if old:
+            detail += (f" — the squash-landed proof needs git >= "
+                       f"{MERGE_TREE_WRITE_GIT}; this is git {old}")
+        logger.debug("landed_proof: merge-tree(%s, %s) gave no answer → proof "
+                     "unavailable: %s", base, head, detail)
+        return LandedProof(None, "unavailable", res.code, detail)
+    landed = merged_tree == base_tree.out
+    logger.debug("landed_proof: merge-tree(%s, %s)=%s vs base tree %s → %s",
+                 base, head, trunc(merged_tree, 40), trunc(base_tree.out, 40),
                  "landed (squash-equivalent)" if landed else "NOT landed")
-    return landed
+    return LandedProof(landed, "tree-equal" if landed else "tree-differs")
 
 
-def unlanded_by_patch_id(cwd: Path | str, new_head: str, remote: str) -> list[str]:
-    """Commits on *remote* whose changes are NOT present (by patch-id) in *new_head*.
+def content_landed(cwd: Path | str, base: str, head: str = "HEAD") -> bool:
+    """Has *head*'s content provably landed in *base*? :func:`landed_proof` as a bool.
 
-    ``rev-list --cherry-pick --right-only A...B`` lists commits on the *remote*
-    side whose patch-id has no equivalent on *new_head* — exactly the commits a
-    force-push would clobber. Empty ⇒ a force-push only replays equivalent
-    content and is safe. The pipeline's one force-push, pr.py's lease-guarded
-    retry, runs this check first whenever ``refs/heads/<branch>`` and
-    ``refs/remotes/origin/<branch>`` both resolve, and otherwise falls back to
-    the bare lease alone.
+    ``False`` both when the work has not landed and when that cannot be proven,
+    so every deletion gate built on it keeps failing closed; a caller that must
+    say which asks :func:`landed_proof`.
+    """
+    return landed_proof(cwd, base, head).landed is True
+
+
+# ── force-push clobber check (whitespace-exact: a replay counts byte for byte) ────
+
+
+#: The oldest git whose ``patch-id`` takes ``--verbatim`` (v2.39.0); git
+#: 2.31-2.38 answers it with usage and exit 129.
+PATCH_ID_VERBATIM_GIT = "2.39.0"
+
+#: How :func:`clobber_check` renders each commit's patch for its id: plumbing
+#: (no porcelain config — ``diff.context``, ``color.ui``, ``diff.noprefix`` —
+#: applies), and every option that still changes what a patch SAYS pinned,
+#: because the ids are compared byte for byte and the shared ``.git/config``
+#: is agent-writable:
+#:
+#: * ``-U3`` — patch ids ignore line numbers, so with less context the same
+#:   added line in different surroundings hashes the same;
+#: * ``--diff-algorithm=myers`` — a driver's ``diff.<driver>.algorithm``;
+#: * ``--no-textconv`` / ``--no-ext-diff`` — a driver that renders two
+#:   different files as the same text, and a program run while publishing;
+#: * ``--ignore-submodules=none`` — ``submodule.<name>.ignore=all`` drops a
+#:   submodule pointer move from plumbing diffs (and from git's internal
+#:   patch-ids): two commits differing only in it read as the same change;
+#: * ``diff.suppressBlankEmpty=false`` — plumbing honours it, and a context
+#:   line it empties is one ``patch-id`` cannot count;
+#: * ``--no-renames``, ``--full-index``, ``--no-color``, ``core.quotePath=true``
+#:   — one rendering whatever the config says. ``--full-index`` is what makes a
+#:   binary change exact: ``patch-id`` hashes a binary diff by the ``index``
+#:   line's blob ids and skips any payload, so ``--binary`` would change no id
+#:   and only add the files' bytes to what is held in memory.
+#:
+#: Merges render nothing without ``-m``, and are never compared.
+_PATCH_ID_RENDER = (
+    "-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+    "diff-tree", "--stdin", "-p", "--root", "-U3", "--diff-algorithm=myers",
+    "--no-renames", "--full-index", "--no-color", "--no-ext-diff",
+    "--no-textconv", "--ignore-submodules=none",
+)
+
+#: The check reads the commits as they really are (:data:`_REAL_HISTORY`: no
+#: replace ref or graft can make the remote's commit read as harness's), and
+#: empties ``GIT_DIFF_OPTS``: an inherited ``--unified=0`` there overrides even
+#: an explicit ``-U3`` inside git's diff machinery.
+_PATCH_ID_ENV = {**_REAL_HISTORY, "GIT_DIFF_OPTS": ""}
+
+#: Bounds on :func:`clobber_check`, whose patches are held in memory while they
+#: are hashed. The remote's commits are hashed at once, at most
+#: ``_CLOBBER_REMOTE_MAX`` of them; the push's own, newest first, in batches of
+#: ``_PATCH_ID_BATCH`` until every remote id is matched (a replay is usually the
+#: newest commits), at most ``_CLOBBER_LOCAL_MAX`` — a base that moved far on
+#: under a rebased branch makes that side long. Past either bound the check
+#: reports itself unable to tell.
+_CLOBBER_REMOTE_MAX = 1000
+_CLOBBER_LOCAL_MAX = 20000
+_PATCH_ID_BATCH = 256
+
+
+@dataclass(frozen=True)
+class ClobberCheck:
+    """What force-pushing over a remote-tracking ref would drop (:func:`clobber_check`).
+
+    ``unlanded``: the commits only the remote carries that no commit of the
+    push replays byte for byte — what a force-push would clobber. ``merges``
+    and ``empty`` name the ones among them that can never be shown replayed: a
+    merge has no patch-id, an empty commit has no patch. ``error``: the check
+    could not run — a git command failed, or this git has no
+    ``patch-id --verbatim`` — with ``git_code`` that command's exit code. Only
+    a check that ran and found nothing is :attr:`safe`: unknown is never a
+    proof.
+    """
+
+    unlanded: tuple[str, ...] = ()
+    merges: tuple[str, ...] = ()
+    empty: tuple[str, ...] = ()
+    error: str = ""
+    git_code: int = 0
+
+    @property
+    def safe(self) -> bool:
+        return not self.error and not self.unlanded
+
+
+def _clobber_unknown(what: str, res: GitResult) -> ClobberCheck:
+    return ClobberCheck(error=f"`git {what}` failed (exit {res.code}): "
+                              f"{_git_error_line(res)}", git_code=res.code)
+
+
+def _verbatim_patch_ids(cwd: Path | str,
+                        commits: Sequence[str]) -> dict[str, str] | ClobberCheck:
+    """``{commit: its git patch-id --verbatim}`` — a commit with no patch has no entry.
+
+    One ``diff-tree --stdin`` renders every commit and one ``patch-id`` hashes
+    them. Bytes in, bytes out (``fs_paths``): file content that is not UTF-8
+    reaches ``patch-id`` exactly as git wrote it, and a CR stays a CR. Any
+    failure comes back as the :class:`ClobberCheck` that reports it.
+    """
+    rendered = git(list(_PATCH_ID_RENDER), cwd=cwd, strip=False, fs_paths=True,
+                   stdin="".join(f"{commit}\n" for commit in commits),
+                   env=_PATCH_ID_ENV)
+    if not rendered.ok:
+        return _clobber_unknown("diff-tree", rendered)
+    hashed = git(["patch-id", "--verbatim"], cwd=cwd, stdin=rendered.out,
+                 fs_paths=True)
+    if hashed.code == 129:
+        old = _git_older_than(PATCH_ID_VERBATIM_GIT)
+        return ClobberCheck(git_code=129, error=(
+            f"the whitespace-exact check needs `git patch-id --verbatim` (git >= "
+            f"{PATCH_ID_VERBATIM_GIT}), and this git rejected it (exit 129: "
+            f"{_git_error_line(hashed)})" + (f"; this is git {old}" if old else "")))
+    if not hashed.ok:
+        return _clobber_unknown("patch-id --verbatim", hashed)
+    ids: dict[str, str] = {}
+    for line in hashed.out.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(looks_like_object_name(f) for f in fields):
+            return ClobberCheck(error="`git patch-id --verbatim` printed a line that "
+                                      f"is not `<id> <commit>`: {_one_line(line)}")
+        ids[fields[1]] = fields[0]
+    return ids
+
+
+def clobber_check(cwd: Path | str, new_head: str, remote: str) -> ClobberCheck:
+    """Would force-pushing *new_head* over *remote* drop work? Whitespace-exact.
+
+    A commit only *remote* carries (``rev-list --right-only``) counts as
+    replayed only when a commit only *new_head* carries (``--left-only``) has
+    the same ``git patch-id --verbatim``: the same change, byte for byte. Its
+    predecessor — the ``rev-list --cherry-pick`` check — compared git's
+    internal patch-ids, which strip every whitespace byte unconditionally (no
+    option or config reaches that), so after any fetch of the shared clone a
+    reviewer's whitespace-only amend — a YAML dedent, a space inside a string
+    literal, a Makefile recipe's tab — read as replayed and the retry
+    force-pushed it away. A FAILED rev-list printed nothing, and that read as
+    "nothing to lose" too.
+
+    Patches are rendered config-proof (:data:`_PATCH_ID_RENDER`,
+    :data:`_PATCH_ID_ENV`). A remote merge, a remote commit with no patch, and
+    ANY git failure leave the remote's work unproven: the first two are listed
+    as unlanded, a failure is the result's ``error``. A git older than
+    :data:`PATCH_ID_VERBATIM_GIT` has no ``--verbatim``; that is reported as
+    the error rather than answered with the whitespace-blind comparison.
+
+    Residuals, both pinned by tests: a patch-id ignores line numbers, so a hunk
+    moved to a spot with identical context still reads as replayed — a tree
+    check (:func:`landed_proof`) would see that move, but alone it misses a
+    reviewer's partial revert of harness's commit, so it is not used in place
+    of the ids; and a patch-id ignores the commit message, so a reviewer's
+    message-only amend (a DCO ``Signed-off-by:`` added) reads as replayed —
+    comparing messages would refuse every re-run that rewords its own commit,
+    the replay the retry exists for.
+
+    The pipeline's one force-push, pr.py's lease-guarded retry, runs this check
+    first whenever ``refs/heads/<branch>`` and ``refs/remotes/origin/<branch>``
+    both resolve. When the remote-tracking ref provably does not, the retry
+    asserts the remote branch absent instead (:func:`tracking_ref_tip`); when
+    either cannot be read, the retry is refused.
 
     It answers for the push only when *new_head* is the commit the push sends
-    (the pushed branch's tip, not HEAD) and *remote* is the remote-tracking ref
-    it replaces, spelled in full (see :func:`ref_exists`).
+    (the pushed branch's tip, not HEAD) and *remote* is what the push replaces:
+    the commit its lease is anchored to (:func:`tracking_ref_tip`), or a
+    remote-tracking ref spelled in full (see :func:`ref_exists`).
     """
-    res = git(
-        ["rev-list", "--cherry-pick", "--right-only", f"{new_head}...{remote}"],
-        cwd=cwd,
-    )
-    commits = _lines(res.out)
-    logger.debug("unlanded_by_patch_id: %d commit(s) on %s have no patch-id "
-                 "equivalent in %s (0 ⇒ force-push is safe)",
-                 len(commits), remote, new_head)
-    return commits
+    sides = f"{new_head}...{remote}"
+    theirs = git(["rev-list", "--right-only", "--parents", sides], cwd=cwd,
+                 env=_REAL_HISTORY)
+    if not theirs.ok:
+        return _clobber_unknown("rev-list --right-only", theirs)
+    ours = git(["rev-list", "--left-only", sides], cwd=cwd, env=_REAL_HISTORY)
+    if not ours.ok:
+        return _clobber_unknown("rev-list --left-only", ours)
+    remote_only = [line.split() for line in _lines(theirs.out)]
+    local_only = _lines(ours.out)                  # newest first, as rev-list lists
+    if not remote_only:
+        logger.debug("clobber_check: %s holds nothing %s lacks — a force-push "
+                     "drops nothing", remote, new_head)
+        return ClobberCheck()
+    if len(remote_only) > _CLOBBER_REMOTE_MAX:
+        return ClobberCheck(error=(
+            f"{len(remote_only)} commit(s) only on {remote}: more than the "
+            f"{_CLOBBER_REMOTE_MAX} the check compares"))
+    merges = tuple(fields[0] for fields in remote_only if len(fields) > 2)
+    singles = [fields[0] for fields in remote_only if len(fields) <= 2]
+    ids: dict[str, str] = {}
+    if singles:
+        hashed = _verbatim_patch_ids(cwd, singles)
+        if isinstance(hashed, ClobberCheck):
+            logger.debug("clobber_check: cannot tell — %s", hashed.error)
+            return hashed
+        ids = hashed
+    wanted = {ids[commit] for commit in singles if commit in ids}
+    replayed: set[str] = set()
+    for start in range(0, len(local_only), _PATCH_ID_BATCH):
+        if wanted <= replayed:
+            break                                   # every remote id is matched
+        if start >= _CLOBBER_LOCAL_MAX:
+            return ClobberCheck(error=(
+                f"{len(local_only)} commit(s) only in {new_head}: more than the "
+                f"{_CLOBBER_LOCAL_MAX} the check compares, and some commit on "
+                f"{remote} matched none of the first"))
+        batch = _verbatim_patch_ids(cwd, local_only[start:start + _PATCH_ID_BATCH])
+        if isinstance(batch, ClobberCheck):
+            logger.debug("clobber_check: cannot tell — %s", batch.error)
+            return batch
+        replayed |= wanted & set(batch.values())
+    empty = tuple(commit for commit in singles if commit not in ids)
+    unlanded = tuple(fields[0] for fields in remote_only
+                     if fields[0] not in ids or ids[fields[0]] not in replayed)
+    logger.debug("clobber_check: %d of %d commit(s) only on %s are not replayed "
+                 "byte for byte by %s (%d merge, %d empty; 0 ⇒ a force-push "
+                 "drops nothing)", len(unlanded), len(remote_only), remote,
+                 new_head, len(merges), len(empty))
+    return ClobberCheck(unlanded=unlanded, merges=merges, empty=empty)
+
+
+def tracking_ref_tip(cwd: Path | str, ref: str) -> tuple[str, str]:
+    """The commit *ref* names, read once for :func:`clobber_check` and its lease — three-state.
+
+    ``(sha, "")`` when it exists. ``("", "")`` when it provably does not:
+    ``rev-parse --verify --quiet`` exits 1, git's code for a name that does
+    not resolve — a ref file holding garbage answers so too — and the
+    caller's retry then asserts the remote branch ABSENT
+    (``--force-with-lease=refs/heads/<branch>:``, :func:`force_push_with_lease`
+    with no expected SHA), which git checks against the remote's own ref,
+    whatever that file holds. ``("", why)`` for any other answer: a git that
+    timed out or could not run, a damaged repository, an exit-0 answer that
+    names no commit. :func:`ref_exists` reads every failure as "absent": a
+    transient one skipped the clobber check and the retry went out on a bare
+    lease alone (since replaced by the expect-absent lease), held on a ref
+    that was current.
+
+    Not peeled (no ``^{commit}``): a ref whose commit a damaged store lost
+    still reads as existing, and the check that follows fails on it, closed.
+    Spell *ref* in full (see :func:`ref_exists`).
+    """
+    res = git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd)
+    if res.code == 1 and not res.out:
+        return "", ""
+    if res.ok and looks_like_object_name(res.out):
+        return res.out, ""
+    if res.ok:
+        return "", (f"`git rev-parse --verify {ref}` answered without a commit "
+                    f"name ({_one_line(res.out) or 'no output'})")
+    return "", (f"`git rev-parse --verify {ref}` failed (exit {res.code}): "
+                f"{_git_error_line(res)}")
 
 
 def force_push_with_lease(
     worktree: Path | str, remote: str, branch: str, expected_sha: str, *, timeout: int = 300,
 ) -> GitResult:
-    """Force-push *branch* anchored to *expected_sha* (``--force-with-lease``).
+    """Force-push *branch* under a lease (``--force-with-lease``), never a bare one.
 
-    The lease is pinned to the SHA we last verified for the remote ref, so a
-    legitimate rebase replaces it but a concurrent out-of-band push is *refused*
-    rather than silently clobbered. A bare ``--force`` is never used. Confined
-    to *worktree* like the pipeline's plain push (:func:`git`'s *confine*): a
-    ``.git`` marker lost after the caller's ownership proof cannot send the
-    force-push to an enclosing repository.
+    With *expected_sha*, the lease is pinned to the SHA we last verified for
+    the remote ref, so a legitimate rebase replaces it but a concurrent
+    out-of-band push is *refused* rather than silently clobbered. With none
+    (``""``), the lease expects the remote branch ABSENT
+    (``--force-with-lease=refs/heads/<branch>:``), which git checks against
+    the remote's own ref: refused wherever that branch exists. A bare
+    ``--force-with-lease`` — checked against whatever remote-tracking ref the
+    fetch refspec maps the branch to — and a bare ``--force`` are never used.
+
+    The refspec is named in full and unforced,
+    ``refs/heads/<branch>:refs/heads/<branch>``, so git consults neither
+    ``remote.<remote>.push`` nor ``push.default``: a colon-less ``<branch>``
+    went through that mapping, and a FORCED one in the repository's config
+    (``+refs/heads/*:refs/heads/*``, in the shared common dir an agent can
+    write) made the push a forced one, which overrides any lease.
+
+    Confined to *worktree* like the pipeline's plain push (:func:`git`'s
+    *confine*): a ``.git`` marker lost after the caller's ownership proof
+    cannot send the force-push to an enclosing repository.
     """
-    lease = f"--force-with-lease={branch}:{expected_sha}" if expected_sha else "--force-with-lease"
     if expected_sha:
+        lease = f"--force-with-lease={branch}:{expected_sha}"
         logger.debug("force-push %s to %s: lease anchored to %s (out-of-band "
                      "pushes will be refused)", branch, remote, expected_sha)
     else:
-        # Deliberate caller choice (see pr.py): a bare lease anchors to the
-        # stored remote-tracking ref — still refuses any remote advance we
-        # haven't fetched. DEBUG, not WARNING: the caller narrates its retry.
-        logger.debug("force-push %s to %s: bare --force-with-lease (no expected "
-                     "SHA) — leased on the stored remote-tracking ref",
-                     branch, remote)
-    return git(["push", lease, remote, branch], cwd=worktree, timeout=timeout,
-               confine=True)
+        lease = f"--force-with-lease=refs/heads/{branch}:"
+    return git(["push", lease, remote, f"refs/heads/{branch}:refs/heads/{branch}"],
+               cwd=worktree, timeout=timeout, confine=True)
 
 
 # No `remote_url()` accessor on purpose: `git remote get-url` returns the

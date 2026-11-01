@@ -1707,6 +1707,11 @@ class _FakeAgentCli(AgentCliBackend):
     def available(self):
         return True, ""
 
+    def cap_refusal(self, config):
+        # The canned runs launch no CLI, so no cap has a CLI to reach — and the
+        # host's own agent CLI must not decide a test.
+        return ""
+
     def _run_agent(self, ctx, feedback, pending_commit_failure=None, *, budget=None):
         if self._write_each:
             (Path(ctx.worktree) / self._write_each).write_text("x = 1\n")
@@ -1945,14 +1950,21 @@ def test_feedback_round_not_inflated_by_body_marker(tmp_path):
     assert (r1, r2) == (1, 2)                                    # not jumped to 2,3
 
 
-def test_safe_repush_uses_bare_lease_not_fetch(tmp_path, monkeypatch):
-    """_safe_repush must NOT git-fetch (which would defeat the lease); it uses a
-    bare --force-with-lease against the stored remote-tracking ref."""
+def test_safe_repush_uses_expect_absent_lease_not_fetch(tmp_path, monkeypatch):
+    """_safe_repush must NOT git-fetch (which would defeat the lease); it leases
+    against the stored remote-tracking ref — here absent (``rev-parse --verify
+    --quiet`` exits 1, git's "no such ref"), so the retry's lease expects the
+    remote branch to be absent (``--force-with-lease=refs/heads/<branch>:``). A
+    present ref anchors the lease to the commit it names
+    (tests/test_pr_github.py, tests/test_clobber_check.py)."""
     from harness.pipeline.pr import GitHubPR
     calls = []
 
     def fake_git(args, **kw):
         calls.append(list(args))
+        if list(args[:3]) == ["rev-parse", "--verify", "--quiet"] \
+                and str(args[3]).startswith("refs/remotes/"):
+            return gitutil.GitResult(1, "", "")          # no such ref, as git answers
         return gitutil.GitResult(0, "", "")
 
     monkeypatch.setattr(gitutil, "git", fake_git)
@@ -1961,25 +1973,31 @@ def test_safe_repush_uses_bare_lease_not_fetch(tmp_path, monkeypatch):
     flat = [" ".join(c) for c in calls]
     assert not any(c[:1] == ["fetch"] for c in calls), f"must not fetch: {flat}"
     assert any("--force-with-lease" in " ".join(c) for c in calls)
-    # bare lease (no :SHA anchor) so it leases against the stored remote-tracking ref
-    assert any(c == "--force-with-lease" for parts in calls for c in parts)
+    # the lease expects the remote branch ABSENT (an empty expected value), never the
+    # bare token git checks against whatever tracking ref its fetch refspec maps to
+    assert ["push", "--force-with-lease=refs/heads/agent/x:", "origin",
+            "refs/heads/agent/x:refs/heads/agent/x"] in calls
+    assert not any(c == "--force-with-lease" for parts in calls for c in parts)
 
 
 # ── agent-cli backend: allow rules, containment, CLI-side caps, model pin ───────
 
 # The agent CLI's --help as a modern CLI advertises it (see backends/agent_cli._cli_help).
+# Like some real agent CLIs it does not list --max-turns: the CLI declares that
+# option hidden, and only its option parser shows it takes it.
 _HELP_MODERN = """Options:
   --allowedTools, --allowed-tools <tools...>  Comma-separated list to allow
   --fallback-model <model>              Automatic fallback when overloaded
   --json-schema <schema>                JSON Schema for structured output
   --max-budget-usd <amount>             Maximum dollar amount to spend
-  --max-turns <n>                       Maximum agentic turns
   --model <model>                       Model for the current session
   --permission-mode <mode>              (choices: "acceptEdits", "dontAsk", "plan")
   --setting-sources <sources>           Comma-separated list of setting sources
   --strict-mcp-config                   Only use MCP servers from --mcp-config
   --tools <tools...>                    Use "" to disable all tools
 """
+# What the modern CLI declares but leaves out of that help.
+_HIDDEN_MODERN = ("--max-turns",)
 # An older CLI with no containment knobs at all.
 _HELP_OLD = """Options:
   --allowedTools, --allowed-tools <tools...>  Comma-separated list to allow
@@ -1987,14 +2005,34 @@ _HELP_OLD = """Options:
 """
 
 
-def _stub_agent_cli(monkeypatch, *, help_text=_HELP_MODERN, stdout="{}", rc=0,
-                     stderr=""):
+def _parser_answers(help_text, hidden):
+    """How the stub CLI's option parser answers harness's dry-run flag probe
+    (``<cli> --help <flag>``, backends/agent_cli._cli_parse_probe) for each cap
+    flag, as a real one does: its "argument missing" error for an option it
+    declares (listed in *help_text* or *hidden*), its help and exit 0 for one
+    it does not."""
+    answers = {}
+    for flag, value in (("--max-turns", "<turns>"), ("--max-budget-usd", "<amount>")):
+        declared = flag in hidden or flag in help_text
+        answers[("gemini", flag)] = (
+            (1, f"error: option '{flag} {value}' argument missing") if declared
+            else (0, help_text))
+    return answers
+
+
+def _stub_agent_cli(monkeypatch, *, help_text=_HELP_MODERN, hidden=None, stdout="{}",
+                    rc=0, stderr=""):
     """Replace the agent CLI with a stub; return the list of launched argvs.
 
     *stderr* defaults to ``""`` (the historical behaviour) so every existing
     caller is unaffected; the denial tests use it to reproduce the real envelope
-    where a big stderr crowds out everything appended after it.
+    where a big stderr crowds out everything appended after it. *hidden* names
+    the options the stub's parser declares although its help leaves them out:
+    ``None`` is the modern CLI's (:data:`_HIDDEN_MODERN`) under the modern help
+    and none under any other.
     """
+    if hidden is None:
+        hidden = _HIDDEN_MODERN if help_text is _HELP_MODERN else ()
     import types
 
     import harness.pipeline.backends.agent_cli as ac
@@ -2012,6 +2050,8 @@ def _stub_agent_cli(monkeypatch, *, help_text=_HELP_MODERN, stdout="{}", rc=0,
 
     monkeypatch.setattr(ac.shutil, "which", lambda _n: "/usr/bin/gemini")
     monkeypatch.setattr(ac, "_CLI_HELP_CACHE", {"gemini": help_text})
+    monkeypatch.setattr(ac, "_CLI_PARSE_CACHE", _parser_answers(help_text, hidden),
+                        raising=False)
     # Pin the version as well. Under a hard floor pinned for the agent CLI,
     # availability fails CLOSED on a version that cannot be verified, so the
     # stub states one (the recommended floor, when one is pinned) — with a probe
@@ -2297,6 +2337,9 @@ def test_loop_budget_remaining_cost():
 
 
 def test_model_and_turn_caps_are_passed_when_configured(tmp_path, monkeypatch):
+    """The turn cap reaches the argv although --help never lists --max-turns
+    (some agent CLIs hide it): the CLI's option parser shows it takes the flag.
+    Read from --help alone, HARNESS_MAX_TURNS was dropped on every run."""
     launched = _stub_agent_cli(monkeypatch)
     ctx = _agent_ctx(tmp_path)
     ctx.config.agent_model = "agent-test-1"
@@ -2309,14 +2352,36 @@ def test_model_and_turn_caps_are_passed_when_configured(tmp_path, monkeypatch):
     assert cmd[cmd.index("--max-turns") + 1] == "12"
 
 
-def test_turn_cap_is_dropped_on_a_cli_that_does_not_support_it(tmp_path, monkeypatch):
-    """An unknown flag kills the invocation outright — probe, never assume."""
+@pytest.mark.parametrize("cap", ["turns", "cost"])
+def test_a_cap_the_cli_cannot_take_refuses_the_launch(tmp_path, monkeypatch, cap):
+    """Fail CLOSED: a cap the operator set that the installed CLI cannot be
+    shown to take is never dropped — the agent is not launched, and the refusal
+    is permanent (the same CLI answers alike on a retry). The flag used to be
+    left out silently, and the agent ran uncapped."""
+    launched = _stub_agent_cli(monkeypatch, help_text=_HELP_OLD)
+    ctx = _agent_ctx(tmp_path)
+    budget = None
+    if cap == "turns":
+        ctx.config.max_agent_turns = 12
+    else:
+        budget = LoopBudget(max_cost_usd=5.0)
+    run = AgentCliBackend()._run_agent(ctx, "", budget=budget)
+    assert launched == []
+    assert not run.ok and run.permanent
+    flag = "--max-turns" if cap == "turns" else "--max-budget-usd"
+    assert flag in run.detail and "refusing to launch" in run.detail.lower()
+
+
+def test_a_turn_cap_the_cli_cannot_take_stops_the_task_before_any_launch(tmp_path,
+                                                                        monkeypatch):
+    """The whole task: one refusal, no agent launched, no retry spent."""
     launched = _stub_agent_cli(monkeypatch, help_text=_HELP_OLD)
     ctx = _agent_ctx(tmp_path)
     ctx.config.max_agent_turns = 12
-    AgentCliBackend()._run_agent(ctx, "", budget=LoopBudget(max_cost_usd=5.0))
-    cmd = launched[0]["cmd"]
-    assert "--max-turns" not in cmd and "--max-budget-usd" not in cmd
+    ctx.config.max_agent_retries = 3
+    out = AgentCliBackend().implement(ctx)
+    assert out.status == "failed" and launched == []
+    assert "max_agent_turns" in out.detail and "--max-turns" in out.detail
 
 
 # ── untrusted mode: the reviewed repo must not configure the agent judging it ────

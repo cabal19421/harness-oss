@@ -19,13 +19,18 @@ mitigation; the redaction/stripping reduce the blast radius.
 The *other* boundary the same text crosses is publication: a PR body carries
 that design text to a public remote, where a home-directory path, a pasted
 token or a forged attestation marker is somebody else's to read.
-:func:`sanitize_publication` is that boundary's single scrub.
+:func:`sanitize_publication` is that boundary's single scrub;
+:func:`redact_worktree_paths` its pass for harness's own checkout paths; and
+:func:`publication_hazards` the narrow test a refuse-only guard keys on, for
+text harness must publish as written or not at all.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+from contextlib import suppress
 
 from harness.log import get_logger, redact_home_paths, redact_url_userinfo, trunc
 
@@ -280,7 +285,10 @@ def neutralize_gh_escapes(text: str) -> str:
     return _GH_ESCAPE_RE.sub(lambda m: "\\u{00" + m.group(1) + "}", text)
 
 
-def sanitize_publication(text: str) -> str:
+def sanitize_publication(text: str, *, worktree: str | os.PathLike[str] | None = None,
+                         worktree_root: str | os.PathLike[str] | None = None,
+                         repo: str | os.PathLike[str] | None = None,
+                         designs: str | os.PathLike[str] | None = None) -> str:
     """Scrub *text* for a surface harness PUBLISHES (a PR body, a packet).
 
     The prompt boundary has :func:`sanitize_design`; this is its counterpart for
@@ -293,13 +301,172 @@ def sanitize_publication(text: str) -> str:
     because dropping an escape sequence JOINS the text around it — run after
     the other passes, ``<!-\\x1b[0m- harness:`` became a live marker, a
     ``ghp_`` token split by one survived unredacted, and so did a home path.
-    Then markers (defanged by shape), then secrets (a design doc that pasted a
-    token is the case :func:`redact_secrets` already knows), then home paths
-    last, so a credential is masked whole rather than surviving as a
+    Then, when the caller names them, harness's own paths
+    (:func:`redact_worktree_paths`: *worktree*, *worktree_root*, *repo*,
+    *designs* → placeholders) — before any pass that could cut one apart (a
+    loose secret shape matches inside a task id), and before the home pass,
+    which would leave ``~/…`` of one under ``$HOME`` and all of one outside
+    it. Then markers (defanged by shape), then secrets (a design doc that
+    pasted a token is the case :func:`redact_secrets` already knows), then home
+    paths last, so a credential is masked whole rather than surviving as a
     ``~``-rewritten fragment.
     """
-    return redact_home_paths(redact_secrets(neutralize_markers(
-        neutralize_controls(text))))
+    text = neutralize_controls(text)
+    if any(p is not None for p in (worktree, worktree_root, repo, designs)):
+        text = redact_worktree_paths(text, worktree=worktree,
+                                     worktree_root=worktree_root, repo=repo,
+                                     designs=designs)
+    return redact_home_paths(redact_secrets(neutralize_markers(text)))
+
+
+# ── harness's own paths ───────────────────────────────────────────────────────
+#
+# The task's worktree, the root every task worktree lives under, the main
+# checkout and the designs directory are the operator's filesystem layout, and
+# no published surface needs them: the human reading the ide-handoff packet is
+# already in that folder, and the console prints them. The home pass rewrites a
+# path under $HOME to `~` and leaves every other path alone, so a repository
+# under /srv published its layout verbatim — in a review round's traceback, for
+# one — and so did a design kept outside the repository, which ingest records by
+# its absolute path. This pass names each by its role instead.
+
+#: What :func:`redact_worktree_paths` writes for the task's own worktree.
+WORKTREE_PLACEHOLDER = "{worktree}"
+#: … for the root every task worktree lives under (another task's tree included).
+WORKTREES_PLACEHOLDER = "{worktrees}"
+#: … for the main checkout.
+REPO_PLACEHOLDER = "{repo}"
+#: … for the designs directory (``--designs``, in or outside the repository).
+DESIGNS_PLACEHOLDER = "{designs}"
+
+# The home pass's leading boundary (harness.log): not preceded by a path or URL
+# character, so a URL that merely contains the spelling keeps its host. The
+# trailing one: not followed by a name character, so `…/wt-t1` never clips
+# `…/wt-t10` — and a `.` counts as one only when a name character follows it
+# (`…/proj.git` is another name), so a path that ENDS a sentence ("see
+# /srv/proj.") is still rewritten. The home pass's own-homes boundary refuses
+# that `.` too; its generic pattern takes the period with the account name.
+_PATH_LEADING = r"(?<![A-Za-z0-9_.~%+/-])"
+_PATH_TRAILING = r"(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])"
+
+
+def _path_spellings(path: str | os.PathLike[str] | None) -> set[str]:
+    """*path* as given and ``realpath``-resolved, absolute only, no trailing slash.
+
+    Both, because a symlinked layout reaches the text in whichever spelling the
+    tool that printed it resolved. The filesystem root is never one.
+    """
+    if path is None:
+        return set()
+    raw = os.fspath(path)
+    if not raw or not os.path.isabs(raw):
+        return set()
+    found = {raw, os.path.normpath(raw)}
+    with suppress(OSError, ValueError):
+        found.add(os.path.realpath(raw))
+    return {s.rstrip("/") for s in found if len(s.rstrip("/")) > 1}
+
+
+def redact_worktree_paths(text: str, *, worktree: str | os.PathLike[str] | None = None,
+                          worktree_root: str | os.PathLike[str] | None = None,
+                          repo: str | os.PathLike[str] | None = None,
+                          designs: str | os.PathLike[str] | None = None) -> str:
+    """Rewrite harness's own paths in *text* to placeholders.
+
+    *worktree* becomes ``{worktree}``, *worktree_root* — and so any other task's
+    worktree under it — ``{worktrees}``, the main checkout *repo* ``{repo}``,
+    the *designs* directory ``{designs}``, each in every spelling (as given,
+    normalised, and realpath-resolved) and path-boundary aligned on both ends,
+    longest first, so the task's own tree is named as such rather than as
+    ``{worktrees}/wt-…`` (and a designs directory inside the repository as
+    ``{designs}``). A spelling two roles share keeps the first role's
+    placeholder. Never raises.
+    """
+    pairs: dict[str, str] = {}
+    for path, placeholder in ((worktree, WORKTREE_PLACEHOLDER),
+                              (worktree_root, WORKTREES_PLACEHOLDER),
+                              (repo, REPO_PLACEHOLDER),
+                              (designs, DESIGNS_PLACEHOLDER)):
+        for spelling in _path_spellings(path):
+            pairs.setdefault(spelling, placeholder)
+    if not pairs:
+        return text
+    count = 0
+    for spelling in sorted(pairs, key=len, reverse=True):
+        literal = pairs[spelling].replace("\\", "\\\\")     # a template: keep it literal
+        text, n = re.subn(_PATH_LEADING + r"(?:file://)?" + re.escape(spelling)
+                          + _PATH_TRAILING, literal, text)
+        count += n
+    if count:
+        logger.debug("rewrote %d of harness's own path(s) in published text to "
+                     "placeholders ({worktree} / {worktrees} / {repo} / {designs})",
+                     count)
+    return text
+
+
+# ── what must never be published as written (refuse-only guards) ─────────────
+#
+# For text harness may NOT rewrite — the agent's own commit messages: a rewrite
+# would skip the repository's commit-msg hook and break the binding to the
+# reviewed commit — the only answer to a hazard is to refuse and say what to
+# fix. A refusal has to be right, so it keys on what no prose produces: terminal
+# control characters, and the credential shapes below, each anchored at a token
+# boundary. The redaction patterns above are tuned to REDACT, where a false
+# positive costs a word; as a refusal they stopped innocent messages
+# ("Read api_key: settings.API_KEY_FROM_ENVIRONMENT", "Add
+# task-queue-worker-pool-sizing" — `sk-` right after `ta`), so the keyword/value
+# and bare Bearer/Basic patterns are not used at all, the token shapes are
+# narrowed, and URL userinfo counts only with a literal password.
+
+_CREDENTIAL_SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("a private key block", re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----END).){16,}?"
+        r"-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL)),
+    # A random key body has a digit and a capital; a kebab-case phrase has neither.
+    ("an sk- API key", re.compile(
+        r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])"
+        r"[A-Za-z0-9_-]{20,}")),
+    ("a GitHub token", re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("a GitHub fine-grained token", re.compile(
+        r"(?<![A-Za-z0-9_])github_pat_(?=[A-Za-z0-9_]*[0-9])[A-Za-z0-9_]{40,}")),
+    ("a GitLab token", re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}")),
+    ("an npm token", re.compile(r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])")),
+    ("a Google API key", re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}")),
+    ("a Slack token", re.compile(r"(?<![A-Za-z0-9_-])xox[abprs]-[0-9]+-[A-Za-z0-9-]{8,}")),
+    ("a Slack webhook URL", re.compile(
+        r"https://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_+-]{16,}")),
+    ("an AWS access key id", re.compile(r"(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![0-9A-Z])")),
+    ("a JSON web token", re.compile(
+        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
+    # user:password@ with a literal password — not `git@host`, not a placeholder.
+    ("a URL with a password", re.compile(
+        r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s/?#@:]*:(?![$<{*%])[^\s/?#@]+@")),
+)
+
+#: A C1 byte (0x80-0x9F) that is part of no UTF-8 sequence, as text decoded with
+#: ``errors="surrogateescape"`` carries it (U+DC80-U+DC9F). git prints a
+#: hand-made commit's raw bytes unconverted, and git itself reads a stray byte
+#: as Latin-1 (``git commit`` re-encodes 0x9B to U+009B, a C1 CSI), so this is a
+#: control character too.
+_RAW_C1_RE = re.compile("[\udc80-\udc9f]")
+
+
+def publication_hazards(text: str) -> list[str]:
+    """What in *text* must not be published as written, by kind — ``[]`` when nothing.
+
+    For a REFUSE-only guard over text harness may not rewrite (the agent's own
+    commit messages, before ``GitHubPR.open`` pushes them): terminal control
+    characters — what :func:`neutralize_controls` would change, or a raw C1
+    byte left as a surrogate escape (:data:`_RAW_C1_RE`) — and the
+    high-confidence credential shapes of :data:`_CREDENTIAL_SHAPES`. Each
+    finding names a kind, never the matched text: the refusal is logged and
+    shown to the operator.
+    """
+    found: list[str] = []
+    if neutralize_controls(text) != text or _RAW_C1_RE.search(text):
+        found.append("terminal control characters")
+    found.extend(kind for kind, shape in _CREDENTIAL_SHAPES if shape.search(text))
+    return found
 
 
 def wrap_untrusted(text: str, *, label: str = "SOURCE DESIGN DOCUMENT") -> str:

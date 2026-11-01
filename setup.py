@@ -34,7 +34,7 @@ setup(
         # 'guard_exclusivity' constraint kinds (the builtin solver abstains on
         # both). Not a speed-up — a capability. See INSTALL.md.
         #
-        # Deliberately UNCAPPED. Tested range: 4.12 … 5.3.1.0. The 4.x→5.x major
+        # Deliberately UNCAPPED. Tested range: 4.12 … 5.3.3.0. The 4.x→5.x major
         # bump broke nothing this package uses (Int/Real/RealVal/BoolVal/And/Or/
         # Not/Solver/add/check/assertions/sat/unsat all predate 4.12; 5.0.0's one
         # documented break is Java-only), and `Z3Solver.__init__` now probes those

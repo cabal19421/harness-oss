@@ -41,9 +41,21 @@ from harness.pipeline.trace import read_spans
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
 

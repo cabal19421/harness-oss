@@ -975,9 +975,20 @@ def _pipeline_dispatch(sub: str, args: argparse.Namespace, config,
             allow_dirty=getattr(args, "allow_dirty", False) or force,
             allow_unlanded=getattr(args, "allow_unlanded", False) or force,
         )
+        listing_failed = pruned.pop("listing_failed", [])
         for label, branches in pruned.items():
             if branches:
                 print(_info(f"  {label.replace('_', ' ')}: {', '.join(branches)}"))
+        if listing_failed:
+            # Not "nothing to prune": git could not list the agent/* branches,
+            # so none was looked at and none deleted. A git refusal of a
+            # pipeline subcommand exits 2 in this one shape (the GitError
+            # handler in _cmd_pipeline), as prune's refusal under a live run
+            # does: prune could not do its job.
+            print(_error(f"pipeline prune: the agent/* branches could not be "
+                         f"listed ({'; '.join(listing_failed)}) — no branch was "
+                         f"pruned"))
+            sys.exit(2)
         if not any(pruned.values()):
             print(_info("  no agent/* branches to prune"))
         return

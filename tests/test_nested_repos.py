@@ -85,8 +85,21 @@ def _attempts_begin_after_their_snapshot(monkeypatch):
     monkeypatch.setattr(gitutil, "untracked_nested_repos", snapshot_then_wait)
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
+
 def _git(args, cwd, *, check: bool = True) -> str:
-    res = subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=str(cwd),
+    res = subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd),
                          capture_output=True, text=True, check=False)
     if check and res.returncode:
         raise AssertionError(f"git {' '.join(args)} failed in {cwd}: {res.stderr}")
@@ -274,6 +287,140 @@ def test_a_repo_that_was_there_before_the_attempt_survives_it(tmp_path, caplog):
     assert note.startswith(gitutil.NESTED_NOTE_PREFIX)
     assert "ops/lib" in note and "survived" in note
     assert "survived the discard" in caplog.text
+
+
+def test_a_commit_repair_after_green_is_still_told_the_operators_repo_is_not_its(
+        tmp_path):
+    """The operator's repository survives a red attempt's discard, and the next
+    agent is told so: it was there before, it is not theirs, do not delete it.
+    That attempt goes green, and its commit is refused — the operator's
+    repository is an unregistered gitlink. Green drops the red verdict (and a
+    cap note), not that note: its facts still hold, and the repair's only other
+    guidance, the refusal, suggests deleting the directory. PRE-FIX (since the
+    green path reset the whole feedback) the repair was handed no feedback at
+    all."""
+    repo, wt = _repo(tmp_path)
+    ops = _nested(wt / "ops" / "lib", commits=2)
+    (ops / "notes.txt").write_text("operator's uncommitted notes\n")
+
+    def red(w: Path) -> None:
+        (w / "app.py").write_text("x = 1/0\n")
+
+    def repair(w: Path) -> None:
+        pass
+
+    backend = _Scripted([red, _green_edit, repair], [False, True, True])
+    backend.implement(_ctx(repo, wt, max_iters=3))
+
+    note, _sep, verdict = backend.feedbacks[1].partition("\n\n")
+    assert note.startswith(gitutil.NESTED_NOTE_PREFIX), backend.feedbacks[1]
+    assert "ops/lib" in note and "Do not delete what was there before" in note
+    assert "red 1" in verdict                            # what green answered
+    assert backend.repairs[:2] == [None, None]
+    assert "ops/lib" in (backend.repairs[2] or ""), backend.repairs   # the refused commit
+    repair_feedback = backend.feedbacks[2]
+    assert repair_feedback == note, repair_feedback
+    assert "red 1" not in repair_feedback and "still failing" not in repair_feedback
+    assert "per-call cap" not in repair_feedback
+    assert _commits(ops) == 2
+    assert (ops / "notes.txt").read_text() == "operator's uncommitted notes\n"
+
+
+#: How the backend's agent call reports a call the CLI ended at its turn cap
+#: (``_Run.capped``, the envelope's words as ``_cli_cap_text`` renders them).
+_TURNS_CAP = "error_max_turns: Reached maximum number of turns (5)"
+
+
+class _ScriptedCaps(_Scripted):
+    """:class:`_Scripted`, with the calls numbered in *capped* (from 0) ended at
+    the CLI's turn cap."""
+
+    def __init__(self, steps, greens, capped) -> None:
+        super().__init__(steps, greens)
+        self.capped = set(capped)
+
+    def _run_agent(self, ctx, feedback, pending_commit_failure=None, *, budget=None):
+        call = self.n
+        run = super()._run_agent(ctx, feedback, pending_commit_failure, budget=budget)
+        if call in self.capped:
+            run.capped = _TURNS_CAP
+        return run
+
+
+def test_a_kept_capped_red_call_keeps_the_nested_repository_note_leading(tmp_path):
+    """[red (discarded: the note), capped red (kept), green (commit refused),
+    repair]. The capped call's red verdict discards nothing, so the note the
+    discard before it wrote still holds: it leads that call's feedback, ahead
+    of the cap note and the red verdict, and green keeps it for the repair.
+    PRE-FIX the verdict restarted the feedback behind the cap note, the note
+    was gone, and the repair after green was handed an empty feedback: its one
+    other guidance, the refusal of the operator's repository, suggests
+    deleting the directory."""
+    repo, wt = _repo(tmp_path)
+    ops = _nested(wt / "ops" / "lib", commits=2)
+
+    def red(w: Path) -> None:
+        (w / "app.py").write_text("x = 1/0\n")
+
+    def capped_red(w: Path) -> None:
+        (w / "app.py").write_text("x = 2/0\n")
+
+    def repair(w: Path) -> None:
+        pass
+
+    backend = _ScriptedCaps([red, capped_red, _green_edit, repair],
+                            [False, False, True, True], capped={1})
+    backend.implement(_ctx(repo, wt, max_iters=4))
+
+    note, _sep, verdict = backend.feedbacks[1].partition("\n\n")
+    assert note.startswith(gitutil.NESTED_NOTE_PREFIX), backend.feedbacks[1]
+    assert "ops/lib" in note and "red 1" in verdict
+    # The green call hears the note, then the cap note, then the capped call's verdict.
+    assert backend.feedbacks[2].startswith(f"{note}\n\n"), backend.feedbacks[2]
+    cap_note, _sep, rest = backend.feedbacks[2][len(note) + 2:].partition("\n\n")
+    assert cap_note.startswith("Note: the previous attempt was ended by its per-call "
+                               f"cap before it finished ({_TURNS_CAP})"), cap_note
+    assert "red 2" in rest and "red 1" not in rest, rest
+    # The repair after green hears the note, and only the note.
+    assert backend.repairs[:3] == [None, None, None]
+    assert "ops/lib" in (backend.repairs[3] or ""), backend.repairs   # the refused commit
+    assert backend.feedbacks[3] == note, backend.feedbacks[3]
+    assert _commits(ops) == 2
+
+
+def test_a_red_commit_repair_keeps_the_nested_repository_note_leading(tmp_path):
+    """[red (discarded: the note), green (commit refused), red repair, repair].
+    A red repair call discards nothing (the green work it repairs is still
+    pending), so the note still holds: it leads the feedback, ahead of that
+    call's red verdict. PRE-FIX the verdict restarted the feedback, and the
+    repair after it was handed only "Validation commands are still failing:
+    …"."""
+    repo, wt = _repo(tmp_path)
+    ops = _nested(wt / "ops" / "lib", commits=2)
+
+    def red(w: Path) -> None:
+        (w / "app.py").write_text("x = 1/0\n")
+
+    def red_repair(w: Path) -> None:
+        (w / "app.py").write_text("x = 3/0\n")
+
+    def repair(w: Path) -> None:
+        (w / "app.py").write_text("x = 42\n")
+
+    backend = _Scripted([red, _green_edit, red_repair, repair], [False, True, False, True])
+    backend.implement(_ctx(repo, wt, max_iters=4))
+
+    note = backend.feedbacks[1].partition("\n\n")[0]
+    assert note.startswith(gitutil.NESTED_NOTE_PREFIX), backend.feedbacks[1]
+    assert backend.feedbacks[2] == note, backend.feedbacks[2]   # green kept it
+    assert backend.repairs[:2] == [None, None]
+    assert "ops/lib" in (backend.repairs[2] or ""), backend.repairs   # the refused commit
+    lead, _sep, verdict = backend.feedbacks[3].partition("\n\n")
+    assert lead == note, backend.feedbacks[3]
+    assert "red 3" in verdict and "red 1" not in verdict, verdict
+    assert "per-call cap" not in backend.feedbacks[3]
+    assert backend.repairs[3] == backend.repairs[2]                # still that repair
+    assert _commits(ops) == 2
 
 
 def test_an_agent_mv_cannot_launder_a_repo_that_was_there_before(tmp_path):

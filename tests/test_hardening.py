@@ -72,7 +72,12 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
                      "-c", "submodule.recurse=false",
-                     "-c", "color.ui=never")
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args, cwd):
@@ -181,6 +186,44 @@ def test_parse_agent_usage_is_defensive():
     assert tokens == 15 and abs(cost - 0.12) < 1e-9
     assert parse_agent_usage("not json") == (0, 0.0)
     assert parse_agent_usage("[1,2,3]") == (0, 0.0)
+
+
+@pytest.mark.parametrize("envelope, counted, said", [
+    pytest.param({"total_cost_usd": 0.12,
+                  "usage": {"input_tokens": float("inf"), "output_tokens": 5}},
+                 (5, 0.12), "usage field inf does not coerce to int — counting 0",
+                 id="an-Infinity-token-count"),
+    pytest.param({"usage": {"input_tokens": 7, "cache_read_input_tokens": float("-inf")}},
+                 (7, 0.0), "usage field -inf does not coerce to int — counting 0",
+                 id="a-minus-Infinity-token-count"),
+    pytest.param({"total_cost_usd": 2**1024, "usage": {"input_tokens": 5}},
+                 (5, 0.0), "does not coerce to float — counting 0.0",
+                 id="an-integer-cost-past-the-float-range"),
+    pytest.param({"total_cost_usd": -(2**1024), "usage": {"output_tokens": 5}},
+                 (5, 0.0), "does not coerce to float — counting 0.0",
+                 id="a-negative-integer-cost-past-the-float-range"),
+    pytest.param({"total_cost_usd": 0.3,
+                  "usage": {"input_tokens": 100, "output_tokens": -60,
+                            "cache_creation_input_tokens": 7}},
+                 (107, 0.3), "usage field -60 is below zero — counting 0",
+                 id="a-negative-token-count"),
+])
+def test_a_usage_figure_that_overflows_or_is_below_zero_counts_as_none(
+        caplog, envelope, counted, said):
+    """The usage parser's figures, as ``json.loads`` reads the CLI's JSON: a
+    bare ``Infinity`` or ``-Infinity`` token count is a float infinity, which
+    ``int()`` refuses with OverflowError, and an integer cost past the float
+    range is one ``float()`` refuses the same way. Each counts 0 like any
+    other drift, with the DEBUG line of any field that does not coerce. A
+    token count below zero is no count either: it counts 0, as a missing one
+    does, so it cancels neither the envelope's other fields nor the other
+    attempts of its iteration. PRE-FIX the overflow escaped as OverflowError
+    (raised inside the agent call, before its cost clamp and its sweeps), and
+    a negative count was summed as it was: 100 - 60 + 7 counted 47."""
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        assert parse_agent_usage(json.dumps(envelope)) == counted
+    assert any(said in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
 
 
 def test_commit_repair_prompt_carries_output():
@@ -1974,8 +2017,10 @@ def test_safe_repush_uses_expect_absent_lease_not_fetch(tmp_path, monkeypatch):
     assert not any(c[:1] == ["fetch"] for c in calls), f"must not fetch: {flat}"
     assert any("--force-with-lease" in " ".join(c) for c in calls)
     # the lease expects the remote branch ABSENT (an empty expected value), never the
-    # bare token git checks against whatever tracking ref its fetch refspec maps to
-    assert ["push", "--force-with-lease=refs/heads/agent/x:", "origin",
+    # bare token git checks against whatever tracking ref its fetch refspec maps to;
+    # and nothing rides on it: no followed tag, no submodule push
+    assert ["push", "--no-follow-tags", "--recurse-submodules=check",
+            "--force-with-lease=refs/heads/agent/x:", "origin",
             "refs/heads/agent/x:refs/heads/agent/x"] in calls
     assert not any(c == "--force-with-lease" for parts in calls for c in parts)
 

@@ -74,8 +74,17 @@ def _alive(pid: int) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
+        # Reaped between the two calls (the probe's orphaned grandchild is
+        # collected by init, or a subreaper, whenever it gets to it, so a check
+        # right after the zombie was seen can land there), or no /proc here: ask
+        # the kernel again instead of guessing "alive".
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
         return True
-    return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rsplit(")", 1)[-1].split()[0] not in ("Z", "X")
 
 
 class _Sink(logging.Handler):

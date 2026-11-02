@@ -30,6 +30,18 @@ from harness.pipeline.worktree import WorktreeManager
 
 _REAL_GIT = shutil.which("git") or "git"
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_git(monkeypatch):
@@ -45,7 +57,7 @@ def _hermetic_git(monkeypatch):
 
 
 def _git(cwd: Path, *args: str) -> str:
-    res = subprocess.run([_REAL_GIT, "-c", "init.defaultBranch=main", *args],
+    res = subprocess.run([_REAL_GIT, *_FIXTURE_GIT_PINS, "-c", "init.defaultBranch=main", *args],
                          cwd=str(cwd), capture_output=True, text=True, check=False)
     assert res.returncode == 0, f"git {' '.join(args)}: {res.stderr}"
     return res.stdout.strip()

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -47,6 +48,7 @@ from harness.pipeline.backends.agent_cli import AgentCliBackend
 from harness.pipeline.backends.base import ImplementContext, OracleResult
 from harness.pipeline.grounding_gate import GateResult
 from harness.pipeline.notes import RunLog
+from harness.pipeline.trace import Tracer, read_spans
 from harness.pipeline.worktree import WorktreeManager
 
 #: A stand-in agent CLI, scripted by fake.json beside it. Its option parser
@@ -114,7 +116,8 @@ cost = step.get("cost", 0.25)
 if cost == "balance":                      # a real CLI at its cap spends it all
     cost = float(value("--max-budget-usd", "0"))
 common = {"duration_api_ms": 1, "stop_reason": "tool_use", "session_id": "s",
-          "total_cost_usd": cost, "usage": {"input_tokens": 5, "output_tokens": 5},
+          "total_cost_usd": cost,
+          "usage": step.get("usage", {"input_tokens": 5, "output_tokens": 5}),
           "modelUsage": {}, "permission_denials": step.get("denials", []),
           "terminal_reason": "max_turns", "fast_mode_state": "off", "origin": None}
 if step.get("shape") == "newer":
@@ -219,8 +222,18 @@ def _alive(pid: int) -> bool:
         return False
     stat = Path(f"/proc/{pid}/stat")
     try:
-        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
+        # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+        return stat.read_text().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except OSError:
+        # Reaped between the two calls (a leftover the sweep just killed is
+        # collected by init, or a subreaper, whenever it gets to it), or no /proc
+        # here: ask the kernel again instead of guessing "alive".
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    except IndexError:
         return True
 
 
@@ -246,7 +259,23 @@ def _no_shutdown_leak():
     shutdown.reset_for_tests()
 
 
-_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false")
+#: The fixtures' own git calls, pinned the way the rest of the suite pins them
+#: (tests/test_hardening.py): the autouse GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM
+#: above do not reach an inherited GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS,
+#: and core.ignoreStat=true or status.showUntrackedFiles=no there would rewrite
+#: the repositories these tests build and hide what they read back. Only the
+#: fixture helper is pinned; harness's own git calls get no pins from here.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "color.ui=never",
+                     "-c", "core.hooksPath=/dev/null",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 #: The cap envelope's words for --max-turns 5, as _cli_cap_text renders them.
 _TURNS_5 = "error_max_turns: Reached maximum number of turns (5)"
@@ -258,8 +287,8 @@ _CAP_NOTE = ("Note: the previous attempt was ended by its per-call cap before it
 
 
 def _git(args, cwd) -> str:
-    return subprocess.run([*_GIT, *args], cwd=cwd, check=True, capture_output=True,
-                          text=True).stdout
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
 
 
 def _ctx(tmp_path: Path, **cfg_kw) -> ImplementContext:
@@ -524,6 +553,50 @@ def test_the_cap_note_goes_with_the_work_a_failed_calls_discard_takes(tmp_path, 
                                   "work of launch 1\nwork of launch 2\nwork of launch 3\n"]
 
 
+@pytest.mark.parametrize("refusal", ["pre-commit-hook", "protected-path"])
+def test_a_commit_repair_after_a_kept_capped_call_is_told_the_commit_failure_only(
+        tmp_path, refusal):
+    """A red capped call is kept, its cap note and red verdict the next call's
+    feedback. That call goes green, and its commit is refused (a pre-commit hook
+    that exits 1, or a protected path). Green answers every verdict before it:
+    the commit-repair prompt carries the commit failure, and neither the cap
+    note nor the earlier red verdict. PRE-FIX the feedback was not reset on
+    green, so the repair prompt still carried "the previous attempt was ended
+    by its per-call cap … continue from it" and that red verdict, although the
+    attempt before it had finished green."""
+    protected = refusal == "protected-path"
+    fake = _FakeCli(tmp_path, [{"kind": "turns"},
+                               {"kind": "ok", "write": {"secret.key": "k\n"} if protected
+                                else {}},
+                               {"kind": "ok"}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_iters=3,
+               protected_paths=["*.key"] if protected else [])
+    if not protected:
+        hook = tmp_path / "repo" / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho 'pre-commit: lint rejected the change' >&2\n"
+                        "exit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+    backend = _Judged(fake.path, [False, True, True], distinct=True)
+
+    out = backend.implement(ctx)
+
+    prompts = [argv[1] for argv in fake.launches()]
+    assert len(prompts) == 3, out.detail
+    # True then: the capped call's work was in the tree, its verdict unanswered.
+    assert _CAP_NOTE.format(_TURNS_5) in prompts[1] and "assert kkkk" in prompts[1]
+    repair = prompts[2]
+    assert "## Previous commit failure (fix this first)" in repair
+    assert ("protected path refusal: secret.key" if protected
+            else "pre-commit: lint rejected the change") in repair
+    assert "ended by its per-call cap" not in repair
+    assert "assert kkkk" not in repair and "test_aaa" not in repair
+    assert "## What is still failing" not in repair
+    # The green work waits for its repair, as before: nothing was discarded.
+    assert out.status == "failed" and "commit never landed" in out.detail, out.detail
+    assert (Path(ctx.worktree) / "agent_work.txt").read_text() == (
+        "work of launch 1\nwork of launch 2\nwork of launch 3\n")
+
+
 # ── the budget cap: one launch, never the whole balance again ────────────────────
 
 
@@ -607,6 +680,393 @@ def test_a_budget_capped_calls_readable_cost_is_kept(tmp_path):
     assert fake.flag("--max-budget-usd") == ["1.00"], out.detail
     assert "stopped on budget — cost budget reached ($1.3700 ≥ $1.00)" in out.detail, \
         out.detail
+
+
+@pytest.mark.parametrize("max_cost, first, handed, reached, charged", [
+    pytest.param(1.0, 0.667, ["1.00", "0.33"], "$1.0000 ≥ $1.00", [0.667, 0.333],
+                 id="sub-cent-remainder"),
+    pytest.param(0.21, 0.047, ["0.21", "0.16"], "$0.2100 ≥ $0.21", [0.047, 0.163],
+                 id="an-ulp-short-in-floats"),
+])
+def test_a_budget_capped_call_is_charged_what_was_left_and_no_call_follows(
+        tmp_path, max_cost, first, handed, reached, charged):
+    """A red call with a readable cost, then a red call the CLI stops at its
+    budget with a cost that cannot be read (null). That call is handed what is
+    left floored to the cent and charged what was left, exactly — the `agent`
+    span shows the charge — and the next budget check stops the run: no third
+    launch. PRE-FIX it was charged only the cents it was handed (0.33 of the
+    0.333 left), the total stayed under max_cost_usd, and a third call went out
+    at the $0.01 floor: 1.00, 0.33, 0.01, stopped at $1.0070. In the second
+    case the remainder (0.21 - 0.047), added back, lands an ulp short of the
+    cap in floats — 0.20999999999999996 — which would leave room for that third
+    launch as well."""
+    fake = _FakeCli(tmp_path, [{"kind": "ok", "cost": first}, {"kind": "budget", "cost": None}])
+    ctx = _ctx(tmp_path, max_cost_usd=max_cost, max_iters=6)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [False], distinct=True)
+
+    out = backend.implement(ctx)
+
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    assert out.status == "failed" and out.iterations == 3, out.detail
+    assert f"stopped on budget — cost budget reached ({reached})" in out.detail, out.detail
+    spans = read_spans(ctx.config.state_dir, span_type="agent")
+    assert [span["cost_usd"] for span in spans] == charged
+
+
+def test_a_budget_capped_call_is_charged_at_least_the_budget_left_as_it_launched():
+    """The charge, unit by unit, given the exact remainder the call launched with
+    (the balance it was handed is that remainder floored to the cent): a
+    readable figure at or past both is kept, and anything else is the larger of
+    the two. The flag-only call shape still charges the balance handed, and the
+    turn cap still costs what its envelope reports."""
+    from harness.pipeline.backends.agent_cli import _capped_call_cost
+
+    flags = ["--max-budget-usd", "0.33", "--max-turns", "5"]
+    budget = "error_max_budget_usd: Reached maximum budget ($0.33)"
+    assert _capped_call_cost(budget, flags, 0.0, 0.333) == 0.333         # unreadable
+    assert _capped_call_cost(budget, flags, float("nan"), 0.333) == 0.333
+    assert _capped_call_cost(budget, flags, 0.331, 0.333) == 0.333       # short of the rest
+    assert _capped_call_cost(budget, flags, 0.34, 0.333) == 0.34         # past both: kept
+    assert _capped_call_cost(budget, flags, 0.0, float("nan")) == 0.33
+    assert _capped_call_cost(budget, flags, 0.0) == 0.33                 # flag-only shape
+    assert _capped_call_cost(budget, flags, 0.0, None) == 0.33
+    floor = ["--max-budget-usd", "0.01"]                       # under a cent left
+    assert _capped_call_cost("error_max_budget_usd", floor, 0.0, 0.004) == 0.01
+    assert _capped_call_cost(_TURNS_5, flags, 0.1, 0.333) == 0.1
+
+
+def test_a_turn_capped_call_under_a_cost_budget_leaves_the_rest_of_it(tmp_path):
+    """Only the CLI's budget stop exhausts the loop's budget
+    (``_at_budget_cap`` → ``_exhaust_cost_budget``): a call the CLI ended at
+    its TURN cap is charged what its envelope reports, and the budget is still
+    the loop's to spend. Under max_cost_usd=1.0 a turn-capped red call that
+    cost $0.10 is followed by a launch handed 0.90, which goes green. Read as
+    a budget stop (``if run.capped:``), the run would end on "cost budget
+    reached" after that first launch."""
+    fake = _FakeCli(tmp_path, [{"kind": "turns", "cost": 0.1}, {"kind": "ok", "cost": 0.1}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_cost_usd=1.0)
+    backend = _Judged(fake.path, [False, True])
+
+    out = backend.implement(ctx)
+
+    assert fake.flag("--max-turns") == ["5", "5"], out.detail
+    assert fake.flag("--max-budget-usd") == ["1.00", "0.90"], out.detail
+    assert out.status == "implemented", out.detail
+    assert backend.judged == ["work of launch 1\n", "work of launch 1\nwork of launch 2\n"]
+
+
+def _strict_trace(ctx: ImplementContext) -> list[dict]:
+    """Every span the run wrote, parsed as strict JSON: a bare ``NaN`` (or
+    ``Infinity``), which ``json.dumps`` writes for a float that is not a
+    number and strict readers refuse, fails the parse."""
+    def refuse(token: str):
+        raise ValueError(f"not strict JSON: {token}")
+
+    path = Path(ctx.config.state_dir) / "trace.jsonl"
+    return [json.loads(line, parse_constant=refuse)
+            for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_turn_capped_call_whose_cost_is_not_a_number_is_no_budget_stop(tmp_path,
+                                                                          caplog):
+    """A call the CLI ended at its TURN cap whose envelope's cost is a bare NaN
+    (the usage parser passes that JSON token through). Only the budget cap
+    is charged the balance it was handed (``_at_budget_cap``), so this call
+    logs no budget-cap WARNING; it counts $0, as a call whose cost is missing
+    does, and the run goes on with the balance intact: the next launch is
+    handed the whole $1.00. PRE-FIX the guard compared the charge with the
+    cost (``charged != cost``), which a NaN never equals, so the run logged
+    "the CLI ended the call at its --max-budget-usd cap, but its envelope's
+    cost reads $nan … charging the $nan it was allowed", every clause of it
+    false; and the ``agent`` span carried the NaN into the trace as a bare
+    ``NaN``, which strict JSON readers refuse."""
+    fake = _FakeCli(tmp_path, [{"kind": "turns", "cost": float("nan")},
+                               {"kind": "ok", "cost": 0.1}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_cost_usd=1.0)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [False, True])
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-turns") == ["5", "5"], out.detail
+    assert fake.flag("--max-budget-usd") == ["1.00", "1.00"], out.detail
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [w for w in warned if "--max-budget-usd cap" in w], warned
+    assert any("ended at its cap (error_max_turns" in w for w in warned), warned
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == [0.0, 0.1]
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged", [
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], id="spent-then-nan"),
+    pytest.param([{"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], id="nan-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "turns", "cost": 0.6},
+                  {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00", "0.40"], [0.6, 0.1],
+                 id="nan-then-turn-capped"),
+])
+def test_a_cost_that_is_not_a_number_never_erases_what_the_other_attempts_spent(
+        tmp_path, script, verdicts, handed, charged):
+    """An attempt whose envelope's cost is a bare NaN counts $0, as one whose
+    cost is missing does, and the iteration's other attempts still count what
+    they spent: each retry is handed the balance net of it, and the loop is
+    charged it. PRE-FIX the NaN was summed into the iteration's spend
+    (``_run_with_retries``), which made the whole sum NaN, and the budget reads
+    a NaN as $0: after $0.95 spent and a NaN, the next attempt was handed the
+    whole $1.00 again (1.00, 0.05, 1.00), and the loop was charged nothing for
+    the iteration (the ``agent`` span read NaN). A turn-capped call after a
+    NaN attempt lost its $0.60 the same way, and the next iteration was handed
+    1.00 for 0.40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+
+
+#: The DEBUG line ``_run_agent`` logs for a cost it counts as $0, given the
+#: reading it names.
+_COUNTS_NOTHING = ("the envelope's cost reads {} — this invocation counts $0 "
+                   "toward the budget, as a missing cost does")
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged, read", [
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": -0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], "$-0.9500 (below zero)",
+                 id="spent-then-negative"),
+    pytest.param([{"kind": "overloaded", "cost": -0.95},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], "$-0.9500 (below zero)",
+                 id="negative-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": float("-inf")},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], "$-inf (not finite)",
+                 id="-inf-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": -0.95},
+                  {"kind": "turns", "cost": 0.6},
+                  {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00", "0.40"], [0.6, 0.1],
+                 "$-0.9500 (below zero)", id="negative-then-turn-capped"),
+])
+def test_a_negative_or_minus_infinite_cost_never_erases_what_the_other_attempts_spent(
+        tmp_path, caplog, script, verdicts, handed, charged, read):
+    """As a NaN does (the test above), an attempt whose envelope's cost is
+    below zero or −Infinity counts $0, with a DEBUG line that says so, and the
+    other attempts still count what they spent: the balances handed and the
+    charge are the NaN cases'. PRE-FIX the figure was summed into the
+    iteration's spend as it was (``_run_with_retries``): −$0.95 after $0.95
+    spent made the sum $0, and the next attempt was handed the whole $1.00
+    again (1.00, 0.05, 1.00; the ``agent`` span read 0.01); before a $0.95
+    attempt it cancelled that spend the same way (1.00, 1.00, 1.00);
+    −Infinity made the sum −Infinity, which the budget reads as $0 and the
+    span wrote as a bare ``-Infinity``; and a turn-capped call after a
+    negative attempt was charged −$0.35, so the next iteration was handed 1.00
+    for 0.40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+    said = [r.getMessage() for r in caplog.records]
+    assert _COUNTS_NOTHING.format(read) in said, [s for s in said if "cost reads" in s]
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged", [
+    pytest.param([{"kind": "ok", "cost": float("inf")}, {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00"], [0.0, 0.1], id="clean-exit"),
+    pytest.param([{"kind": "turns", "cost": float("inf")}, {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00"], [0.0, 0.1], id="turn-capped"),
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": float("inf")},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], id="spent-then-inf"),
+])
+def test_an_infinite_cost_on_a_call_the_budget_cap_did_not_stop_counts_nothing(
+        tmp_path, caplog, script, verdicts, handed, charged):
+    """+Infinity is no reading of what a call spent: the budget cap's own
+    charge reads it as unreadable (``_capped_call_cost`` charges a
+    budget-capped call the balance for it, pinned above). So on any other
+    call — a clean exit, a turn-capped call, a failed attempt — it counts $0,
+    as a missing cost does, with a DEBUG line that says so, and the run goes
+    on: the trace is strict JSON, and no budget stop reads "$inf". PRE-FIX it
+    was charged as it was: the budget's total became infinite, the run
+    stopped at the next check on "cost budget reached ($inf ≥ $1.00)" after
+    the one launch (after $0.95 spent and an Infinity on a failed attempt, no
+    retry was launched either), and the ``agent`` span wrote a bare
+    ``Infinity`` into ``trace.jsonl``."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert "$inf" not in out.detail, out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+    said = [r.getMessage() for r in caplog.records]
+    assert _COUNTS_NOTHING.format("$inf (not finite)") in said, \
+        [s for s in said if "cost reads" in s]
+
+
+def test_the_budget_cap_warning_names_a_cost_that_is_not_finite(tmp_path, caplog):
+    """A call the CLI stopped at its budget whose envelope's cost reads
+    +Infinity is charged its balance (``_capped_call_cost`` reads the figure
+    as unreadable), with the budget cap's WARNING, whose list of what the
+    figure read as now names that case. PRE-FIX the list read "(none, not a
+    number, or below what the call was allowed)", none of which an infinite
+    figure is."""
+    fake = _FakeCli(tmp_path, [{"kind": "budget", "cost": float("inf")}])
+    ctx = _ctx(tmp_path, max_cost_usd=1.0)
+    backend = _Judged(fake.path, [False])
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert fake.flag("--max-budget-usd") == ["1.00"], out.detail
+    assert "stopped on budget — cost budget reached ($1.0000 ≥ $1.00)" in out.detail, \
+        out.detail
+    warned = [r.getMessage() for r in caplog.records
+              if "--max-budget-usd cap, but" in r.getMessage()]
+    assert len(warned) == 1, warned
+    assert ("cost reads $inf (none, not a number, not finite, or below what the "
+            "call was allowed) — charging the $1.0000 it was allowed") in warned[0], warned
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="needs a cwd-scannable /proc")
+@pytest.mark.parametrize("step, counted", [
+    pytest.param({"usage": {"input_tokens": float("inf"), "output_tokens": 5}},
+                 (5, 0.25), id="an-Infinity-token-count"),
+    pytest.param({"cost": 2**1024}, (10, 0.0), id="an-integer-cost-past-the-float-range"),
+])
+def test_an_overflowing_usage_figure_counts_zero_and_the_call_is_still_swept(
+        tmp_path, step, counted):
+    """The envelope of a clean exit that left a process running in the
+    worktree carries a figure the usage parser cannot coerce: a JSON
+    ``Infinity`` token count (``json.loads`` reads it as float inf, which
+    ``int()`` refuses) or an integer cost too large for a float (which
+    ``float()`` refuses). That figure counts 0, like any other drift, and the
+    call goes on as the clean exit it is: the leftover is reclaimed before the
+    oracle judges the tree, and the ``agent`` span counts the rest of the
+    usage. PRE-FIX the parser raised OverflowError inside the agent call,
+    before its cost clamp and every sweep: implement() raised (only the
+    orchestrator's catch-all would see it), nothing was judged, and the
+    leftover kept running in the worktree."""
+    fake = _FakeCli(tmp_path, [{"kind": "ok", "leave": True, **step}])
+    ctx = _ctx(tmp_path)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+    orig = backend.run_oracle
+
+    def judged(c):
+        backend.watch = fake.leftovers()[-1]
+        return orig(c)
+
+    backend.run_oracle = judged
+    try:
+        out = backend.implement(ctx)
+
+        assert out.status == "implemented", out.detail
+        assert backend.alive_when_judged == [False], "judged while the leftover ran"
+        pid = fake.leftovers()[-1]
+        reclaimed = [n for n in _notes(ctx) if n.get("kind") == "reclaim"]
+        assert reclaimed and f"pids {pid}" in reclaimed[0]["detail"], reclaimed
+        spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+        assert [(span["tokens"], span["cost_usd"]) for span in spans] == [counted]
+    finally:
+        for pid in fake.leftovers():
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_attempt_costs_that_sum_past_the_float_range_keep_the_span_finite(tmp_path):
+    """Two attempts of one iteration, each reporting a finite cost of 9e307,
+    in a run with no cost cap (under one, the first attempt would have spent
+    it, and no retry would follow). Each figure is a reading of what its
+    attempt spent, so neither counts $0 and neither is dropped: their sum,
+    past the float range, is held at the largest finite float, and the trace
+    stays strict JSON. PRE-FIX the sum was +Infinity, which the ``agent`` span
+    wrote into trace.jsonl as a bare ``Infinity``."""
+    fake = _FakeCli(tmp_path, [{"kind": "overloaded", "cost": 9e307},
+                               {"kind": "ok", "cost": 9e307}])
+    ctx = _ctx(tmp_path, max_agent_retries=3)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+
+    out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert len(fake.launches()) == 2
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == [sys.float_info.max]
+
+
+@pytest.mark.parametrize("script, max_tokens, launches, status, stop, tokens", [
+    pytest.param([{"kind": "overloaded", "usage": {"input_tokens": 10, "output_tokens": 10}},
+                  {"kind": "overloaded", "usage": {"input_tokens": -20, "output_tokens": 0}},
+                  {"kind": "ok"}],
+                 None, 3, "implemented", "", [30], id="every-attempt-counts"),
+    pytest.param([{"kind": "overloaded", "usage": {"input_tokens": 10, "output_tokens": 10}},
+                  {"kind": "overloaded", "usage": {"input_tokens": -20, "output_tokens": 0}},
+                  {"kind": "overloaded"},
+                  {"kind": "ok"}],
+                 25, 3, "failed", "stopped on budget — token budget reached (30 ≥ 25)",
+                 [30], id="the-token-cap-sees-them"),
+])
+def test_a_negative_token_count_never_cancels_what_the_other_attempts_spent(
+        tmp_path, script, max_tokens, launches, status, stop, tokens):
+    """One attempt's envelope reports -20 input tokens. No call spends fewer
+    than none: the count is malformed and counts 0, as a missing one does, and
+    the iteration's other attempts still count theirs (20, then 10). Under
+    max_tokens=25 the attempts have spent the budget after the third, so no
+    fourth is launched and the run stops on budget. PRE-FIX the usage parser
+    passed the count through and the attempts were summed as they came
+    (``_run_with_retries``): -20 cancelled the first attempt's 20, the
+    ``agent`` span counted 10 tokens, and under the cap a fourth attempt was
+    launched and went green with 20 tokens counted for attempts that had spent
+    40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_agent_retries=3, max_tokens=max_tokens)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+
+    out = backend.implement(ctx)
+
+    assert len(fake.launches()) == launches, out.detail
+    assert out.status == status and stop in out.detail, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["tokens"] for span in spans] == tokens
 
 
 def test_a_retry_is_handed_only_what_the_earlier_attempts_left(tmp_path):

@@ -61,6 +61,18 @@ from harness.pipeline.spec import PipelineConfig, Task
 from harness.pipeline.trace import Tracer, read_spans
 from harness.pipeline.worktree import WorktreeManager
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 _LINUX = sys.platform.startswith("linux")
 pytestmark = pytest.mark.skipif(not _LINUX, reason="needs a cwd-scannable /proc")
 
@@ -113,7 +125,8 @@ def _alive(pid: int) -> bool:
         except ProcessLookupError:
             return False
         return True
-    return stat.rpartition(")")[2].split()[0] != "Z"
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
 
 
 def _wait_gone(pid: int) -> bool:
@@ -168,7 +181,7 @@ def _interrupt_when(path: Path) -> threading.Thread:
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
 

@@ -43,7 +43,11 @@ _ROOT = Path(__file__).resolve().parent.parent
 # dropped from their environment explicitly, whatever harness does.
 _PINS = ("-c", "core.ignoreStat=false", "-c", "status.showUntrackedFiles=normal",
          "-c", "diff.ignoreSubmodules=none", "-c", "submodule.recurse=false",
-         "-c", "color.ui=never", "-c", "commit.gpgsign=false")
+         "-c", "color.ui=never", "-c", "commit.gpgsign=false",
+         "-c", "tag.gpgsign=false",
+         "-c", "protocol.file.allow=always",
+         "-c", "safe.bareRepository=all",
+         "-c", "branch.autoSetupMerge=true")
 
 
 def _clean_env() -> dict[str, str]:

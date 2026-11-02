@@ -100,7 +100,11 @@ def test_control_bytes_and_high_confidence_credentials_are_hazards(message):
 # ── the guard in GitHubPR.open ────────────────────────────────────────────────
 
 _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
-                     "-c", "commit.gpgsign=false")
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 _GH = r'''#!{python}
 import json, sys
@@ -533,7 +537,11 @@ def test_an_unreadable_origin_tracking_ref_refuses_the_push_until_it_is_repaired
     With the ref removed the walk runs on every git and names that commit; once
     origin has it, the push goes out. The control: a dangling
     refs/remotes/origin/HEAD symref (common after a default-branch rename) is
-    skipped, and blocks nothing."""
+    skipped, and blocks nothing. The premise is checked before the push: git
+    itself reports the planted ref (a reftable ref store never reads a loose
+    ref file, so the case is skipped there), and a git that does not honour
+    ``GIT_REF_PARANOIA=0`` skips that case. After it, harness must have read
+    the ref the way git's own walk does."""
     if refs == "skipped-when-broken":
         monkeypatch.setenv("GIT_REF_PARANOIA", "0")
     _open_pr, _sha, origin, gh_calls, wt = agent_commit("Set x to 2\n")
@@ -553,9 +561,30 @@ def test_an_unreadable_origin_tracking_ref_refuses_the_push_until_it_is_repaired
     broken.parent.mkdir(parents=True, exist_ok=True)
     broken.write_text("garbage\n" if case == "garbage-in-a-loose-ref"
                       else "1234567890abcdef1234567890abcdef12345678\n")
+    # The premise, before any push: the file is a ref git reads. Without it every
+    # branch below passes on the ordinary walk and never meets a broken ref.
+    if _git(["rev-parse", "--show-ref-format"], repo).stdout.strip() == "reftable":
+        pytest.skip("a reftable ref store never reads a loose ref file, so no broken "
+                    "tracking ref can be planted this way")
+
+    def walk(**paranoia: str) -> subprocess.CompletedProcess:
+        """The guard's walk (``--not --remotes=origin``), run by git alone."""
+        return subprocess.run(["git", *_FIXTURE_GIT_PINS, "rev-list", "HEAD", "--not",
+                               "--remotes=origin"], cwd=str(repo), capture_output=True,
+                              text=True, check=False,
+                              env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+                                   "GIT_CONFIG_NOSYSTEM": "1", **paranoia})
+
+    seen = walk(GIT_REF_PARANOIA="1")
+    assert "origin/broken" in seen.stderr, seen.stderr       # git reports the planted ref
+    unasked = walk()                          # this git's own walk, in harness's env
+    if refs == "skipped-when-broken" and unasked.returncode:
+        pytest.skip("this git does not honour GIT_REF_PARANOIA=0: its walk still dies "
+                    f"on the broken ref ({unasked.stderr.strip()})")
 
     res = _open_at_tip(wt)
 
+    assert ("could not be read" in res.detail) == bool(unasked.returncode), res.detail
     if "could not be read" in res.detail:     # current git: the walk dies on that ref
         assert refs == "as-this-git-reads-them", res.detail
         assert not res.ok and "origin/broken" in res.detail, res.detail  # git's own words

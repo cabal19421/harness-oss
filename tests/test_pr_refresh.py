@@ -53,6 +53,18 @@ from harness.pipeline.pr import GitHubPR
 from harness.pipeline.review import ReviewGate
 from tests.gh_read_model import gh_read
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 URL = "https://github.com/o/r/pull/1"
 TITLE = "Do the thing [t1]"
 # What run 2 publishes: bound to its reviewed head.
@@ -452,7 +464,7 @@ def test_a_body_without_an_attestation_cannot_claim_an_adopted_pr(gh, tmp_path):
 
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
 
@@ -683,6 +695,9 @@ class _GitHubWorld:
         _git(["add", "-A"], repo)
         _git(["commit", "-q", "-m", "init"], repo)
         _git(["remote", "add", "origin", str(self.origin)], repo)
+        # The fixture's opt-in: harness's push to this local-path origin carries
+        # no pin, and protocol.file.allow=never in the run's config refuses it.
+        _git(["config", "protocol.file.allow", "always"], repo)
         _git(["push", "-q", "-u", "origin", "main"], repo)
 
         backend = _TwoPassBackend()

@@ -5582,8 +5582,29 @@ def _write_stale_gitlinks(cwd: Path | str, record: Mapping[str, tuple[str, str]]
 # ── landed-work proof (refuse to delete work that has not merged) ─────────────────
 
 
-def is_ancestor(cwd: Path | str, ancestor: str, descendant: str) -> bool:
-    """True iff *ancestor* is reachable from *descendant* (a plain merge landed)."""
+#: What a walk that licenses a deletion reads parents from: the commit objects
+#: themselves. With ``core.commitGraph`` on (git's default) a walk takes each
+#: commit's parents from ``.git/objects/info/commit-graph`` when the file
+#: lists the commit — a cache nothing re-checks against the objects, in the
+#: shared object store an agent can write — and one forged edge made another
+#: task's unlanded tip read as an ancestor of the base. Paired with
+#: :data:`_REAL_HISTORY` (no replace ref, no graft).
+_NO_COMMIT_GRAPH = ("-c", "core.commitGraph=false")
+
+
+def is_ancestor(cwd: Path | str, ancestor: str, descendant: str, *,
+                real_history: bool = False) -> bool:
+    """True iff *ancestor* is reachable from *descendant* (a plain merge landed).
+
+    *real_history* walks the commits as they really are, as a check that
+    licenses a deletion must (:func:`landed_proof`): no replace ref and no
+    graft (:data:`_REAL_HISTORY`), and no commit-graph file
+    (:data:`_NO_COMMIT_GRAPH`) — each one agent-writable, and each able to
+    make any commit read as reachable from any other.
+    """
+    if real_history:
+        return git([*_NO_COMMIT_GRAPH, "merge-base", "--is-ancestor", ancestor,
+                    descendant], cwd=cwd, env=_REAL_HISTORY).ok
     return git(["merge-base", "--is-ancestor", ancestor, descendant], cwd=cwd).ok
 
 
@@ -5678,11 +5699,16 @@ class LandedProof:
       squash-merge case);
     * ``False`` — proven not: the merge brings changes in (``"tree-differs"``)
       or conflicts (``"conflict"``);
-    * ``None`` — no proof either way: the base does not resolve (``"no-base"``)
-      or git could not run the proof (``"unavailable"``: a git without
-      ``merge-tree --write-tree``, unrelated histories, a missing object).
-      ``git_code`` is git's exit code and ``detail`` its error line, plus the
-      version floor when the probed git is below it.
+    * ``None`` — no proof either way: the base does not resolve (``"no-base"``),
+      the head does not resolve to a commit (``"no-head"``: a branch deleted
+      after it was listed, a name that is no ref), the merge conflicts only
+      in files a merge driver would merge, which the proof never runs
+      (``"merge-driver"``), or git could not run the proof
+      (``"unavailable"``: a git without ``merge-tree --write-tree``,
+      unrelated histories, a missing object, a merge git refuses to start,
+      configuration or attributes it cannot read). ``git_code`` is git's exit
+      code and ``detail`` its error line, plus the version floor when the
+      probed git is below it.
 
     A caller about to delete treats anything but ``True`` as "keep it"; one
     that explains itself names the unavailable proof instead of calling the
@@ -5693,6 +5719,102 @@ class LandedProof:
     how: str
     git_code: int = 0
     detail: str = ""
+
+
+#: How the squash-landed proof (:func:`landed_proof`) merges: by git's own line
+#: merge, whatever the configuration says. ``merge.default=text`` is the driver
+#: of every file no ``merge`` attribute names, where config could name
+#: ``union`` or a configured driver. ``merge.renormalize=false``: under
+#: ``true`` git runs both sides of a file through its ``filter`` programs —
+#: configured ones, anybody's — and reads a change they erase as no change,
+#: with no message: a modification the base had deleted merged as the
+#: deletion, and the branch read as landed.
+_PROOF_MERGE_PINS = ("-c", "merge.default=text", "-c", "merge.renormalize=false")
+
+
+def _merge_drivers(cwd: Path | str) -> frozenset[str] | GitResult:
+    """Every merge driver the configuration defines, by name — or the failed listing.
+
+    git knows a driver once ANY ``merge.<name>.*`` key names it (``driver``,
+    ``name``, ``recursive``), in any scope: system, global, the shared
+    ``.git/config``, an include, the environment. It looks a ``merge``
+    attribute's value, and ``merge.default``'s, up among those before its
+    built-in ``text``, ``binary`` and ``union``. Exit 1 is git's "no such key".
+    """
+    res = git(["config", "-z", "--get-regexp", r"^merge\..*\."], cwd=cwd,
+              strip=False, fs_paths=True)
+    if res.code == 1 and not res.out:
+        return frozenset()
+    if not res.ok:
+        return res
+    names: set[str] = set()
+    for record in res.out.split("\0"):
+        key = record.split("\n", 1)[0]          # "<key>\n<value>", or a bare key
+        if key.startswith("merge.") and key.count(".") >= 2:
+            names.add(key[len("merge."):key.rindex(".")])
+    return frozenset(names)
+
+
+def _refusing_drivers(drivers: Collection[str]) -> dict[str, str]:
+    """``GIT_CONFIG_*`` replacing each driver in *drivers*, and ``union``, by a refusal.
+
+    The replacement writes a marker nobody can predict over the file it is
+    handed and exits 1, a conflict, so a file one of them would merge never
+    comes out clean. The marker matters in git's inner merge of several merge
+    bases, which goes on through a conflict and takes the file's content as
+    the outer merge's ancestor: left as one side, the branch's version read
+    as unchanged and the base's won without a conflict. Exact keys
+    (:func:`_config_env`): any name is replaced, one holding ``=`` included.
+    """
+    refuse = f"echo harness-refused-merge-{os.urandom(16).hex()} > %A; exit 1"
+    return _config_env([(f"merge.{name}.driver", refuse)
+                        for name in sorted({*drivers, "union"})])
+
+
+def _conflicted_paths(lines: Sequence[str]) -> list[str]:
+    """The files in ``merge-tree --write-tree``'s conflicted file info.
+
+    *lines* is its output split at ``\\n``: the tree id, then one ``<mode>
+    <object> <stage>\\t<path>`` line per conflicted stage, in git's quoting
+    (:data:`_QUOTED_PATHS`), up to the first blank line.
+    """
+    paths: set[str] = set()
+    for line in lines[1:]:
+        if not line:
+            break
+        _stage, tab, path = line.partition("\t")
+        if tab:
+            paths.add(_unquote_path(path))
+    return sorted(paths)
+
+
+def _refused_merges(cwd: Path | str, paths: Sequence[str],
+                    drivers: Collection[str]) -> dict[str, str] | GitResult:
+    """``{path: driver}`` for each of *paths* a refused driver merges — or the failed read.
+
+    The driver is the one the file's ``merge`` attribute names, read with
+    ``git check-attr`` from every source the merge reads, or — the attribute
+    unspecified — ``merge.default``, pinned to ``text``
+    (:data:`_PROOF_MERGE_PINS`), which a configured ``text`` driver answers
+    before the built-in one. A value naming a configured driver, or
+    ``union``, is a refused one (:func:`_refusing_drivers`).
+    """
+    if not paths:
+        return {}
+    res = git(["check-attr", "--stdin", "-z", "merge"], cwd=cwd, strip=False,
+              fs_paths=True, stdin="".join(f"{path}\0" for path in paths))
+    if not res.ok:
+        return res
+    fields = res.out.split("\0")
+    refused: dict[str, str] = {}
+    # "<path>\0merge\0<value>\0" per path.
+    for k in range(0, len(fields) - 2, 3):
+        path, value = fields[k], fields[k + 2]
+        if value in drivers or value == "union":
+            refused[path] = value
+        elif value == "unspecified" and "text" in drivers:
+            refused[path] = "text"
+    return refused
 
 
 def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
@@ -5709,34 +5831,111 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
     anything else non-zero when it could not merge at all, which is no answer:
     every such failure used to read as "not landed", so on a git without
     ``--write-tree`` every squash-merged branch was reported as unmerged work,
-    behind a remedy that discards it. See :class:`LandedProof`.
+    behind a remedy that discards it. Exit 1 alone proves no conflict either:
+    git also exits 1, printing no tree, for a side it cannot merge ("not
+    something we can merge": a ref that is gone, a name that is no ref, an
+    object that is no commit). A conflict is an exit 1 whose output leads with
+    the merged tree's id, and *head* must resolve to a commit before the merge
+    is asked (``"no-head"``): unchecked, a branch deleted after it was listed,
+    or a misread name, was reported as unlanded work. See :class:`LandedProof`.
+
+    A YES here licenses ``git branch -D``, so neither half reads anything an
+    agent can rewrite through the configuration or the shared ``.git``.
+    Every read takes the history as it really is (:data:`_REAL_HISTORY`,
+    :data:`_NO_COMMIT_GRAPH`): one ``git replace --graft``, an
+    ``info/grafts`` line or a forged commit-graph edge made another task's
+    unlanded tip an ancestor of the base. The merge is git's own line merge
+    (:data:`_PROOF_MERGE_PINS`), and it runs no merge driver: each driver the
+    configuration defines (:func:`_merge_drivers`), and the built-in
+    ``union``, is replaced by a refusal (:func:`_refusing_drivers`). A driver
+    picked by ``merge.default``, or by a ``merge`` attribute — in
+    ``.gitattributes``, ``.git/info/attributes`` or the file
+    ``core.attributesFile`` names — made a merge that drops the branch's
+    lines come out clean and equal to the base; so did ``union``, for lines
+    the base had rewritten and the branch deleted. A refused file conflicts
+    instead, and a merge whose conflicts are all in such files is no proof
+    either way (``"merge-driver"``): git's line merge decided none of them.
+    Any other conflict is still a NO.
     """
-    resolved = git(["rev-parse", "--verify", base], cwd=cwd)
+    resolved = git(["rev-parse", "--verify", base], cwd=cwd, env=_REAL_HISTORY)
     if not resolved.ok:
+        # The lines that name cwd pass it through _log_text, as the ones that
+        # name base or head with %s do (below): a repository path that is not
+        # UTF-8 made a strict UTF-8 log file drop each such record.
         logger.debug("landed_proof: base %r does not resolve in %s → no proof "
-                     "(rc=%s)", base, cwd, resolved.code)
+                     "(rc=%s)", base, _log_text(str(cwd)), resolved.code)
         return LandedProof(None, "no-base", resolved.code,
                            f"the base {base!r} does not resolve "
                            f"({_git_error_line(resolved)})")
-    if is_ancestor(cwd, head, base):
+    tip = git(["rev-parse", "--verify", f"{head}^{{commit}}"], cwd=cwd,
+              env=_REAL_HISTORY)
+    if not tip.ok:
+        logger.debug("landed_proof: head %r does not resolve to a commit in %s → "
+                     "no proof (rc=%s)", head, _log_text(str(cwd)), tip.code)
+        return LandedProof(None, "no-head", tip.code,
+                           f"the head {head!r} does not resolve to a commit "
+                           f"({_git_error_line(tip)})")
+    if is_ancestor(cwd, head, base, real_history=True):
+        # Each line that formats base or head with %s passes it through
+        # _log_text (a %r is encodable already): prune hands in a branch name
+        # that is not UTF-8 as surrogate escapes, and a strict UTF-8 log file
+        # (--log-file / HARNESS_LOG_FILE) printed "--- Logging error ---" with
+        # a traceback for each such record, and dropped it.
         logger.debug("landed_proof: %s is an ancestor of %s → landed "
-                     "(plain merge)", head, base)
+                     "(plain merge)", _log_text(head), _log_text(base))
         return LandedProof(True, "ancestor")
-    base_tree = git(["rev-parse", "--verify", f"{base}^{{tree}}"], cwd=cwd)
+    base_tree = git(["rev-parse", "--verify", f"{base}^{{tree}}"], cwd=cwd,
+                    env=_REAL_HISTORY)
     if not base_tree.ok or not base_tree.out:
         logger.debug("landed_proof: cannot resolve the tree of base %r → no proof",
                      base)
         return LandedProof(None, "unavailable", base_tree.code,
                            f"the tree of {base!r} cannot be read "
                            f"({_git_error_line(base_tree)})")
+    drivers = _merge_drivers(cwd)
+    if isinstance(drivers, GitResult):
+        logger.debug("landed_proof: cannot list the merge drivers configured in %s "
+                     "→ no proof (rc=%s)", _log_text(str(cwd)), drivers.code)
+        return LandedProof(None, "unavailable", drivers.code,
+                           "the merge drivers the configuration defines cannot be "
+                           f"listed ({_git_error_line(drivers)})")
     # lenient: see seed_commit — a conflict on a non-UTF-8 name raised out of
-    # every prune that asked whether the branch had landed.
-    res = git(["merge-tree", "--write-tree", base, head], cwd=cwd, lenient=True)
-    if res.code == 1:
+    # every prune that asked whether the branch had landed. The conflicted
+    # file info is read in git's quoting (_QUOTED_PATHS); the messages after it
+    # print names raw.
+    res = git([*_QUOTED_PATHS, *_PROOF_MERGE_PINS, *_NO_COMMIT_GRAPH, "merge-tree",
+               "--write-tree", base, head], cwd=cwd, lenient=True, strip=False,
+              env={**_REAL_HISTORY, **_refusing_drivers(drivers)})
+    lines = res.out.split("\n")
+    # The merged tree's id leads the output of a clean merge (exit 0) and of a
+    # conflicted one (exit 1). An exit 1 without it is git refusing to merge at
+    # all ("<rev> - not something we can merge"): no answer, not a conflict.
+    lead = lines[0].strip()
+    merged_tree = lead if res.code in (0, 1) and looks_like_object_name(lead) else ""
+    if res.code == 1 and merged_tree:
+        conflicted = _conflicted_paths(lines)
+        refused = _refused_merges(cwd, conflicted, drivers)
+        if isinstance(refused, GitResult):
+            logger.debug("landed_proof: cannot read the merge attributes of the "
+                         "files merge-tree(%s, %s) conflicts in → no proof",
+                         _log_text(base), _log_text(head))
+            return LandedProof(None, "unavailable", refused.code,
+                               "the merge attributes of the conflicting files cannot "
+                               f"be read ({_git_error_line(refused)})")
+        if conflicted and set(conflicted) <= set(refused):
+            shown = ", ".join(f"{display_path(path)} (driver "
+                              f"{display_path(refused[path])})"
+                              for path in conflicted[:3])
+            more = f" and {len(conflicted) - 3} more" if len(conflicted) > 3 else ""
+            detail = ("the merge conflicts only in files a merge driver would merge "
+                      f"— {shown}{more} — and the proof runs no driver, so git's "
+                      "own line merge decided none of them")
+            logger.debug("landed_proof: merge-tree(%s, %s): %s → no proof",
+                         _log_text(base), _log_text(head), detail)
+            return LandedProof(None, "merge-driver", 1, detail)
         logger.debug("landed_proof: merge-tree(%s, %s) conflicts → NOT landed",
-                     base, head)
+                     _log_text(base), _log_text(head))
         return LandedProof(False, "conflict", 1)
-    merged_tree = res.out.splitlines()[0].strip() if res.ok and res.out else ""
     if not merged_tree:
         detail = (f"`git merge-tree --write-tree` exited {res.code}: "
                   f"{_git_error_line(res)}" if not res.ok else
@@ -5746,11 +5945,12 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
             detail += (f" — the squash-landed proof needs git >= "
                        f"{MERGE_TREE_WRITE_GIT}; this is git {old}")
         logger.debug("landed_proof: merge-tree(%s, %s) gave no answer → proof "
-                     "unavailable: %s", base, head, detail)
+                     "unavailable: %s", _log_text(base), _log_text(head), detail)
         return LandedProof(None, "unavailable", res.code, detail)
     landed = merged_tree == base_tree.out
     logger.debug("landed_proof: merge-tree(%s, %s)=%s vs base tree %s → %s",
-                 base, head, trunc(merged_tree, 40), trunc(base_tree.out, 40),
+                 _log_text(base), _log_text(head), trunc(merged_tree, 40),
+                 trunc(base_tree.out, 40),
                  "landed (squash-equivalent)" if landed else "NOT landed")
     return LandedProof(landed, "tree-equal" if landed else "tree-differs")
 
@@ -6030,6 +6230,37 @@ def force_push_with_lease(
     (``+refs/heads/*:refs/heads/*``, in the shared common dir an agent can
     write) made the push a forced one, which overrides any lease.
 
+    No other ref rides on it: ``--no-follow-tags`` and
+    ``--recurse-submodules=check`` lead the argv, in that order, as on the
+    plain push in ``pr.GitHubPR.open``. Each overrides a key of the same
+    agent-writable config, which still decides the push options transmitted
+    (``push.pushOption``). Under ``push.followTags=true`` every annotated tag
+    the branch reaches went out with the push — tag messages, which the
+    pre-push message guard never reads. Under
+    ``push.recurseSubmodules=on-demand``, or ``submodule.recurse=true``, each
+    populated submodule's same-named branch was first pushed to that
+    submodule's own remote, and ``push.recurseSubmodules=only`` pushed the
+    submodule's branch and skipped this push altogether, exiting 0 with
+    nothing on *remote*. ``check`` pushes no submodule: when a changed
+    gitlink names a commit no remote-tracking ref of a populated submodule
+    reaches, git refuses the whole push with its own diagnosis.
+    Reachability is read from those local refs, never asked of the
+    submodule's remote, so a commit the remote holds only under a tag, or
+    one fetched by name while the tracking refs are stale, is refused too.
+    The check contacts no remote, with one exception: a submodule configured
+    as a partial clone lazily fetches a gitlink commit it lacks from its
+    promisor remote, through its own transport config. An agent can write
+    those refs too, so the refusal stops a gitlink nobody can fetch without
+    proving that anyone can. Not checked: a submodule the worktree never
+    populated, one with no remote-tracking ref at all, a populated one that
+    does not hold the gitlink's commit, or holds it but reaches it from none
+    of its refs and not from HEAD (git asks ``rev-list <commit> --not --all``
+    there before anything else), and one git cannot open at its path (a
+    broken gitfile, a symlinked path); and the superproject's own
+    ``refs/remotes/<remote>/*`` decide which pushed commits are examined, so
+    one there that reaches the bump hides it. An operator's own ``check`` is
+    honoured, where ``no`` would switch it off.
+
     Confined to *worktree* like the pipeline's plain push (:func:`git`'s
     *confine*): a ``.git`` marker lost after the caller's ownership proof
     cannot send the force-push to an enclosing repository.
@@ -6040,7 +6271,8 @@ def force_push_with_lease(
                      "pushes will be refused)", branch, remote, expected_sha)
     else:
         lease = f"--force-with-lease=refs/heads/{branch}:"
-    return git(["push", lease, remote, f"refs/heads/{branch}:refs/heads/{branch}"],
+    return git(["push", "--no-follow-tags", "--recurse-submodules=check", lease, remote,
+                f"refs/heads/{branch}:refs/heads/{branch}"],
                cwd=worktree, timeout=timeout, confine=True)
 
 

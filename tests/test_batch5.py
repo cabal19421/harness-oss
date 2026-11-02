@@ -10,6 +10,18 @@ from harness.pipeline import PipelineConfig, PipelineOrchestrator
 from harness.pipeline.backends import register_backend
 from harness.pipeline.backends.base import CodingBackend, ImplementOutcome
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 
 def _fake_venv(root: Path, pkg: str) -> None:
     sp = root / ".venv" / "lib" / "python3.14" / "site-packages"
@@ -73,9 +85,9 @@ class _InstantBackend(CodingBackend):
 
     def implement(self, ctx):
         (ctx.worktree / "out.txt").write_text(ctx.task.id + "\n")
-        subprocess.run(["git", "add", "-A"], cwd=ctx.worktree, capture_output=True,
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, "add", "-A"], cwd=ctx.worktree, capture_output=True,
                        check=False)
-        subprocess.run(["git", "commit", "-q", "-m", ctx.task.id], cwd=ctx.worktree,
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, "commit", "-q", "-m", ctx.task.id], cwd=ctx.worktree,
                        capture_output=True, check=False)
         return ImplementOutcome(status="implemented", iterations=1,
                                 oracle_passed=True, grounding_ok=True)
@@ -86,10 +98,10 @@ def _chain_repo(tmp_path):
     repo.mkdir()
     for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
                  ["config", "user.name", "t"]):
-        subprocess.run(["git", *args], cwd=repo, capture_output=True, check=False)
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=repo, capture_output=True, check=False)
     (repo / "README.md").write_text("# r\n")
-    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, check=False)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo,
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "add", "-A"], cwd=repo, capture_output=True, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "commit", "-q", "-m", "init"], cwd=repo,
                    capture_output=True, check=False)
     (repo / "designs").mkdir()
     (repo / "designs" / "d.md").write_text(

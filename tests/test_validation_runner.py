@@ -34,6 +34,18 @@ from harness.pipeline.backends.base import (
     run_validation_report,
 )
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 # ── non-UTF-8 output ───────────────────────────────────────────────────────────
 
 _BAD_BYTES = """\
@@ -83,7 +95,7 @@ def test_the_grouped_runner_returns_text_with_replacement_characters(tmp_path):
 
 
 def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True, text=True,
                    check=False)
 
 

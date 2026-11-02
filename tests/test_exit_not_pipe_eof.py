@@ -146,7 +146,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "diff.ignoreSubmodules=none",
                      "-c", "submodule.recurse=false",
                      "-c", "color.ui=never",
-                     "-c", "commit.gpgsign=false")
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 # ── fixtures and helpers ──────────────────────────────────────────────────────
@@ -186,8 +190,15 @@ def _alive(pid: int) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return False
-    return stat.rpartition(")")[2].split()[0] != "Z"
+        # Reaped between the two calls, or no /proc here: ask the kernel again
+        # instead of guessing; an unproven "gone" would pass a was-it-killed check.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
 
 
 class _State:

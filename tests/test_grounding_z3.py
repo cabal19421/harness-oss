@@ -34,6 +34,18 @@ from harness.grounding.solver import (
     get_solver,
 )
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 z3_only = pytest.mark.skipif(importlib.util.find_spec("z3") is None,
                              reason="z3 not installed")
 
@@ -585,10 +597,10 @@ class TestRequireZ3:
         repo.mkdir()
         for cmd in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
                     ["config", "user.name", "t"]):
-            subprocess.run(["git", *cmd], cwd=repo, check=True)
+            subprocess.run(["git", *_FIXTURE_GIT_PINS, *cmd], cwd=repo, check=True)
         (repo / "README.md").write_text("# repo\n")
-        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, "commit", "-q", "-m", "init"], cwd=repo, check=True)
         (repo / "designs").mkdir()
         (repo / "designs" / "d.md").write_text("# D\n## Tasks\n- [ ] one (id: t1)\n")
 

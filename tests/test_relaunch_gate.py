@@ -151,8 +151,21 @@ def writers():
         p.wait(timeout=_POLL)
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
+
 def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), check=True, capture_output=True)
 
 
 def _dead_pid() -> int:
@@ -289,7 +302,8 @@ def _gone(pid: int) -> bool:
         except ProcessLookupError:
             return True
         return False
-    return stat.rpartition(")")[2].split()[0] == "Z"
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rpartition(")")[2].split()[0] in ("Z", "X")
 
 
 # ── recovery's deferral is held out of the same run ──────────────────────────

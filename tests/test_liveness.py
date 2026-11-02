@@ -30,6 +30,18 @@ from harness.pipeline.supervisor import (
     Supervisor,
 )
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 # ── TaskClaim semantics ─────────────────────────────────────────────────────────
 
 
@@ -76,12 +88,12 @@ def test_run_skips_claimed_task(tmp_path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=False)
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=False)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "init", "-q", "-b", "main"], cwd=repo, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "config", "user.email", "t@t"], cwd=repo, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "config", "user.name", "t"], cwd=repo, check=False)
     (repo / "README.md").write_text("# r\n")
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=False)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "add", "-A"], cwd=repo, check=False)
+    subprocess.run(["git", *_FIXTURE_GIT_PINS, "commit", "-q", "-m", "init"], cwd=repo, check=False)
     d = repo / "designs"
     d.mkdir()
     (d / "d.md").write_text("# D\n## Tasks\n- [ ] task one (id: t1)\n")
@@ -184,7 +196,7 @@ def test_api_backend_last_tokens_is_thread_local():
 
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _dirty_worktree(path: Path) -> Path:

@@ -27,6 +27,18 @@ from harness.pipeline.verifier import _build_prompt, verify_change
 # verifier that has not been fixed yet and reports real assertion failures
 # instead of one import error.
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 # A real unified-diff body: a judge can see app/core.py and its hunk.
 _DIFF_ONE_FILE = """diff --git a/app/core.py b/app/core.py
 index 1111111..2222222 100644
@@ -291,7 +303,7 @@ def test_shownness_against_a_real_git_rendering(tmp_path):
     repo.mkdir()
 
     def g(*args):
-        return subprocess.run(["git", *args], cwd=repo, capture_output=True,
+        return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=repo, capture_output=True,
                               text=True, check=False)
 
     g("init", "-q", "-b", "main")

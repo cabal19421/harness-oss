@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 ![Grounding](https://img.shields.io/badge/grounding-Python%20%2B%20Go-blueviolet)
-![Tests](https://img.shields.io/badge/tests-2866%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-2967%20passing-brightgreen)
 
 ---
 
@@ -56,7 +56,7 @@ The core runs on the Python standard library alone — no cloud services or API 
 **Foundations**
 - 🔍 **Dependency doctor** — `harness status` reports the grounding solver and the constraint kinds it decides, backend availability, every external tool it can use — `git`, `gh`, `tmux`, `agent` (the agent CLI driving the `agent-cli` backend; default binary `gemini`), `go`, `npm` — with its detected-vs-required version, the optional Python extras, and an extensions summary. See **[INSTALL.md](INSTALL.md)**.
 - 📓 **Two observability channels** — an append-only JSONL **span trace** (`.harness/trace.jsonl`, one line per consequential decision) and a **verbose log** (`-v`/`-vv`, `HARNESS_LOG`) whose output is secret-redacted *and* terminal-safe. See **[LOGGING.md](LOGGING.md)**.
-- 🧪 **Tested** — **2866 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
+- 🧪 **Tested** — **2967 passing, 1 skipped**; the harness also grounds clean against itself — zero unresolved symbols across every module, with the optional extras (`.[z3,proc]`) installed. Without them, those two imports are the only expected findings.
 
 ---
 
@@ -359,8 +359,9 @@ harness/
 │       ├── cockpit.py         # tmux cockpit (run features simultaneously)
 │       ├── orchestrator.py    # Ties ingest→ground→implement→verify→review→PR; recovery + supervise/prune
 │       └── store.py           # Repo-local plan persistence (.harness/pipeline.json) + the run lock
-├── tests/                     # 2866 passing, 1 skipped (pytest; config in pytest.toml)
+├── tests/                     # 2967 passing, 1 skipped (pytest; config in pytest.toml)
 │   ├── conftest.py            # Isolated cwd/data per test
+│   ├── hostile_configs/       # two hostile git configs (v1, v2) and a README: data, not collected
 │   ├── test_grounding.py      test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py   test_grounding_precision.py
 │   ├── test_pipeline.py       test_api_backends.py       test_pr_github.py
@@ -390,6 +391,8 @@ harness/
 │   ├── test_gh_env_isolation.py      test_git_floor.py
 │   ├── test_landed_proof.py          test_lstart_identity.py
 │   ├── test_recovery_owner_proof.py  test_scan_handoff_rescan.py
+│   ├── test_agent_branch_listing.py  test_landed_proof_integrity.py
+│   ├── test_publish_followed_tags.py  test_push_config_isolation.py
 │   └── test_verifier_exit_envelope.py  test_worktree_registration_safety.py
 ├── designs/                   # ← drop your design .md files here (pipeline input)
 │   ├── TEMPLATE.md
@@ -428,7 +431,7 @@ The table below is the **selected** set most runs touch. Every
 | `HARNESS_BACKEND`, `HARNESS_PR`, `HARNESS_PARALLEL`, `HARNESS_MAX_ITERS` | Pipeline backend / PR mode / parallelism / ralph cap | `ide-handoff` / `local` / `1` / `15` |
 | `HARNESS_TEST_CMD`, `HARNESS_TYPE_CMD`, `HARNESS_LINT_CMD` | Override the pipeline oracle commands | auto-detected |
 | `HARNESS_MAX_TOKENS`, `HARNESS_MAX_COST_USD` | Budget caps that stop an unattended run (tokens on any token-tracking backend; USD parsed best-effort from the agent CLI's JSON envelope on **agent-cli** (estimated per served model on Gemini CLI, whose envelope has no USD), estimated on `openai`/`gemini` — and only for models the rate table prices, which the shipped defaults are **not**: see `HARNESS_MODEL_PRICES`) | unbounded |
-| `HARNESS_MODEL_PRICES` | Per-model USD rates for the API backends and for Gemini CLI on `agent-cli`: `model=in/cached/out` per 1M tokens, comma-separated. **Required for `HARNESS_MAX_COST_USD` to have any effect on the default `openai`/`gemini` models, and on Gemini CLI for any served model outside the built-in `gemini-2.x` rates** — the built-in table knows only `gpt-4.1*`/`gpt-4o*`/`gemini-2.x`, so an unpriced model contributes $0 and the USD cap can never trip | unset |
+| `HARNESS_MODEL_PRICES` | Per-model USD rates for the API backends and for Gemini CLI on `agent-cli`: `model=in/cached/out` per 1M tokens, comma-separated. **Required for `HARNESS_MAX_COST_USD` to have any effect on the default `openai`/`gemini` models, and on Gemini CLI for any served model outside the built-in `gemini-2.x` rates** — the built-in table knows only `gpt-4.1*`/`gpt-4o*`/`gemini-2.x`, so an unpriced model contributes $0 and the USD cap can never trip. An entry with a rate that is not finite or is below zero is ignored with the malformed-entry WARNING, as one that does not parse is | unset |
 | `HARNESS_VERIFY` | Independent verifier gate: ≥ 2 fresh-context second opinions on each diff (fail → block, abstain → high risk); `0` turns the gate off entirely | `1` (on) |
 | `HARNESS_VERIFY_SAMPLES` | Independent verifier votes per diff — **minimum 2** while the gate is on; majority wins, a split → human review | `2` |
 | `HARNESS_NO_PROGRESS_WINDOW` | Abstain to a human after N iterations reach the same failing state (`0` disables) | `3` |

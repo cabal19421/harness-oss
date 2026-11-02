@@ -59,8 +59,21 @@ def _neutral_git_config(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(cfg))
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
+
 def _git(args, cwd, *, check: bool = True) -> subprocess.CompletedProcess:
-    res = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    res = subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                          text=True, check=False)
     if check and res.returncode:
         raise AssertionError(f"git {args} in {cwd} failed: {res.stderr}")

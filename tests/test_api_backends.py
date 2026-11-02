@@ -1,10 +1,13 @@
 """Tests for the API-direct backends (openai / gemini) and the shared ralph loop."""
 from __future__ import annotations
 
+import logging
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from harness.pipeline import PipelineConfig
 from harness.pipeline.backends import available_backends, get_backend
@@ -13,9 +16,21 @@ from harness.pipeline.backends.base import ImplementContext
 from harness.pipeline.spec import Task
 from harness.pipeline.worktree import WorktreeManager
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _init_repo(path: Path) -> Path:
@@ -528,6 +543,31 @@ def test_model_prices_can_be_supplied_by_env(monkeypatch):
     assert estimate_cost_usd("two-price", output_tokens=1_000_000) == 5.0
     monkeypatch.setenv("HARNESS_MODEL_PRICES", "garbage-without-prices")
     assert estimate_cost_usd("garbage-without-prices", input_tokens=1) is None
+
+
+@pytest.mark.parametrize("prices", ["nan/1/2", "1/inf/2", "1/1/-1", "-1/5"],
+                         ids=["nan", "inf", "-1", "-1-in-the-two-price-form"])
+def test_a_price_that_is_not_finite_or_is_negative_is_ignored(monkeypatch, caplog, prices):
+    """``float()`` reads "nan" and "inf" as prices, and nothing refused a rate
+    below zero. Such an entry is now ignored with the malformed-entry WARNING,
+    like one that does not parse, and a valid entry in the same variable still
+    prices its model. PRE-FIX the entry was taken: a NaN rate made every
+    estimate for its model NaN (the ``agent`` span wrote a bare NaN, and the
+    budget read it as $0), a negative one took spend off the estimate or made
+    it negative, and an infinite one stopped the run on a "$inf" reading."""
+    from harness.pipeline import looptools
+
+    monkeypatch.setattr(looptools, "_rate_cache", {})
+    monkeypatch.setenv("HARNESS_MODEL_PRICES", f"bad-model={prices},good-model=2/1/10")
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        rates = looptools._env_rates()
+    assert rates == {"good-model": (2.0, 1.0, 10.0)}
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    said = (f"ignoring malformed HARNESS_MODEL_PRICES entry 'bad-model={prices}' "
+            "(want finite, non-negative prices)")
+    assert warned == [said]
+    assert looptools.model_rate("bad-model") is None
+    assert looptools.estimate_cost_usd("good-model", input_tokens=1_000_000) == 2.0
 
 
 def test_openai_accounts_cost_from_usage(monkeypatch, tmp_path):

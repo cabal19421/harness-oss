@@ -509,6 +509,9 @@ def _cli_budget_flags(cli: str, cfg,
     A cap is never dropped silently: while the CLI hid ``--max-turns`` from
     ``--help``, the turn cap was skipped on every run, unenforced and unlogged.
 
+    The remaining balance goes over floored to the cent, never above it
+    (:func:`_handed_balance`); a remainder below one cent goes over as $0.01.
+
     That is the legacy family's rule. Gemini CLI (:func:`_cli_family`) gets
     :func:`_gemini_budget_flags` instead — no dry run of its parser proves a
     flag, and it has neither cap flag — and is refused only for a
@@ -525,7 +528,7 @@ def _cli_budget_flags(cli: str, cfg,
         if not takes:
             return [], _cap_refusal(cli, "max_cost_usd", "HARNESS_MAX_COST_USD",
                                     "--max-budget-usd", why)
-        flags += ["--max-budget-usd", f"{max(0.01, remaining):.2f}"]
+        flags += ["--max-budget-usd", _handed_balance(remaining)]
     if turns:
         takes, why = _cli_takes(cli, "--max-turns")
         if not takes:
@@ -533,6 +536,38 @@ def _cli_budget_flags(cli: str, cfg,
                                     "--max-turns", why)
         flags += ["--max-turns", str(int(turns))]
     return flags, ""
+
+
+#: Float noise absorbed before a balance is floored to the cent. The budget's
+#: remainder is a float difference, and float cents are inexact both ways
+#: (1.0 - 0.67 is 0.32999999999999996, and 0.29 * 100 is 28.999999999999996),
+#: so a bare floor would hand a cent less than remains. A billionth of a dollar
+#: is far above that noise for any realistic budget (below about $10M), and far
+#: below a cent.
+_CENT_NOISE_USD = 1e-9
+
+
+def _handed_balance(remaining: float) -> str:
+    """The ``--max-budget-usd`` value for a *remaining* budget: floored to the cent.
+
+    Never above what remains, so the CLI's own stop is never set past the
+    budget (its last turn can still overshoot it, and the overshoot is charged
+    when the envelope reports it). Rounded to the nearest cent, as it used to
+    be, 0.336 went over as 0.34. A balance within a billionth of a dollar
+    below a cent is that cent: float noise, not a remainder
+    (:data:`_CENT_NOISE_USD`). A remainder below one cent, zero
+    included, is handed 0.01: the hand-over is in whole cents, and the CLI
+    refuses a balance that is not above 0 ("must be a positive number greater
+    than 0"). That cent is the one hand-over that can exceed what remains, by
+    less than a cent; a call the CLI ends at it is charged at least that cent
+    (:func:`_capped_call_cost`), so the next budget check stops the run. A
+    balance that is not finite (an ``inf`` budget) is rendered as it always was.
+    """
+    scaled = (remaining + _CENT_NOISE_USD) * 100
+    if not math.isfinite(scaled):
+        return f"{max(0.01, remaining):.2f}"
+    cents = max(1, math.floor(scaled))
+    return f"{cents // 100}.{cents % 100:02d}"
 
 
 def _cap_refusal(cli: str, knob: str, env: str, flag: str, why: str) -> str:
@@ -1076,11 +1111,13 @@ def _gemini_budget_flags(cli: str, cfg, budget: LoopBudget | None) -> list[str]:
     cannot be handed refuses the task (:func:`_gemini_cap_refusal`). Without
     ``--max-budget-usd``, ``max_cost_usd`` rests on harness's per-model
     estimate alone: never a refusal, and said once per binary at WARNING.
+    With it, the balance goes over floored to the cent, never above what
+    remains (:func:`_handed_balance`), as on the legacy family.
     """
     flags: list[str] = []
     remaining = budget.remaining_cost() if budget is not None else None
     if remaining is not None and _cli_supports(cli, "--max-budget-usd"):
-        flags += ["--max-budget-usd", f"{max(0.01, remaining):.2f}"]
+        flags += ["--max-budget-usd", _handed_balance(remaining)]
     elif remaining is not None:
         _warn_once(_POLICY_NOTED, (cli, "--max-budget-usd"),
                    "max_cost_usd is set, but the agent CLI `%s` (Gemini CLI) takes no "
@@ -1460,9 +1497,12 @@ class AgentCliBackend(CodingBackend):
         # discards that work — a later attempt's discard, a terminal stop — also
         # sweeps the nested repositories it created.
         kept_capped_work = False
-        # The note that leads `feedback` after a red capped call, telling the
-        # next agent that work is in the tree to continue. It goes from the
-        # feedback with the work: a failed call's discard takes both.
+        # The note that leads `feedback` after a red capped call (behind a
+        # nested-repository note, when one is kept), telling the next agent
+        # that work is in the tree to continue. It goes from the feedback with
+        # the work: a failed call's discard takes both, and a green verdict
+        # drops both note and verdict (the green path below, which keeps only
+        # a leading nested-repository note).
         cap_note = ""
         nested: gitutil.NestedRepoIds | None = None
 
@@ -1529,6 +1569,12 @@ class AgentCliBackend(CodingBackend):
                               "terminated after it exited 0",
                               detail=run.detail, iteration=i)
             budget.add(tokens=run.tokens, cost_usd=run.cost)
+            if _at_budget_cap(run.capped):
+                # Charged at least what the budget had left as it launched, the
+                # call leaves none of it — exactly, not an ulp short in floats —
+                # so the check at the next iteration stops the run with no
+                # further launch (_exhaust_cost_budget).
+                _exhaust_cost_budget(budget)
             if run.usage_unreported:
                 # Gemini CLI prints no stats with its exit-53 error: nothing was
                 # unparseable, and its calls that exit 0 still report theirs —
@@ -1673,6 +1719,21 @@ class AgentCliBackend(CodingBackend):
                 # repair, whose iterations snapshot as they always have.
                 consecutive_failures = 0
                 kept_capped_work = False
+                # Green answers every verdict before it, so the feedback goes
+                # now, cap note included: a commit-repair prompt carries the
+                # commit failure — it used to carry an earlier capped call's
+                # note and red verdict too — as does the prompt after a repair
+                # call that failed (that path discards nothing), and a later
+                # red verdict starts the feedback afresh. A leading
+                # nested-repository note is no verdict, and it stays (its own
+                # paragraph, gitutil.with_nested_note): the operator's
+                # repository that survived an earlier discard is still there
+                # and still not the agent's, and a commit refused because of
+                # it would otherwise hand the repair only text that suggests
+                # deleting the directory.
+                feedback = (feedback.partition("\n\n")[0]
+                            if feedback.startswith(gitutil.NESTED_NOTE_PREFIX) else "")
+                cap_note = ""
                 commit = self._ensure_committed(ctx)
                 if commit is not None and not commit.ok:
                     # Green by the oracle but the commit was rejected (pre-commit
@@ -1760,6 +1821,12 @@ class AgentCliBackend(CodingBackend):
             # still bound the loop, and every stop keeps its usual cleanup.
             if not run.capped:
                 consecutive_failures += 1
+            # A leading nested-repository note is no verdict, and what it says
+            # still holds when no discard follows this verdict (a call the CLI
+            # ended at its cap is kept; a red commit repair keeps the green
+            # work it repairs), so it leads the new feedback too (below).
+            kept_note = (feedback.partition("\n\n")[0]
+                         if feedback.startswith(gitutil.NESTED_NOTE_PREFIX) else "")
             feedback = oracle.feedback()
             logger.debug("iteration %d for %s: oracle red (%s %d/%d) — feeding "
                          "back %d chars of findings", i, ctx.task.id,
@@ -1778,6 +1845,13 @@ class AgentCliBackend(CodingBackend):
                             f"done was judged as it stood, and it is still in the "
                             f"worktree — continue from it.")
                 feedback = f"{cap_note}\n\n{feedback}"
+            # The kept note ahead of the cap note and the verdict, its own
+            # paragraph, so the green path keeps it for a commit repair.
+            # Before, the verdict restarted the feedback here, and a repair
+            # after either path heard nothing of the nested repositories but
+            # the commit's refusal, which suggests deleting the directory. A
+            # discard below writes its own sweep's note in its place.
+            feedback = gitutil.with_nested_note(feedback, kept_note)
             # No-progress guard: if the loop keeps reaching the SAME red state,
             # more iterations will only reproduce it — abstain to a human with a
             # diagnostic instead of burning the budget on a dead end.
@@ -1962,9 +2036,17 @@ class AgentCliBackend(CodingBackend):
             last = self._run_agent(ctx, feedback, pending_commit_failure, budget=view)
             # Every attempt's spend counts toward the budget — a failed attempt
             # still billed tokens; returning only the last attempt's numbers
-            # made the cap under-count on retried iterations.
+            # made the cap under-count on retried iterations. No attempt's
+            # figure is below zero, so none cancels another's: the usage parser
+            # counts a negative token count 0, and _run_agent counts a cost
+            # that is not finite or is below zero $0. Finite costs can still
+            # add up past the float range, and that sum is held at the largest
+            # finite float: each figure is a reading of what its attempt spent,
+            # so none is dropped, and the attempts spent at least that much.
+            # Summed to +Infinity, it went into the `agent` span as a bare
+            # Infinity, which strict JSON readers refuse.
             last.tokens += spent_tokens
-            last.cost += spent_cost
+            last.cost = min(last.cost + spent_cost, sys.float_info.max)
             if last.ok or last.permanent:
                 return last
             if shutdown.requested():
@@ -2100,6 +2182,7 @@ class AgentCliBackend(CodingBackend):
         policy_files: list[Path] = []
         popen_kw: dict[str, Any] = {}
         budget_flags: list[str] = []
+        launched_with: float | None = None
         if family.name == _GEMINI:
             built = _gemini_implement_argv(self.cli, family, ctx, prompt, budget)
             if isinstance(built, str):
@@ -2132,6 +2215,11 @@ class AgentCliBackend(CodingBackend):
                 # (cap_refusal); this guards any other caller of _run_agent.
                 return self._Run(False, detail=refusal, permanent=True)
             cmd += budget_flags
+            # The exact budget left as this call launches. Its flag above hands
+            # it floored to the cent; a call the CLI ends at that cap is charged
+            # at least this figure (_capped_call_cost), so no sub-cent remainder
+            # outlives it to launch another call.
+            launched_with = budget.remaining_cost() if budget is not None else None
             # The prompt is design-doc-derived text — log its size, never its
             # contents; the flags after it are safe to show verbatim.
             logger.debug("%s", fmt_cmd(
@@ -2262,19 +2350,47 @@ class AgentCliBackend(CodingBackend):
         # and only for a cap flag this launch's argv carried.
         capped = (_cli_cap_text(out or "", budget_flags)
                   if proc.returncode == 1 and not shutdown.requested() else "")
-        if capped:
-            # What the loop's budget is charged for the call: at least the
-            # --max-budget-usd balance it was handed, when that is the cap the
-            # CLI says it reached (_capped_call_cost).
-            charged = _capped_call_cost(capped, budget_flags, cost)
+        if _at_budget_cap(capped):
+            # What the loop's budget is charged for a call the CLI stopped at
+            # its --max-budget-usd cap: at least the balance it was handed and
+            # the exact budget left as it launched (_capped_call_cost). A call
+            # it ended at its turn cap never comes here: it is charged its own
+            # figure, and a NaN one (which equals no charge, not even itself)
+            # used to log this WARNING with every clause of it false.
+            charged = _capped_call_cost(capped, budget_flags, cost, launched_with)
             if charged != cost:
                 logger.warning("the CLI ended the call at its --max-budget-usd cap, "
                                "but its envelope's cost reads $%.4f (none, not a "
-                               "number, or below the cap) — charging the $%.2f it "
-                               "was handed: the most it was allowed, since its "
-                               "real spend cannot be read",
+                               "number, not finite, or below what the call was "
+                               "allowed) — charging the $%.4f it was allowed: at "
+                               "least the balance it was handed and the budget "
+                               "left as it launched, so the next budget check "
+                               "stops the run",
                                cost, charged)
                 cost = charged
+        if not math.isfinite(cost) or cost < 0.0:
+            # A cost that is not finite or is below zero (a bare NaN or
+            # Infinity — JSON tokens the usage parser passes through in the
+            # cost field, though it counts either one 0 in a token field — or
+            # a negative figure) is no reading of what the call spent: it counts
+            # $0, as a missing cost does. A budget-capped call was charged
+            # above instead: _capped_call_cost reads each of these as
+            # unreadable and charges the balance, a finite figure under any
+            # finite budget. Carried as it was, the figure was summed into the
+            # iteration's attempts (_run_with_retries): a NaN made the sum NaN,
+            # which the budget reads as $0, and a negative or -Infinity figure
+            # cancelled what the other attempts spent, in part or whole; either
+            # way the next attempt was handed balance they had already spent.
+            # +Infinity, unreadable by the same rule, stopped the run on a
+            # "$inf" reading. The `agent` span wrote a NaN or an infinite sum
+            # into trace.jsonl as a bare NaN, Infinity or -Infinity, which
+            # strict JSON readers refuse.
+            logger.debug("the envelope's cost reads $%.4f (%s) — this "
+                         "invocation counts $0 toward the budget, as a missing "
+                         "cost does", cost,
+                         "not a number" if math.isnan(cost) else
+                         "not finite" if math.isinf(cost) else "below zero")
+            cost = 0.0
         # A CLI that exited on SIGTERM — the shutdown handler's, or anyone
         # else's — left behind whatever of its tools no TERM stopped; one
         # killed by any other signal (the OOM killer's SIGKILL) ran no
@@ -2511,6 +2627,26 @@ class AgentCliBackend(CodingBackend):
         logger.debug("agent CLI (Gemini CLI) exited rc=%s in %.1fs — stdout=%d chars, "
                      "stderr=%d chars, parsed usage: tokens=%d cost=$%.4f (estimated)",
                      rc, elapsed, len(out), len(err), tokens, cost)
+        if not math.isfinite(cost) or cost < 0.0:
+            # The cost here is harness's estimate from the envelope's stats
+            # (parse_gemini_usage), and an estimate that is not finite or is
+            # below zero is no reading of what the call spent: it counts $0,
+            # as a missing one does, by the legacy family's rule and for its
+            # reasons (_run_agent). The parser applies the rule to each served
+            # model's estimate before it sums them, so that one model's NaN,
+            # Infinity or negative figure (+Infinity from a count so large that
+            # it times its rate overflows or from a finite but huge
+            # HARNESS_MODEL_PRICES rate; a NaN or a negative one only from a
+            # rate set in looptools._MODEL_RATES itself, since _env_rates
+            # refuses a rate in the variable that is not finite or is below
+            # zero) cannot erase or cancel the others'; this is the backstop
+            # for a sum that overflows. Every return below carries this figure.
+            logger.debug("the envelope's cost reads $%.4f (%s) — this "
+                         "invocation counts $0 toward the budget, as a missing "
+                         "cost does", cost,
+                         "not a number" if math.isnan(cost) else
+                         "not finite" if math.isinf(cost) else "below zero")
+            cost = 0.0
         stopped = _gemini_stopped(rc, out, stderr, error)
         sigtermed = rc in (143, -signal.SIGTERM)
         reclaimed = ""
@@ -3625,7 +3761,8 @@ def _cli_cap_text(stdout: str, flags: list[str]) -> str:
     return trunc(f"{subtype}: {'; '.join(said)}" if said else str(subtype), 300)
 
 
-def _capped_call_cost(capped: str, flags: list[str], cost: float) -> float:
+def _capped_call_cost(capped: str, flags: list[str], cost: float,
+                      remaining: float | None = None) -> float:
     """What a call the CLI ended at its cap (*capped*, :func:`_cli_cap_text`) costs the loop.
 
     *cost* — the envelope's own figure, :func:`parse_agent_usage`'s — except
@@ -3633,8 +3770,14 @@ def _capped_call_cost(capped: str, flags: list[str], cost: float) -> float:
     cost has reached the balance in *flags* (the balance it was handed), and
     newer CLIs also end one there when the session's cost is no longer a
     number, before any balance is reached; either way the call is charged at
-    least that balance — the most it was allowed, not a measured spend. Its own
-    figure is kept when it reads as at least the balance. One that cannot be
+    least that balance — the most it was allowed, not a measured spend — and at
+    least *remaining*, when given: the exact budget left as the call launched
+    (the balance in *flags* is that figure floored to the cent,
+    :func:`_handed_balance`). Charged that, the call leaves nothing of the
+    budget, and the next budget check stops the run. Charged only the floored
+    balance, a sub-cent remainder (0.333, handed as 0.33) left the total just
+    under ``max_cost_usd``, and one more call was launched at the $0.01 floor.
+    Its own figure is kept when it reads as at least both. One that cannot be
     read — ``null`` (newer CLIs refuse a session cost that is not a number
     under the same subtype, and JSON writes the NaN as ``null``), a bare NaN, a
     missing or drifted field, each of which parses as $0 or NaN — or that reads
@@ -3643,15 +3786,40 @@ def _capped_call_cost(capped: str, flags: list[str], cost: float) -> float:
     exactly where the CLI-side cap exists to hold: every red budget-capped call
     was handed the whole balance again, until ``max_iters``.
     """
-    if capped.partition(":")[0] != _CLI_CAP_SUBTYPES["--max-budget-usd"]:
+    if not _at_budget_cap(capped):
         return cost
     try:
         handed = float(flags[flags.index("--max-budget-usd") + 1])
     except (ValueError, IndexError):
         return cost
-    # A NaN fails every comparison, so it reads as unreadable here.
+    # A NaN fails every comparison, so it reads as unreadable here — and a
+    # NaN *remaining* leaves `allowed` at the balance it was handed.
     readable = cost if 0.0 <= cost < float("inf") else 0.0
-    return max(readable, handed)
+    allowed = handed if remaining is None else max(handed, remaining)
+    return max(readable, allowed)
+
+
+def _at_budget_cap(capped: str) -> bool:
+    """Whether *capped* (:func:`_cli_cap_text`) is the CLI's ``--max-budget-usd`` stop."""
+    return capped.partition(":")[0] == _CLI_CAP_SUBTYPES["--max-budget-usd"]
+
+
+def _exhaust_cost_budget(budget: LoopBudget) -> None:
+    """Hold *budget*'s cost total at its cap at least: nothing of it is left.
+
+    What a call the CLI ended at its ``--max-budget-usd`` cap leaves of the
+    budget. The call is charged at least the exact remainder it launched with
+    (:func:`_capped_call_cost`), which puts the total at the cap in exact
+    arithmetic; in floats, a remainder found by subtraction and added back can
+    land an ulp short (0.047 + (0.21 - 0.047) is 0.20999999999999996), and the
+    next budget check would then launch one more call at the $0.01 floor.
+    """
+    cap = budget.max_cost_usd
+    if cap is not None and budget.cost_usd < cap:
+        logger.debug("budget: the call the CLI ended at its --max-budget-usd cap "
+                     "leaves nothing of the cost budget — total $%r held at the "
+                     "$%.2f cap", budget.cost_usd, cap)
+        budget.cost_usd = cap
 
 
 def _tail_elided(text: str, limit: int) -> str:

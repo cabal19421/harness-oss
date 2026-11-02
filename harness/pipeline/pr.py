@@ -26,7 +26,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from harness.log import fmt_cmd, get_logger, redact, redact_home_paths, step, trunc
+from harness.log import (
+    fmt_cmd,
+    get_logger,
+    redact,
+    redact_home_paths,
+    sanitize_control,
+    step,
+    trunc,
+)
 
 from . import gitutil
 from .sanitize import _HARNESS_MARKER_RE, publication_hazards
@@ -595,13 +603,48 @@ class GitHubPR(PrCreator):
         # write) made this plain push a force push: a reviewer's commit was
         # overwritten before any retry, clobber check or lease ran. `-u` still
         # records the upstream.
+        #
+        # No other ref rides on it. More keys of that agent-writable config
+        # each pushed what no one reviewed, and the two flags right after
+        # `push` override them (which push options it transmits is still that
+        # config's: push.pushOption):
+        # * push.followTags=true sent every annotated tag the branch reaches —
+        #   messages _unpublishable_messages never reads (a token in one
+        #   reached origin, even with a push whose branch was rejected: git
+        #   updates refs one by one). `--no-follow-tags`.
+        # * push.recurseSubmodules=on-demand, or submodule.recurse=true, first
+        #   pushed each populated submodule's same-named branch to THAT
+        #   submodule's own remote, one the operator never named; =only
+        #   pushed the submodule's branch and skipped this push altogether,
+        #   exiting 0 with nothing on origin. `--recurse-submodules=check`
+        #   pushes no submodule; it refuses the whole push, in git's words,
+        #   when a changed gitlink names a commit no remote-tracking ref of a
+        #   populated submodule reaches. Reachability is read from those
+        #   local refs, never asked of the submodule's remote, so a commit
+        #   the remote holds only under a tag, or one fetched by name while
+        #   the tracking refs are stale, is refused too.
+        #   The check contacts no remote, with one exception: a submodule
+        #   configured as a partial clone lazily fetches a gitlink commit it
+        #   lacks from its promisor remote, through its own transport config.
+        #   Those refs are agent-writable too, so this stops a gitlink nobody
+        #   can fetch without proving anyone can. Not checked: a submodule the
+        #   worktree never populated, one with no remote-tracking ref at all,
+        #   a populated one that does not hold the gitlink's commit, or holds
+        #   it but reaches it from none of its refs and not from HEAD (git
+        #   asks `rev-list <commit> --not --all` there before anything else),
+        #   and one git cannot open at its path (a broken gitfile, a
+        #   symlinked path); and this repository's own refs/remotes/origin/*
+        #   decide which pushed commits are examined, so one there that
+        #   reaches the bump hides it. An operator's own `check` stays in
+        #   force; `no` would switch it off.
+        # Both retries lead with the same two flags (force_push_with_lease).
         refspec = f"refs/heads/{branch}:refs/heads/{branch}"
-        logger.debug("%s", fmt_cmd(["git", "push", "-u", "origin", refspec],
-                                   cwd=worktree))
+        push_argv = ["push", "--no-follow-tags", "--recurse-submodules=check",
+                     "-u", "origin", refspec]
+        logger.debug("%s", fmt_cmd(["git", *push_argv], cwd=worktree))
         # Confined like the destructive helpers: a marker lost after the proof
         # above still cannot send the push to an enclosing repository.
-        push = gitutil.git(["push", "-u", "origin", refspec], cwd=worktree,
-                           timeout=300, confine=True)
+        push = gitutil.git(push_argv, cwd=worktree, timeout=300, confine=True)
         if not push.ok:
             logger.warning("push of %r rejected (rc=%d): %s — evaluating safe "
                            "retry", branch, push.code,
@@ -614,7 +657,16 @@ class GitHubPR(PrCreator):
             if not push.ok:
                 logger.warning("push of %r still failing after retry decision "
                                "(rc=%d) — PR not opened", branch, push.code)
-                return PrResult(ok=False, detail=f"git push failed: {push.err or push.out}")
+                # Scrubbed of terminal control characters (newlines and tabs
+                # stay) here, once, for every reader of the result — the
+                # review summary, the task's detail, the run report and
+                # `pipeline complete` print it as it is. git prints a refused
+                # submodule's path raw, so an escape sequence an agent put in
+                # one reached the operator's terminal. This is the first
+                # push's failure or the lease-guarded retry's; the log lines
+                # are redacted on their own.
+                return PrResult(ok=False, detail=sanitize_control(
+                    f"git push failed: {push.err or push.out}"))
 
         # Idempotent on re-run, but adoption is not success by itself: the new
         # head is already on the remote, so the PR must be made to attest it.
@@ -699,7 +751,21 @@ class GitHubPR(PrCreator):
         retry — name their refspec in full and unforced
         (``refs/heads/<branch>:refs/heads/<branch>``), so a forced
         ``remote.origin.push`` in the repository's config cannot make either a
-        force push, which would override the lease.
+        force push, which would override the lease. Both also lead with
+        ``--no-follow-tags`` and ``--recurse-submodules=check``, so neither
+        ``push.followTags`` nor ``push.recurseSubmodules=on-demand`` /
+        ``=only`` / ``submodule.recurse`` adds a tag or a submodule push to
+        either (see :func:`gitutil.force_push_with_lease`). A changed gitlink
+        that no remote-tracking ref of its populated submodule reaches makes
+        git refuse the push itself, in its own words: no non-fast-forward, so
+        that failure is returned as it came — unless the refused submodule's
+        path itself contains one of the words this retry keys on below
+        ("rejected", "non-fast-forward", "fetch first", "stale info"), which
+        are matched case-insensitively. Then the retry path runs, but
+        harness's own clobber check or its cannot-tell guard can refuse
+        before any second push (the detail then quotes git's diagnosis as the
+        original push error); otherwise git refuses the lease-guarded push
+        the same way.
 
         Crucially we do **not** ``git fetch`` first: fetching would update the
         remote-tracking ref to the diverged tip and lease the force-push to *that*,
@@ -800,8 +866,8 @@ class GitHubPR(PrCreator):
                            "git refuses it wherever that branch exists (no fetch)",
                            branch, remote_ref, lease)
             # force_push_with_lease with no expected SHA sends exactly that
-            # lease, with the refspec in full and unforced, confined to the
-            # worktree like the plain push.
+            # lease, with the refspec in full and unforced behind the plain
+            # push's two flags, confined to the worktree like the plain push.
             return gitutil.force_push_with_lease(worktree, "origin", branch, "")
         local = gitutil.branch_tip(worktree, branch)
         if not local:
@@ -839,8 +905,9 @@ class GitHubPR(PrCreator):
                        "named when the clobber check validated it (no fetch: a "
                        "remote that moved past it since is still refused)",
                        branch, remote[:12], remote_ref)
-        # The refspec in full and unforced, confined to the worktree like the
-        # plain push (see force_push_with_lease).
+        # The refspec in full and unforced behind the plain push's two flags,
+        # confined to the worktree like the plain push (see
+        # force_push_with_lease).
         return gitutil.force_push_with_lease(worktree, "origin", branch, remote)
 
     @staticmethod

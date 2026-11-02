@@ -34,6 +34,18 @@ from harness.pipeline.backends.agent_cli import AgentCliBackend
 from harness.pipeline.backends.base import ImplementContext
 from harness.pipeline.verifier import VERDICT_SCHEMA, verify_change
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 _FAIL = {"verdict": "FAIL", "confidence": 0.9, "reasons": ["deliberate FAIL"]}
 _USAGE = {"input_tokens": 1, "output_tokens": 1}
 _DIFF = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
@@ -87,7 +99,7 @@ def oneshot(tmp_path, monkeypatch):
     for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
                  ["config", "user.name", "t"], ["commit", "-q", "--allow-empty",
                                                 "-m", "init"]):
-        subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=str(repo),
+        subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(repo),
                        check=True, capture_output=True)
     cfg = PipelineConfig(repo=repo, designs_dir="designs")
     ctx = ImplementContext(task=Task(id="t", title="x", design_doc="d.md", validation=[]),

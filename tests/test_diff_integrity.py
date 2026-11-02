@@ -51,8 +51,21 @@ def _neutral_git_config(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(neutral))
 
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
+
 def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+    return subprocess.run(["git", *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
 
@@ -597,7 +610,7 @@ def test_display_path_is_what_git_itself_prints(tmp_path):
     _git(["add", "-A"], repo)
     _git(["commit", "-qm", "names"], repo)
     # git's DEFAULT spelling, whatever config the run inherits.
-    printed = subprocess.run(["git", "-c", "core.quotePath=true", "diff", "--name-only",
+    printed = subprocess.run(["git", *_FIXTURE_GIT_PINS, "-c", "core.quotePath=true", "diff", "--name-only",
                               "main...HEAD"], cwd=repo, capture_output=True,
                              check=True).stdout.decode("ascii")
 
@@ -1247,7 +1260,7 @@ def test_detect_language_names_a_changed_file_as_git_prints_it(_strict_log):
 
 def _raw(args: list[str], cwd: Path) -> str:
     """git with BYTES output: the fixture's own calls here print raw names."""
-    res = subprocess.run(["git", "-c", "protocol.file.allow=always", *args],
+    res = subprocess.run(["git", *_FIXTURE_GIT_PINS, "-c", "protocol.file.allow=always", *args],
                          cwd=str(cwd), capture_output=True, check=False)
     assert res.returncode == 0, res.stderr
     return os.fsdecode(res.stdout).strip()

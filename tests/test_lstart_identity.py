@@ -33,6 +33,18 @@ from harness.pipeline.notes import Heartbeat, RunLog
 from harness.pipeline.spec import PipelineConfig, Plan, Task
 from harness.pipeline.supervisor import Supervisor
 
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
+
 pytestmark = pytest.mark.skipif(shutil.which("ps") is None, reason="needs a ps binary")
 
 _WRITER_TZ, _READER_TZ = "EST5", "JST-9"        # 14 hours apart
@@ -205,7 +217,7 @@ def test_a_task_parked_at_review_is_never_rolled_back_without_proof_its_parker_r
     repo.mkdir()
 
     def run(cwd: Path, *args: str) -> str:
-        return subprocess.run([git, *args], cwd=str(cwd), check=True, capture_output=True,
+        return subprocess.run([git, *_FIXTURE_GIT_PINS, *args], cwd=str(cwd), check=True, capture_output=True,
                               text=True).stdout.strip()
 
     run(repo, "init", "-q", "-b", "main")

@@ -407,9 +407,18 @@ def gem(tmp_path, monkeypatch):
     yield from gemini_setup(tmp_path, monkeypatch)
 
 
-#: The fixtures' own git calls, pinned against the user's config.
-_FIXTURE_GIT_PINS = ("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-                     "-c", "core.ignoreStat=false", "-c", "color.ui=never")
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.hooksPath=/dev/null",
+                     "-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args, cwd):
@@ -1231,6 +1240,26 @@ def test_max_cost_usd_on_gemini_cli_is_said_once_per_binary_and_never_refuses(
     assert len(quiet.launches()) == 2
     assert not [r for r in warnings_matching(caplog, "per-call budget flag")
                 if quiet.cli in r.getMessage()]
+
+
+def test_a_balance_handed_to_gemini_cli_is_floored_to_the_cent(gem, tmp_path):
+    """A help that lists --max-budget-usd is handed the balance floored to the
+    cent, never above what remains, as on the legacy family. PRE-FIX it was
+    rounded to the nearest cent, so a 0.336 balance went over as 0.34 and the
+    CLI could spend past the budget. A remainder below one cent goes over as
+    0.01: the hand-over is in whole cents."""
+    listed = gem.stand_in(help_text=_help_listing("--max-budget-usd"))
+    ctx = make_ctx(tmp_path, max_cost_usd=1.0)
+    backend = listed.backend()
+
+    for spent in (0.664, 0.996):                    # $0.336 left, then $0.004
+        budget = LoopBudget(max_cost_usd=1.0, cost_usd=spent)
+        run = backend._run_agent(ctx, "", budget=budget)
+        assert run.ok, run.detail
+
+    handed = [launch["argv"][launch["argv"].index("--max-budget-usd") + 1]
+              for launch in listed.launches()]
+    assert handed == ["0.33", "0.01"]
 
 
 # ── the legacy family stays byte-for-byte ───────────────────────────────────────

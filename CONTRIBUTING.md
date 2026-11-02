@@ -197,6 +197,7 @@ harness/
 │       └── store.py            # repo-local plan persistence (.harness/pipeline.json)
 ├── tests/                      # Test suite (flat; pytest, config in pytest.toml)
 │   ├── conftest.py             # Shared fixtures (isolated cwd per test)
+│   ├── hostile_configs/        # two hostile git configs (v1, v2) and a README: data, not collected
 │   ├── test_grounding.py  test_grounding_explain.py  test_grounding_z3.py
 │   ├── test_grounding_go.py  test_grounding_precision.py
 │   ├── test_pipeline.py  test_api_backends.py  test_verify_hook.py
@@ -226,6 +227,8 @@ harness/
 │   ├── test_gh_env_isolation.py  test_git_floor.py
 │   ├── test_landed_proof.py  test_lstart_identity.py
 │   ├── test_recovery_owner_proof.py  test_scan_handoff_rescan.py
+│   ├── test_agent_branch_listing.py  test_landed_proof_integrity.py
+│   ├── test_publish_followed_tags.py  test_push_config_isolation.py
 │   └── test_verifier_exit_envelope.py  test_worktree_registration_safety.py
 ├── designs/                    # Pipeline input (design docs)
 ├── extensions/                 # Drop-in skills / MCP servers / automations
@@ -509,7 +512,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 2866 passing, 1 skipped at the time of writing
+# Run all tests — 2967 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output
@@ -556,6 +559,97 @@ pytest --cov=harness --cov-report=html --cov-report=term-missing
   base, ran there (the diff broke it) or never launched there (nothing shows it
   was broken before): then the leg counts against the diff
   (`backends.base._unexcuse_diff_broken_legs`).
+
+**Git fixtures and the hostile-config run.** The suite is also run with
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` both pointing at one hostile file:
+`status.showUntrackedFiles=no`, `diff.ignoreSubmodules=all`,
+`diff.external=/bin/false`, `submodule.recurse=true`, `core.ignoreStat=true`,
+`core.fsmonitor=false`, `color.ui=always`, `push.recurseSubmodules=check`. For
+that run to judge harness, not the fixture, a module's own git calls carry the
+module-level `_FIXTURE_GIT_PINS` tuple, spliced right after the git program in
+their argv. "Own git calls" means its `_git`-style helpers and the direct
+`subprocess.run(["git", ...])` calls that build or read back a repository. The
+pins ride only that argv: no environment variable is set, and harness's own git
+calls are never pinned.
+
+Two hostile files are checked in. `tests/hostile_configs/v1.gitconfig` holds
+those eight keys. `tests/hostile_configs/v2.gitconfig` holds 57, an opinionated
+operator's global config: v1 plus, among others, commit and tag signing with a
+key that does not exist, `protocol.file.allow=never`,
+`safe.bareRepository=explicit`, `branch.autoSetupMerge=always` with
+`branch.autoSetupRebase=always`, `column.ui=always`, `init.defaultBranch=trunk`
+and `gc.auto=0`. Run from the repository root:
+`GIT_CONFIG_GLOBAL="$PWD/tests/hostile_configs/v2.gitconfig" GIT_CONFIG_SYSTEM="$PWD/tests/hostile_configs/v2.gitconfig" .venv/bin/python -m pytest -c pytest.toml -q`,
+and the same with v1. Give the file's absolute path. git resolves a relative
+`GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` against its own working directory,
+which for nearly every call in the suite is a temporary repository. A relative
+path therefore leaves the hostile file unread, and the run passes without
+exercising it. Counts and per-test outcomes must match a plain run's.
+
+- A new tuple carries ten keys: `core.ignoreStat=false`, `color.ui=never`,
+  `commit.gpgsign=false`, `status.showUntrackedFiles=normal`,
+  `diff.ignoreSubmodules=none`, `submodule.recurse=false`, `tag.gpgsign=false`,
+  `protocol.file.allow=always`, `safe.bareRepository=all` and
+  `branch.autoSetupMerge=true`. All but `protocol.file.allow=always` are what
+  git does anyway on a clean config with captured output. That one also lets a
+  fixture's submodule command clone over a local path, which git's default
+  policy refuses inside submodule commands. Not every tuple holds exactly these.
+  `test_commit_message_guard.py` and `test_gh_env_isolation.py` hold seven: no
+  status, diff or submodule pins, because their helpers run under
+  `GIT_CONFIG_GLOBAL=/dev/null` with `GIT_CONFIG_NOSYSTEM=1`.
+  `test_sanitize_gh_read_path.py` holds nine (no `diff.ignoreSubmodules`). Five
+  modules add `core.hooksPath=/dev/null` (`test_cli_cap_hit`,
+  `test_gemini_cli_flags`, `test_quota_cli_limits`, `test_recovery_owner_proof`,
+  `test_verifier_usage_limit`), and two spell the tuple `_PINS`
+  (`test_repo_location_env`, `test_sanitize_gh_read_path`). A call site need
+  not repeat a tuple key.
+- A fixture git call that argv cannot reach opts in through the fixture's own
+  repository or command, never through harness's environment. A git command
+  run in a child process, such as a stand-in agent CLI's commit or a validation
+  command's commit, carries `-c commit.gpgsign=false` on its own command line.
+  A repository that harness pushes *from* to a local-path origin runs
+  `git config protocol.file.allow always` where the origin is attached, as an
+  operator with local-path remotes must. The pushing side's config decides; an
+  opt-in in the bare origin's own config has no effect. `git gc --auto` keeps a
+  bare argv for the maintenance carve-out, so it gets `gc.auto` in the
+  repository's config instead. `safe.bareRepository` is honoured only from
+  system, global or command-line config, so no repository can opt in on its
+  own: fixtures read bare origins through the pinned helper or `--git-dir`.
+- harness's own calls see whatever global and system config the test's
+  environment gives them. That is the hostile file in that run, unless the
+  module or the test points `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` at a
+  neutral file of its own, as several do (there the pins are inert).
+- A call that is the test's subject stays unpinned: a call that must run under a
+  key the test set on purpose (an agent's `git add` under
+  `core.ignoreStat=true`); a premise read that must honour such a key
+  (`git status --porcelain` under `status.showUntrackedFiles=no`;
+  `git config <key>` reading back what an agent wrote, because under
+  `-c key=value` it reports the pin, not the file); or a call that runs git
+  exactly as the agent would, under harness's environment. A
+  `git config <key> <value>` write is unaffected by a pin. `-c` values also
+  reach every child git process the call starts (git exports them as
+  `GIT_CONFIG_PARAMETERS`), so a pinned `git status` overrides a key set in a
+  submodule's own config.
+- `test_commit_and_paths.py`, `test_hidden_index_entries.py`,
+  `test_submodule_pointers.py` and `test_unpopulated_submodules.py` keep their
+  helpers unpinned, because each helper also runs subject calls. An autouse
+  fixture in each points `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at a
+  neutral file, so the hostile file reaches none of their git calls, harness's
+  included.
+- A pin must not change what a test asserts. Run the module plain and under the
+  hostile config, before and after the change, and compare per-test outcomes,
+  not just totals.
+- A test that plants on-disk state for git to interpret first checks that git
+  sees it.
+  `test_an_unreadable_origin_tracking_ref_refuses_the_push_until_it_is_repaired`
+  skips when `git rev-parse --show-ref-format` prints `reftable` (a reftable ref
+  store never reads a loose ref file); asserts that the guard's own walk
+  (`git rev-list HEAD --not --remotes=origin`, run with `GIT_REF_PARANOIA=1`)
+  names the planted loose ref; skips its `GIT_REF_PARANOIA=0` case when the
+  installed git's walk still dies on the ref; and then requires harness's
+  refusal to match what git's own walk did in the same environment.
+  `--show-ref-format` exists from git 2.45; an older git echoes the unknown flag
+  and exits 0, which correctly reads as not-reftable.
 
 ### `pytest.toml`
 

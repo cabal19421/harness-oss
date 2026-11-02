@@ -302,7 +302,8 @@ def _gone(pid: int) -> bool:
         except ProcessLookupError:
             return True
         return False
-    return stat.rpartition(")")[2].split()[0] == "Z"
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rpartition(")")[2].split()[0] in ("Z", "X")
 
 
 # ── recovery's deferral is held out of the same run ──────────────────────────

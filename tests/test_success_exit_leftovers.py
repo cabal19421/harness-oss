@@ -189,7 +189,8 @@ def _alive(pid: int) -> bool:
         except ProcessLookupError:
             return False
         return True
-    return stat.rpartition(")")[2].split()[0] != "Z"
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
 
 
 class _Leftovers:

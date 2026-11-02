@@ -116,7 +116,8 @@ cost = step.get("cost", 0.25)
 if cost == "balance":                      # a real CLI at its cap spends it all
     cost = float(value("--max-budget-usd", "0"))
 common = {"duration_api_ms": 1, "stop_reason": "tool_use", "session_id": "s",
-          "total_cost_usd": cost, "usage": {"input_tokens": 5, "output_tokens": 5},
+          "total_cost_usd": cost,
+          "usage": step.get("usage", {"input_tokens": 5, "output_tokens": 5}),
           "modelUsage": {}, "permission_denials": step.get("denials", []),
           "terminal_reason": "max_turns", "fast_mode_state": "off", "origin": None}
 if step.get("shape") == "newer":
@@ -221,8 +222,18 @@ def _alive(pid: int) -> bool:
         return False
     stat = Path(f"/proc/{pid}/stat")
     try:
-        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
+        # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+        return stat.read_text().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except OSError:
+        # Reaped between the two calls (a leftover the sweep just killed is
+        # collected by init, or a subreaper, whenever it gets to it), or no /proc
+        # here: ask the kernel again instead of guessing "alive".
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    except IndexError:
         return True
 
 
@@ -926,6 +937,136 @@ def test_an_infinite_cost_on_a_call_the_budget_cap_did_not_stop_counts_nothing(
     said = [r.getMessage() for r in caplog.records]
     assert _COUNTS_NOTHING.format("$inf (not finite)") in said, \
         [s for s in said if "cost reads" in s]
+
+
+def test_the_budget_cap_warning_names_a_cost_that_is_not_finite(tmp_path, caplog):
+    """A call the CLI stopped at its budget whose envelope's cost reads
+    +Infinity is charged its balance (``_capped_call_cost`` reads the figure
+    as unreadable), with the budget cap's WARNING, whose list of what the
+    figure read as now names that case. PRE-FIX the list read "(none, not a
+    number, or below what the call was allowed)", none of which an infinite
+    figure is."""
+    fake = _FakeCli(tmp_path, [{"kind": "budget", "cost": float("inf")}])
+    ctx = _ctx(tmp_path, max_cost_usd=1.0)
+    backend = _Judged(fake.path, [False])
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert fake.flag("--max-budget-usd") == ["1.00"], out.detail
+    assert "stopped on budget — cost budget reached ($1.0000 ≥ $1.00)" in out.detail, \
+        out.detail
+    warned = [r.getMessage() for r in caplog.records
+              if "--max-budget-usd cap, but" in r.getMessage()]
+    assert len(warned) == 1, warned
+    assert ("cost reads $inf (none, not a number, not finite, or below what the "
+            "call was allowed) — charging the $1.0000 it was allowed") in warned[0], warned
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="needs a cwd-scannable /proc")
+@pytest.mark.parametrize("step, counted", [
+    pytest.param({"usage": {"input_tokens": float("inf"), "output_tokens": 5}},
+                 (5, 0.25), id="an-Infinity-token-count"),
+    pytest.param({"cost": 2**1024}, (10, 0.0), id="an-integer-cost-past-the-float-range"),
+])
+def test_an_overflowing_usage_figure_counts_zero_and_the_call_is_still_swept(
+        tmp_path, step, counted):
+    """The envelope of a clean exit that left a process running in the
+    worktree carries a figure the usage parser cannot coerce: a JSON
+    ``Infinity`` token count (``json.loads`` reads it as float inf, which
+    ``int()`` refuses) or an integer cost too large for a float (which
+    ``float()`` refuses). That figure counts 0, like any other drift, and the
+    call goes on as the clean exit it is: the leftover is reclaimed before the
+    oracle judges the tree, and the ``agent`` span counts the rest of the
+    usage. PRE-FIX the parser raised OverflowError inside the agent call,
+    before its cost clamp and every sweep: implement() raised (only the
+    orchestrator's catch-all would see it), nothing was judged, and the
+    leftover kept running in the worktree."""
+    fake = _FakeCli(tmp_path, [{"kind": "ok", "leave": True, **step}])
+    ctx = _ctx(tmp_path)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+    orig = backend.run_oracle
+
+    def judged(c):
+        backend.watch = fake.leftovers()[-1]
+        return orig(c)
+
+    backend.run_oracle = judged
+    try:
+        out = backend.implement(ctx)
+
+        assert out.status == "implemented", out.detail
+        assert backend.alive_when_judged == [False], "judged while the leftover ran"
+        pid = fake.leftovers()[-1]
+        reclaimed = [n for n in _notes(ctx) if n.get("kind") == "reclaim"]
+        assert reclaimed and f"pids {pid}" in reclaimed[0]["detail"], reclaimed
+        spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+        assert [(span["tokens"], span["cost_usd"]) for span in spans] == [counted]
+    finally:
+        for pid in fake.leftovers():
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_attempt_costs_that_sum_past_the_float_range_keep_the_span_finite(tmp_path):
+    """Two attempts of one iteration, each reporting a finite cost of 9e307,
+    in a run with no cost cap (under one, the first attempt would have spent
+    it, and no retry would follow). Each figure is a reading of what its
+    attempt spent, so neither counts $0 and neither is dropped: their sum,
+    past the float range, is held at the largest finite float, and the trace
+    stays strict JSON. PRE-FIX the sum was +Infinity, which the ``agent`` span
+    wrote into trace.jsonl as a bare ``Infinity``."""
+    fake = _FakeCli(tmp_path, [{"kind": "overloaded", "cost": 9e307},
+                               {"kind": "ok", "cost": 9e307}])
+    ctx = _ctx(tmp_path, max_agent_retries=3)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+
+    out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert len(fake.launches()) == 2
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == [sys.float_info.max]
+
+
+@pytest.mark.parametrize("script, max_tokens, launches, status, stop, tokens", [
+    pytest.param([{"kind": "overloaded", "usage": {"input_tokens": 10, "output_tokens": 10}},
+                  {"kind": "overloaded", "usage": {"input_tokens": -20, "output_tokens": 0}},
+                  {"kind": "ok"}],
+                 None, 3, "implemented", "", [30], id="every-attempt-counts"),
+    pytest.param([{"kind": "overloaded", "usage": {"input_tokens": 10, "output_tokens": 10}},
+                  {"kind": "overloaded", "usage": {"input_tokens": -20, "output_tokens": 0}},
+                  {"kind": "overloaded"},
+                  {"kind": "ok"}],
+                 25, 3, "failed", "stopped on budget — token budget reached (30 ≥ 25)",
+                 [30], id="the-token-cap-sees-them"),
+])
+def test_a_negative_token_count_never_cancels_what_the_other_attempts_spent(
+        tmp_path, script, max_tokens, launches, status, stop, tokens):
+    """One attempt's envelope reports -20 input tokens. No call spends fewer
+    than none: the count is malformed and counts 0, as a missing one does, and
+    the iteration's other attempts still count theirs (20, then 10). Under
+    max_tokens=25 the attempts have spent the budget after the third, so no
+    fourth is launched and the run stops on budget. PRE-FIX the usage parser
+    passed the count through and the attempts were summed as they came
+    (``_run_with_retries``): -20 cancelled the first attempt's 20, the
+    ``agent`` span counted 10 tokens, and under the cap a fourth attempt was
+    launched and went green with 20 tokens counted for attempts that had spent
+    40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_agent_retries=3, max_tokens=max_tokens)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [True])
+
+    out = backend.implement(ctx)
+
+    assert len(fake.launches()) == launches, out.detail
+    assert out.status == status and stop in out.detail, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["tokens"] for span in spans] == tokens
 
 
 def test_a_retry_is_handed_only_what_the_earlier_attempts_left(tmp_path):

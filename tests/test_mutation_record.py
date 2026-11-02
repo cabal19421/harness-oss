@@ -202,8 +202,15 @@ def _gone(pid: int) -> bool:
     try:
         state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
     except OSError:
-        return True
-    return state == "Z"
+        # Reaped between the two calls, or no /proc here: ask the kernel again
+        # instead of guessing; an unproven "gone" would pass a was-it-killed check.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+    # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+    return state in ("Z", "X")
 
 
 def _dead_pid() -> int:

@@ -902,6 +902,16 @@ def _env_rates() -> dict[str, tuple[float, float, float]]:
             logger.warning("ignoring malformed %s entry %r (want 2 or 3 prices)",
                            _PRICE_ENV, trunc(entry, 60))
             continue
+        if not all(0.0 <= n < float("inf") for n in nums):
+            # float() reads "nan", "inf" and "1e999" as prices too, and nothing
+            # refused one below zero. A NaN rate made its model's every estimate
+            # NaN, which the `agent` span wrote as a bare NaN (strict JSON
+            # readers refuse it) and the budget read as $0; a negative one took
+            # spend off the estimate or made it negative; an infinite one
+            # stopped the run on a "$inf" reading.
+            logger.warning("ignoring malformed %s entry %r (want finite, "
+                           "non-negative prices)", _PRICE_ENV, trunc(entry, 60))
+            continue
         out[name.strip().lower()] = (nums[0], nums[1], nums[2])
     return out
 
@@ -1001,8 +1011,9 @@ _GEMINI_TOKEN_PARTS = ("prompt", "candidates", "thoughts", "tool")
 def _token_count(v) -> int:
     """A non-negative token count out of one envelope field; 0 on drift.
 
-    :func:`_as_int` plus the one failure it lets through: Python's JSON reader
-    accepts ``Infinity``, which no integer holds.
+    :func:`_as_int` already counts 0 for an infinite count (Python's JSON reader
+    accepts ``Infinity``, which no integer holds) and for one below zero; the
+    guards here are a backstop.
     """
     try:
         return max(0, _as_int(v))
@@ -1066,12 +1077,15 @@ def parse_gemini_usage(stdout: str) -> tuple[int, float]:
             # its estimate either.
             estimate = math.inf
         if estimate is not None and (not math.isfinite(estimate) or estimate < 0.0):
-            # Not finite or below zero (a count so large that it times the rate
-            # overflows, or a HARNESS_MODEL_PRICES rate float() read as "nan",
-            # "inf" or "-1") is no reading of what this model's part of the call
-            # spent: it counts $0, as an unpriced model does, and alone. Summed
-            # as it was, a NaN or an Infinity took every other model's estimate
-            # with it, and a negative one cancelled them, in part or whole.
+            # An estimate that is not finite or is below zero is no reading of
+            # what this model's part of the call spent: it counts $0, as an
+            # unpriced model does, and alone. +Infinity comes from a count so
+            # large that it times the rate overflows, or from a finite but huge
+            # HARNESS_MODEL_PRICES rate; a NaN or a negative figure only from a
+            # rate set in _MODEL_RATES itself, since _env_rates refuses a rate
+            # in the variable that is not finite or is below zero. Summed as it
+            # was, a NaN or an Infinity took every other model's estimate with
+            # it, and a negative one cancelled them, in part or whole.
             logger.debug("the cost estimate for %r reads $%.4f (%s) — its part of "
                          "this call counts $0 toward the budget, as an unpriced "
                          "model's does", model, estimate,
@@ -1185,19 +1199,43 @@ def parse_permission_denial_details(stdout: str, *, limit: int = 6,
 
 
 def _as_int(v) -> int:
+    """A usage token count; 0 for one that is no count, as for a missing one.
+
+    That is a figure that does not coerce to an int, an infinite one (a JSON
+    ``Infinity`` token, which ``json.loads`` reads as float inf and ``int()``
+    refuses with OverflowError), or one below zero. The overflow used to
+    escape the usage parser from inside the agent call, before its cost clamp
+    and its sweeps, so the task failed with the call's processes unswept. A
+    negative count, summed as it was, cancelled the envelope's other fields
+    and the other attempts of its iteration, so the token cap under-counted.
+    """
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
         if v is not None:   # absent keys (None) are normal shape drift, not anomalies
             logger.debug("usage field %s does not coerce to int — counting 0",
                          trunc(redact(repr(v)), 80))
         return 0
+    if n < 0:
+        logger.debug("usage field %s is below zero — counting 0",
+                     trunc(redact(repr(v)), 80))
+        return 0
+    return n
 
 
 def _as_float(v) -> float:
+    """A usage cost figure; 0.0 for one that does not coerce to a float.
+
+    An integer past the float range (a magnitude of about 1.8e308 or more,
+    which ``float()`` refuses with OverflowError) is such a figure; it used to
+    escape the usage parser as an infinite token count did. A NaN, an infinity
+    or a negative figure is passed through for the caller to judge: the agent
+    CLI backend counts such a cost $0, and its budget cap's charge reads it as
+    unreadable.
+    """
     try:
         return float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         if v is not None:   # absent keys (None) are normal shape drift, not anomalies
             logger.debug("usage field %s does not coerce to float — counting 0.0",
                          trunc(redact(repr(v)), 80))

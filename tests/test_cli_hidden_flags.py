@@ -264,8 +264,18 @@ def test_a_hung_probe_is_no_proof_and_is_asked_again(tmp_path, monkeypatch):
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
-        stat = Path(f"/proc/{pid}/stat")
-        return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            # Reaped between the two calls, or no /proc here: ask the kernel again
+            # instead of guessing "alive".
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+        # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+        return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
 
     deadline = time.monotonic() + 10
     while alive(probe["pid"]) and time.monotonic() < deadline:

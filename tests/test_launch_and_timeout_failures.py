@@ -156,7 +156,8 @@ def _alive(pid: int) -> bool:
     """Is *pid* running? A zombie is dead: it no longer writes anything."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-        return stat.rpartition(")")[2].split()[0] != "Z"
+        # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+        return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
     except OSError:
         pass
     try:

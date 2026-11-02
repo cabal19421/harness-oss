@@ -874,8 +874,12 @@ class _Target:
             stat = Path(f"/proc/{pid}/stat").read_text()
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
+            # Gone, or at least not provably ours: kill_survivors() signals only
+            # what this proves, so an unreadable pid is never "alive" here.
             return False
-        return stat.rsplit(")", 1)[1].split()[0] != "Z" and str(self.base).encode() in cmdline
+        # Z: dead, awaiting its reaper; X: being reaped this instant. Neither runs.
+        return (stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+                and str(self.base).encode() in cmdline)
 
     def suite_running(self) -> bool:
         return self._pid("suite.pid") is not None

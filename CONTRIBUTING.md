@@ -512,7 +512,7 @@ mypy harness/
 ### Running Tests
 
 ```bash
-# Run all tests — 2952 passing, 1 skipped at the time of writing
+# Run all tests — 2967 passing, 1 skipped at the time of writing
 pytest
 
 # Run with verbose output

@@ -2036,9 +2036,17 @@ class AgentCliBackend(CodingBackend):
             last = self._run_agent(ctx, feedback, pending_commit_failure, budget=view)
             # Every attempt's spend counts toward the budget — a failed attempt
             # still billed tokens; returning only the last attempt's numbers
-            # made the cap under-count on retried iterations.
+            # made the cap under-count on retried iterations. No attempt's
+            # figure is below zero, so none cancels another's: the usage parser
+            # counts a negative token count 0, and _run_agent counts a cost
+            # that is not finite or is below zero $0. Finite costs can still
+            # add up past the float range, and that sum is held at the largest
+            # finite float: each figure is a reading of what its attempt spent,
+            # so none is dropped, and the attempts spent at least that much.
+            # Summed to +Infinity, it went into the `agent` span as a bare
+            # Infinity, which strict JSON readers refuse.
             last.tokens += spent_tokens
-            last.cost += spent_cost
+            last.cost = min(last.cost + spent_cost, sys.float_info.max)
             if last.ok or last.permanent:
                 return last
             if shutdown.requested():
@@ -2353,16 +2361,18 @@ class AgentCliBackend(CodingBackend):
             if charged != cost:
                 logger.warning("the CLI ended the call at its --max-budget-usd cap, "
                                "but its envelope's cost reads $%.4f (none, not a "
-                               "number, or below what the call was allowed) — "
-                               "charging the $%.4f it was allowed: at least the "
-                               "balance it was handed and the budget left as it "
-                               "launched, so the next budget check stops the run",
+                               "number, not finite, or below what the call was "
+                               "allowed) — charging the $%.4f it was allowed: at "
+                               "least the balance it was handed and the budget "
+                               "left as it launched, so the next budget check "
+                               "stops the run",
                                cost, charged)
                 cost = charged
         if not math.isfinite(cost) or cost < 0.0:
             # A cost that is not finite or is below zero (a bare NaN or
-            # Infinity, JSON tokens the usage parser passes through, or a
-            # negative figure) is no reading of what the call spent: it counts
+            # Infinity — JSON tokens the usage parser passes through in the
+            # cost field, though it counts either one 0 in a token field — or
+            # a negative figure) is no reading of what the call spent: it counts
             # $0, as a missing cost does. A budget-capped call was charged
             # above instead: _capped_call_cost reads each of these as
             # unreadable and charges the balance, a finite figure under any
@@ -2624,11 +2634,13 @@ class AgentCliBackend(CodingBackend):
             # as a missing one does, by the legacy family's rule and for its
             # reasons (_run_agent). The parser applies the rule to each served
             # model's estimate before it sums them, so that one model's NaN,
-            # Infinity or negative figure (a count so large that it times its
-            # rate overflows, or a HARNESS_MODEL_PRICES rate that is not finite
-            # or is below zero: float() reads "nan", "inf" and "-1") cannot
-            # erase or cancel the others'; this is the backstop for a sum that
-            # overflows. Every return below carries this figure.
+            # Infinity or negative figure (+Infinity from a count so large that
+            # it times its rate overflows or from a finite but huge
+            # HARNESS_MODEL_PRICES rate; a NaN or a negative one only from a
+            # rate set in looptools._MODEL_RATES itself, since _env_rates
+            # refuses a rate in the variable that is not finite or is below
+            # zero) cannot erase or cancel the others'; this is the backstop
+            # for a sum that overflows. Every return below carries this figure.
             logger.debug("the envelope's cost reads $%.4f (%s) — this "
                          "invocation counts $0 toward the budget, as a missing "
                          "cost does", cost,

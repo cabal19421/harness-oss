@@ -1,0 +1,87 @@
+[status]
+	showUntrackedFiles = no
+	short = true
+	branch = true
+	aheadBehind = false
+	relativePaths = false
+	renames = copies
+[diff]
+	ignoreSubmodules = all
+	external = /bin/false
+	noprefix = true
+	mnemonicPrefix = true
+	renames = copies
+[submodule]
+	recurse = true
+[core]
+	ignoreStat = true
+	fsmonitor = false
+	autocrlf = input
+	commentChar = ";"
+	quotePath = false
+	untrackedCache = true
+	pager = cat
+	whitespace = trailing-space,space-before-tab
+[color]
+	ui = always
+[column]
+	ui = always
+[push]
+	recurseSubmodules = check
+	default = nothing
+	followTags = true
+[init]
+	defaultBranch = trunk
+[commit]
+	gpgsign = true
+	cleanup = scissors
+[tag]
+	gpgsign = true
+	sort = -v:refname
+[gpg]
+	format = ssh
+[user]
+	signingkey = /nonexistent/signing-key.pub
+[log]
+	showSignature = true
+	decorate = full
+	abbrevCommit = true
+[format]
+	pretty = fuller
+[merge]
+	conflictStyle = zdiff3
+[rerere]
+	enabled = true
+	autoupdate = true
+[pull]
+	rebase = true
+[fetch]
+	prune = true
+	pruneTags = true
+	fsckObjects = true
+[branch]
+	autoSetupRebase = always
+	autoSetupMerge = always
+	sort = -committerdate
+[worktree]
+	guessRemote = true
+[apply]
+	whitespace = error
+[transfer]
+	fsckObjects = true
+[receive]
+	fsckObjects = true
+[i18n]
+	logOutputEncoding = latin1
+[feature]
+	manyFiles = true
+[safe]
+	bareRepository = explicit
+[protocol "file"]
+	allow = never
+[gc]
+	auto = 0
+[maintenance]
+	auto = false
+[advice]
+	detachedHead = false

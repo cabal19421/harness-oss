@@ -658,7 +658,12 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
                      "-c", "submodule.recurse=false",
-                     "-c", "color.ui=never")
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args, cwd):
@@ -733,8 +738,10 @@ def test_pr_is_withheld_when_head_is_rewritten_after_the_review(tmp_path):
     from harness.pipeline.trace import read_spans
 
     # The validation command stands in for that mutator: it rewrites HEAD to a
-    # commit the reviewed SHA is not an ancestor of.
-    ctx, repo = _review_ctx(tmp_path, ["git commit -q --amend -m rewritten-elsewhere"])
+    # commit the reviewed SHA is not an ancestor of. (Its git is a child of the
+    # oracle, out of the fixture pins' reach, so the command carries its own.)
+    ctx, repo = _review_ctx(
+        tmp_path, ["git -c commit.gpgsign=false commit -q --amend -m rewritten-elsewhere"])
     res = ReviewGate(pr_mode="local").review(ctx, open_pr=True)
 
     assert res.passed, "the oracle itself was green — only the push is refused"
@@ -897,8 +904,9 @@ def test_a_commit_made_on_the_branch_after_the_freeze_is_not_taken_for_one_befor
     from harness.pipeline.review import ReviewGate
     from harness.pipeline.trace import read_spans
 
-    ctx, repo = _review_ctx(tmp_path, ["python -c \"print(1)\"",
-                                       "git commit -q --allow-empty -m stamped-by-the-build"])
+    ctx, repo = _review_ctx(tmp_path, [
+        "python -c \"print(1)\"",
+        "git -c commit.gpgsign=false commit -q --allow-empty -m stamped-by-the-build"])
 
     res = ReviewGate(pr_mode="local").review(ctx, open_pr=True)
 
@@ -1083,6 +1091,10 @@ def _origin(tmp_path: Path, repo: Path) -> Path:
     origin = tmp_path / "origin.git"
     _ok(["init", "-q", "--bare", "-b", "main", str(origin)], tmp_path)
     _ok(["remote", "add", "origin", str(origin)], repo)
+    # The fixture's opt-in, in the repository's own config: harness's push to
+    # this local-path origin carries no pin, and protocol.file.allow=never in
+    # the run's global config would refuse it.
+    _ok(["config", "protocol.file.allow", "always"], repo)
     return origin
 
 
@@ -1177,6 +1189,10 @@ def test_a_marker_lost_after_the_proof_cannot_send_the_retry_to_an_enclosing_rep
     outer_origin = tmp_path / "outer-origin.git"
     _ok(["init", "-q", "--bare", "-b", "main", str(outer_origin)], tmp_path)
     _ok(["remote", "add", "origin", str(outer_origin)], outer)
+    # The enclosing repository opts in to the file transport, so an unconfined
+    # retry could reach its origin: the refusal below is the confinement's, not
+    # that of a protocol.file.allow=never in the run's global config.
+    _ok(["config", "protocol.file.allow", "always"], outer)
     app = tmp_path / "app"
     app.mkdir()
     _ok(["init", "-q", "-b", "main"], app)

@@ -1,0 +1,14 @@
+[status]
+	showUntrackedFiles = no
+[diff]
+	ignoreSubmodules = all
+	external = /bin/false
+[submodule]
+	recurse = true
+[core]
+	ignoreStat = true
+	fsmonitor = false
+[color]
+	ui = always
+[push]
+	recurseSubmodules = check

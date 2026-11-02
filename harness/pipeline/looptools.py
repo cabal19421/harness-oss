@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -1020,7 +1021,9 @@ def parse_gemini_usage(stdout: str) -> tuple[int, float]:
     :func:`estimate_cost_usd` per served model — input ``prompt − cached +
     tool``, cached ``cached``, output ``candidates + thoughts`` — and an unpriced
     model counts $0, named once at WARNING. Without that, ``max_cost_usd`` could
-    never trip on Gemini CLI, which advertises no ``--max-budget-usd``.
+    never trip on Gemini CLI, which advertises no ``--max-budget-usd``. A model
+    whose estimate is not finite or is below zero counts $0 as well, alone, named
+    at DEBUG: the other models' estimates still count.
 
     Defensive like :func:`parse_agent_usage`: shape drift yields what parsed and
     never raises.
@@ -1052,10 +1055,29 @@ def parse_gemini_usage(stdout: str) -> tuple[int, float]:
             tokens += prompt + candidates + thoughts + tool
         else:
             tokens += _token_count(counts.get("total"))
-        estimate = estimate_cost_usd(str(model),
-                                     input_tokens=max(0, prompt - cached) + tool,
-                                     cached_input_tokens=min(cached, prompt),
-                                     output_tokens=candidates + thoughts)
+        try:
+            estimate = estimate_cost_usd(str(model),
+                                         input_tokens=max(0, prompt - cached) + tool,
+                                         cached_input_tokens=min(cached, prompt),
+                                         output_tokens=candidates + thoughts)
+        except OverflowError:
+            # A count past the largest double (a JSON integer of about 1.8e308
+            # or more, 309 digits), or parts that sum past it: no double holds
+            # its estimate either.
+            estimate = math.inf
+        if estimate is not None and (not math.isfinite(estimate) or estimate < 0.0):
+            # Not finite or below zero (a count so large that it times the rate
+            # overflows, or a HARNESS_MODEL_PRICES rate float() read as "nan",
+            # "inf" or "-1") is no reading of what this model's part of the call
+            # spent: it counts $0, as an unpriced model does, and alone. Summed
+            # as it was, a NaN or an Infinity took every other model's estimate
+            # with it, and a negative one cancelled them, in part or whole.
+            logger.debug("the cost estimate for %r reads $%.4f (%s) — its part of "
+                         "this call counts $0 toward the budget, as an unpriced "
+                         "model's does", model, estimate,
+                         "not a number" if math.isnan(estimate) else
+                         "not finite" if math.isinf(estimate) else "below zero")
+            estimate = 0.0
         cost += estimate or 0.0
     return tokens, cost
 

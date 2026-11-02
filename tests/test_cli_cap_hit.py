@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -259,7 +260,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "submodule.recurse=false",
                      "-c", "color.ui=never",
                      "-c", "core.hooksPath=/dev/null",
-                     "-c", "commit.gpgsign=false")
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 #: The cap envelope's words for --max-turns 5, as _cli_cap_text renders them.
 _TURNS_5 = "error_max_turns: Reached maximum number of turns (5)"
@@ -718,6 +723,209 @@ def test_a_budget_capped_call_is_charged_at_least_the_budget_left_as_it_launched
     floor = ["--max-budget-usd", "0.01"]                       # under a cent left
     assert _capped_call_cost("error_max_budget_usd", floor, 0.0, 0.004) == 0.01
     assert _capped_call_cost(_TURNS_5, flags, 0.1, 0.333) == 0.1
+
+
+def test_a_turn_capped_call_under_a_cost_budget_leaves_the_rest_of_it(tmp_path):
+    """Only the CLI's budget stop exhausts the loop's budget
+    (``_at_budget_cap`` → ``_exhaust_cost_budget``): a call the CLI ended at
+    its TURN cap is charged what its envelope reports, and the budget is still
+    the loop's to spend. Under max_cost_usd=1.0 a turn-capped red call that
+    cost $0.10 is followed by a launch handed 0.90, which goes green. Read as
+    a budget stop (``if run.capped:``), the run would end on "cost budget
+    reached" after that first launch."""
+    fake = _FakeCli(tmp_path, [{"kind": "turns", "cost": 0.1}, {"kind": "ok", "cost": 0.1}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_cost_usd=1.0)
+    backend = _Judged(fake.path, [False, True])
+
+    out = backend.implement(ctx)
+
+    assert fake.flag("--max-turns") == ["5", "5"], out.detail
+    assert fake.flag("--max-budget-usd") == ["1.00", "0.90"], out.detail
+    assert out.status == "implemented", out.detail
+    assert backend.judged == ["work of launch 1\n", "work of launch 1\nwork of launch 2\n"]
+
+
+def _strict_trace(ctx: ImplementContext) -> list[dict]:
+    """Every span the run wrote, parsed as strict JSON: a bare ``NaN`` (or
+    ``Infinity``), which ``json.dumps`` writes for a float that is not a
+    number and strict readers refuse, fails the parse."""
+    def refuse(token: str):
+        raise ValueError(f"not strict JSON: {token}")
+
+    path = Path(ctx.config.state_dir) / "trace.jsonl"
+    return [json.loads(line, parse_constant=refuse)
+            for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_turn_capped_call_whose_cost_is_not_a_number_is_no_budget_stop(tmp_path,
+                                                                          caplog):
+    """A call the CLI ended at its TURN cap whose envelope's cost is a bare NaN
+    (the usage parser passes that JSON token through). Only the budget cap
+    is charged the balance it was handed (``_at_budget_cap``), so this call
+    logs no budget-cap WARNING; it counts $0, as a call whose cost is missing
+    does, and the run goes on with the balance intact: the next launch is
+    handed the whole $1.00. PRE-FIX the guard compared the charge with the
+    cost (``charged != cost``), which a NaN never equals, so the run logged
+    "the CLI ended the call at its --max-budget-usd cap, but its envelope's
+    cost reads $nan … charging the $nan it was allowed", every clause of it
+    false; and the ``agent`` span carried the NaN into the trace as a bare
+    ``NaN``, which strict JSON readers refuse."""
+    fake = _FakeCli(tmp_path, [{"kind": "turns", "cost": float("nan")},
+                               {"kind": "ok", "cost": 0.1}])
+    ctx = _ctx(tmp_path, max_agent_turns=5, max_cost_usd=1.0)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, [False, True])
+
+    with caplog.at_level(logging.WARNING, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-turns") == ["5", "5"], out.detail
+    assert fake.flag("--max-budget-usd") == ["1.00", "1.00"], out.detail
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [w for w in warned if "--max-budget-usd cap" in w], warned
+    assert any("ended at its cap (error_max_turns" in w for w in warned), warned
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == [0.0, 0.1]
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged", [
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], id="spent-then-nan"),
+    pytest.param([{"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], id="nan-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": float("nan")},
+                  {"kind": "turns", "cost": 0.6},
+                  {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00", "0.40"], [0.6, 0.1],
+                 id="nan-then-turn-capped"),
+])
+def test_a_cost_that_is_not_a_number_never_erases_what_the_other_attempts_spent(
+        tmp_path, script, verdicts, handed, charged):
+    """An attempt whose envelope's cost is a bare NaN counts $0, as one whose
+    cost is missing does, and the iteration's other attempts still count what
+    they spent: each retry is handed the balance net of it, and the loop is
+    charged it. PRE-FIX the NaN was summed into the iteration's spend
+    (``_run_with_retries``), which made the whole sum NaN, and the budget reads
+    a NaN as $0: after $0.95 spent and a NaN, the next attempt was handed the
+    whole $1.00 again (1.00, 0.05, 1.00), and the loop was charged nothing for
+    the iteration (the ``agent`` span read NaN). A turn-capped call after a
+    NaN attempt lost its $0.60 the same way, and the next iteration was handed
+    1.00 for 0.40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+
+
+#: The DEBUG line ``_run_agent`` logs for a cost it counts as $0, given the
+#: reading it names.
+_COUNTS_NOTHING = ("the envelope's cost reads {} — this invocation counts $0 "
+                   "toward the budget, as a missing cost does")
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged, read", [
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": -0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], "$-0.9500 (below zero)",
+                 id="spent-then-negative"),
+    pytest.param([{"kind": "overloaded", "cost": -0.95},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], "$-0.9500 (below zero)",
+                 id="negative-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": float("-inf")},
+                  {"kind": "overloaded", "cost": 0.95},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "1.00", "0.05"], [0.96], "$-inf (not finite)",
+                 id="-inf-then-spent"),
+    pytest.param([{"kind": "overloaded", "cost": -0.95},
+                  {"kind": "turns", "cost": 0.6},
+                  {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00", "0.40"], [0.6, 0.1],
+                 "$-0.9500 (below zero)", id="negative-then-turn-capped"),
+])
+def test_a_negative_or_minus_infinite_cost_never_erases_what_the_other_attempts_spent(
+        tmp_path, caplog, script, verdicts, handed, charged, read):
+    """As a NaN does (the test above), an attempt whose envelope's cost is
+    below zero or −Infinity counts $0, with a DEBUG line that says so, and the
+    other attempts still count what they spent: the balances handed and the
+    charge are the NaN cases'. PRE-FIX the figure was summed into the
+    iteration's spend as it was (``_run_with_retries``): −$0.95 after $0.95
+    spent made the sum $0, and the next attempt was handed the whole $1.00
+    again (1.00, 0.05, 1.00; the ``agent`` span read 0.01); before a $0.95
+    attempt it cancelled that spend the same way (1.00, 1.00, 1.00);
+    −Infinity made the sum −Infinity, which the budget reads as $0 and the
+    span wrote as a bare ``-Infinity``; and a turn-capped call after a
+    negative attempt was charged −$0.35, so the next iteration was handed 1.00
+    for 0.40."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+    said = [r.getMessage() for r in caplog.records]
+    assert _COUNTS_NOTHING.format(read) in said, [s for s in said if "cost reads" in s]
+
+
+@pytest.mark.parametrize("script, verdicts, handed, charged", [
+    pytest.param([{"kind": "ok", "cost": float("inf")}, {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00"], [0.0, 0.1], id="clean-exit"),
+    pytest.param([{"kind": "turns", "cost": float("inf")}, {"kind": "ok", "cost": 0.1}],
+                 [False, True], ["1.00", "1.00"], [0.0, 0.1], id="turn-capped"),
+    pytest.param([{"kind": "overloaded", "cost": 0.95},
+                  {"kind": "overloaded", "cost": float("inf")},
+                  {"kind": "ok", "cost": 0.01}],
+                 [True], ["1.00", "0.05", "0.05"], [0.96], id="spent-then-inf"),
+])
+def test_an_infinite_cost_on_a_call_the_budget_cap_did_not_stop_counts_nothing(
+        tmp_path, caplog, script, verdicts, handed, charged):
+    """+Infinity is no reading of what a call spent: the budget cap's own
+    charge reads it as unreadable (``_capped_call_cost`` charges a
+    budget-capped call the balance for it, pinned above). So on any other
+    call — a clean exit, a turn-capped call, a failed attempt — it counts $0,
+    as a missing cost does, with a DEBUG line that says so, and the run goes
+    on: the trace is strict JSON, and no budget stop reads "$inf". PRE-FIX it
+    was charged as it was: the budget's total became infinite, the run
+    stopped at the next check on "cost budget reached ($inf ≥ $1.00)" after
+    the one launch (after $0.95 spent and an Infinity on a failed attempt, no
+    retry was launched either), and the ``agent`` span wrote a bare
+    ``Infinity`` into ``trace.jsonl``."""
+    fake = _FakeCli(tmp_path, script)
+    ctx = _ctx(tmp_path, max_cost_usd=1.0, max_agent_retries=3, max_agent_turns=5)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+    backend = _Judged(fake.path, verdicts)
+
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        out = backend.implement(ctx)
+
+    assert out.status == "implemented", out.detail
+    assert "$inf" not in out.detail, out.detail
+    assert fake.flag("--max-budget-usd") == handed, out.detail
+    spans = [span for span in _strict_trace(ctx) if span["type"] == "agent"]
+    assert [span["cost_usd"] for span in spans] == charged
+    said = [r.getMessage() for r in caplog.records]
+    assert _COUNTS_NOTHING.format("$inf (not finite)") in said, \
+        [s for s in said if "cost reads" in s]
 
 
 def test_a_retry_is_handed_only_what_the_earlier_attempts_left(tmp_path):

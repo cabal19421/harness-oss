@@ -130,7 +130,7 @@ with open(os.path.join(state, "launches"), "a") as fh:
 with open("app.py", "w") as fh:
     fh.write("x = 2\n")
 subprocess.run(["git", "add", "app.py"], check=True)
-subprocess.run(["git", "commit", "-q", "-m", "set x to 2"], check=True)
+subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "set x to 2"], check=True)
 if mode != "none":
     spawn(state, mode, "late.txt")
 print(json.dumps({{"type": "result", "subtype": "success", "is_error": False,
@@ -269,14 +269,22 @@ def leftovers(tmp_path):
 #: (``in_worktree=False``) the stand-in CLI's `git add app.py` then staged
 #: nothing, its `git commit` failed, and it exited 1 before leaving the helper
 #: the test reads back. Only these helpers are pinned. The stand-in CLI's git,
-#: like a real agent's, and harness's own calls still face the run's config;
-#: `_start_real_git_gc` keeps the bare `git gc --auto` argv, since the
-#: maintenance carve-out reads the subcommand from argv[1].
+#: like a real agent's, and harness's own calls still face the run's config,
+#: but for one key on the CLI's commit, `-c commit.gpgsign=false`: a signing
+#: key the run's config names and cannot load fails the commit every scenario
+#: here starts from. `_start_real_git_gc` keeps the bare `git gc --auto` argv,
+#: since the maintenance carve-out reads the subcommand from argv[1], and sets
+#: `gc.auto` in the repository's own config instead.
 _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
                      "-c", "submodule.recurse=false",
-                     "-c", "color.ui=never")
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -1044,6 +1052,9 @@ def _start_real_git_gc(ctx: ImplementContext, tmp_path: Path):
     repo, wt = ctx.config.repo, ctx.worktree
     state = tmp_path / "gc-state"
     state.mkdir()
+    # An operator's gc.auto=0 makes `gc --auto` exit before it runs the hook;
+    # the repository's own config outranks it (6700 is git's default).
+    _git(["config", "gc.auto", "6700"], repo)
     _git(["config", "gc.autoPackLimit", "1"], repo)
     _git(["config", "gc.autoDetach", "false"], repo)
     for i in range(2):  # two packs, so `gc --auto` has a reason to run the hook

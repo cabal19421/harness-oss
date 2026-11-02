@@ -100,7 +100,11 @@ def test_control_bytes_and_high_confidence_credentials_are_hazards(message):
 # ── the guard in GitHubPR.open ────────────────────────────────────────────────
 
 _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
-                     "-c", "commit.gpgsign=false")
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 _GH = r'''#!{python}
 import json, sys

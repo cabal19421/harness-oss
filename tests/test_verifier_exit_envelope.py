@@ -40,7 +40,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
                      "-c", "commit.gpgsign=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
-                     "-c", "submodule.recurse=false")
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 _FAIL = {"verdict": "FAIL", "confidence": 0.9, "reasons": ["deliberate FAIL"]}
 _USAGE = {"input_tokens": 1, "output_tokens": 1}

@@ -1,4 +1,4 @@
-"""Nothing rides on a harness publish but the reviewed branch: no tag, no submodule push.
+"""No ref rides on a harness publish but the reviewed branch: no tag, no submodule push.
 
 Both harness pushes — the plain one in ``GitHubPR.open`` and the lease-guarded
 retry (``gitutil.force_push_with_lease``, anchored or expect-absent) — name
@@ -15,14 +15,29 @@ overrides a key an agent can write into the repository's shared
 * ``push.recurseSubmodules=on-demand``, or ``submodule.recurse=true`` (which
   push reads as the same), first pushed a populated submodule's same-named
   branch to the submodule's own remote: content nobody reviewed, to a remote
-  the operator never named. ``check`` pushes no submodule. It refuses the whole
-  push, in git's own words, when a changed gitlink names a commit that no
-  remote-tracking ref of the submodule reaches, and it reads only those local
-  refs. An operator's own ``check`` stays in force (``no`` would switch it
-  off). It is a guard, not a proof: those refs are the agent's to write too (a
-  forged one passes, a submodule with none is not checked), and a submodule the
-  worktree never populated cannot be checked at all — git publishes such a
-  gitlink unchecked, and still pushes nothing to the submodule's remote.
+  the operator never named. ``push.recurseSubmodules=only`` pushed that branch
+  and skipped the superproject altogether, exiting 0 with nothing on origin.
+  ``check`` pushes no submodule. It refuses the whole push, in git's own words,
+  when a changed gitlink names a commit that no remote-tracking ref of the
+  submodule reaches. Reachability is read from those local refs, never asked of
+  the submodule's remote, so a commit that remote holds only under a tag, or
+  one fetched by name while the tracking refs are stale, is refused too.
+  The check contacts no remote, with one exception: a submodule configured as
+  a partial clone lazily fetches a gitlink commit it lacks from its promisor
+  remote, through its own transport config. An operator's own ``check`` stays
+  in force (``no`` would switch it off). It is a guard, not a proof, and the
+  agent can write every input it reads: the superproject's own
+  ``refs/remotes/origin/*`` decide which pushed commits are examined (one there
+  that reaches the bump hides it), and the submodule's remote-tracking refs
+  decide reachability (a forged one passes, a submodule with none is not
+  checked). A gitlink commit the submodule cannot be asked about is not checked
+  either: where the worktree never populated the submodule, where the
+  populated submodule does not hold that commit, or holds it but reaches it
+  from none of its refs and not from HEAD (git asks
+  ``rev-list <commit> --not --all`` there before anything else), or where git
+  cannot open the submodule at its path (a broken gitfile, a symlinked path).
+  git publishes such a gitlink unchecked, and still pushes nothing to the
+  submodule's remote.
 
 Every repository is a throwaway with local bare remotes reached by path, and
 ``gh`` is faked: nothing reaches a network. The fixtures' own git calls are
@@ -48,7 +63,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "commit.gpgsign=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
-                     "-c", "submodule.recurse=false")
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 #: Submodule commands over a local path: git refuses the file transport inside
 #: them unless it is allowed.
 _FILE_TRANSPORT = ("-c", "protocol.file.allow=always")
@@ -155,6 +174,7 @@ def _task_worktree(tmp_path: Path) -> tuple[Path, Path, Path]:
     _git(["init", "-q", "-b", "main"], repo)
     _commit(repo, {"README.md": "# repo\n"}, "init")
     _git(["remote", "add", "origin", str(origin)], repo)
+    _git(["config", "protocol.file.allow", "always"], repo)     # the fixture's opt-in
     _git(["push", "-q", "--no-follow-tags", "origin", "main"], repo)
     wt = tmp_path / "wt" / "wt-t1"
     _git(["worktree", "add", "-q", "-b", _BRANCH, str(wt), "main"], repo)
@@ -265,11 +285,12 @@ def test_a_refused_publish_sends_no_tag_either(tmp_path, monkeypatch):
 # ── push.recurseSubmodules / submodule.recurse: no submodule push ─────────────
 
 
-def _superproject(tmp_path: Path) -> tuple[Path, Path, Path, Path, str]:
+def _superproject(tmp_path: Path, *, path: str = "sub") -> tuple[Path, Path, Path, Path, str]:
     """``repo``, whose ``main`` records submodule ``sub`` at s1 — its remote,
     the bare ``sub.git``, holds s1 on ``main`` and on a same-named ``agent/t1``
     — with a bare ``origin`` holding ``main``, and the task's linked worktree on
     ``agent/t1``, ``sub`` UNPOPULATED there as ``git worktree add`` leaves it.
+    *path* is where the submodule sits (``sub`` unless a test names another).
     Returns ``repo, wt, origin, sub_remote, s1``."""
     sub_remote, origin = tmp_path / "sub.git", tmp_path / "origin.git"
     for bare in (sub_remote, origin):
@@ -284,23 +305,25 @@ def _superproject(tmp_path: Path) -> tuple[Path, Path, Path, Path, str]:
     repo.mkdir()
     _git(["init", "-q", "-b", "main"], repo)
     _commit(repo, {"README.md": "# repo\n"}, "init")
-    _git([*_FILE_TRANSPORT, "submodule", "add", "-q", str(sub_remote), "sub"], repo)
+    _git([*_FILE_TRANSPORT, "submodule", "add", "-q", str(sub_remote), path], repo)
     _git(["commit", "-q", "-m", "add sub"], repo)
     _git(["remote", "add", "origin", str(origin)], repo)
+    _git(["config", "protocol.file.allow", "always"], repo)     # the fixture's opt-in
     _git(["push", "-q", "--no-follow-tags", "origin", "main"], repo)
     wt = tmp_path / "wt" / "wt-t1"
     _git(["worktree", "add", "-q", "-b", _BRANCH, str(wt), "main"], repo)
-    assert (wt / "sub").is_dir() and not any((wt / "sub").iterdir())
+    assert (wt / path).is_dir() and not any((wt / path).iterdir())
     return repo, wt, origin, sub_remote, s1
 
 
-def _agent_bumps_the_submodule(wt: Path) -> str:
-    """The agent populates ``sub`` in its worktree, commits s2 there on a
-    same-named branch, and records the bump in the superproject. Returns s2."""
-    _git([*_FILE_TRANSPORT, "submodule", "update", "--init", "-q", "--", "sub"], wt)
-    _git(["checkout", "-q", "-b", _BRANCH], wt / "sub")
-    s2 = _commit(wt / "sub", {"f": "2\n"}, "s2: the agent's commit in the submodule")
-    _git(["add", "sub"], wt)
+def _agent_bumps_the_submodule(wt: Path, *, path: str = "sub") -> str:
+    """The agent populates ``sub`` (at *path*) in its worktree, commits s2
+    there on a same-named branch, and records the bump in the superproject.
+    Returns s2."""
+    _git([*_FILE_TRANSPORT, "submodule", "update", "--init", "-q", "--", path], wt)
+    _git(["checkout", "-q", "-b", _BRANCH], wt / path)
+    s2 = _commit(wt / path, {"f": "2\n"}, "s2: the agent's commit in the submodule")
+    _git(["add", path], wt)
     _git(["commit", "-q", "-m", "bump sub to s2"], wt)
     return s2
 
@@ -356,6 +379,41 @@ def test_a_submodule_push_never_rides_on_the_publish(tmp_path, monkeypatch, conf
     assert "not be found on any remote" in res.detail and "\n  sub\n" in res.detail
     assert [argv for argv, _rc in pushes] == [_PLAIN_PUSH]
     assert pushes[0][1] != 0
+    assert not _created(gh_calls)
+
+
+#: A submodule path holding an escape sequence — ESC [ 2 J clears the screen of
+#: a terminal that replays it. git takes the byte in a path.
+_ESCAPED_PATH = "sub\x1b[2J"
+
+
+def test_a_refused_publish_carries_the_submodule_path_scrubbed(tmp_path, monkeypatch):
+    """git names a refused submodule by its path, printed raw (``fprintf``, not
+    ``die``), so an escape sequence an agent put in a submodule's path reached
+    the PR result's detail — and from there the review summary, the task's
+    detail, the run report and ``pipeline complete``'s output, each printed as
+    it is (only the log lines were scrubbed). PRE-FIX the detail held the ESC
+    byte. Now it still names the submodule, the control byte shown as ``?``,
+    with git's diagnosis, its newlines and tabs kept; nothing reaches origin or
+    the submodule's remote, and no PR is opened."""
+    repo, wt, origin, sub_remote, _s1 = _superproject(tmp_path, path=_ESCAPED_PATH)
+    _agent_bumps_the_submodule(wt, path=_ESCAPED_PATH)
+    reviewed = _git(["rev-parse", "HEAD"], wt)
+    origin_before, sub_before = _refs(origin), _refs(sub_remote)
+    # The premise: git itself prints the path with the ESC byte in it.
+    dry = _run(["push", "--dry-run", "--no-follow-tags", "--recurse-submodules=check",
+                "origin", _REFSPEC], wt)
+    assert dry.returncode != 0 and f"\n  {_ESCAPED_PATH}\n" in dry.stderr, dry
+    gh_calls, pushes = _gh_over_real_git(monkeypatch)
+
+    res = _publish(repo, wt, reviewed)
+
+    assert not res.ok and res.detail.startswith("git push failed: "), res.detail
+    assert "\x1b" not in res.detail, repr(res.detail)
+    assert "not be found on any remote" in res.detail, repr(res.detail)
+    assert "\n  sub?[2J\n" in res.detail and "\t" in res.detail, repr(res.detail)
+    assert _refs(origin) == origin_before and _refs(sub_remote) == sub_before
+    assert [argv for argv, _rc in pushes] == [_PLAIN_PUSH]
     assert not _created(gh_calls)
 
 
@@ -470,6 +528,123 @@ def test_the_residual_check_trusts_the_submodules_own_tracking_refs(tmp_path, mo
     assert _created(gh_calls)
 
 
+def test_the_residual_check_trusts_the_superprojects_own_tracking_refs(tmp_path,
+                                                                       monkeypatch):
+    """What ``check`` cannot do, pinned (git 2.56), the superproject's half: git
+    examines only the pushed commits that no ``refs/remotes/origin/*`` of the
+    superproject reaches — refs every worktree shares, and the agent's to write.
+    A ref written there (any name) that reaches the bump hides it from the
+    check: no remote-tracking ref of the submodule reaches s2, and a dry run
+    of the same push is refused for it, yet the superproject goes out with a
+    gitlink the submodule's remote lacks, under on-demand too. Still nothing is
+    pushed to that remote: the check guards against a gitlink nobody can
+    fetch, it proves nothing."""
+    repo, wt, origin, sub_remote, _s1 = _superproject(tmp_path)
+    s2 = _agent_bumps_the_submodule(wt)
+    reviewed = _git(["rev-parse", "HEAD"], wt)
+    _git(["config", "push.recurseSubmodules", "on-demand"], repo)
+    sub_before = _refs(sub_remote)
+    assert s2 not in sub_before.values()
+    assert _git(["for-each-ref", "--contains", s2, "refs/remotes"], wt / "sub") == ""
+    check = ["push", "--dry-run", "--no-follow-tags", "--recurse-submodules=check",
+             "origin", _REFSPEC]
+    unforged = _run(check, wt)
+    assert unforged.returncode != 0 and "not be found on any remote" in unforged.stderr, \
+        unforged
+    _git(["update-ref", "refs/remotes/origin/forged", reviewed], wt)
+    gh_calls, pushes = _gh_over_real_git(monkeypatch)
+
+    res = _publish(repo, wt, reviewed)
+
+    assert _refs(sub_remote) == sub_before
+    assert res.ok and res.url == _URL, res.detail
+    assert _gitlink(origin) == s2
+    assert pushes == [(_PLAIN_PUSH, 0)]
+    assert _created(gh_calls)
+
+
+def _bumped_to_a_release_only_under_a_tag(tmp_path: Path, wt: Path,
+                                          sub_remote: Path) -> tuple[str, list[str]]:
+    """A release commit made off every branch and published on the submodule's
+    remote only as the annotated tag ``v2``; the agent populates ``sub``, fetches
+    the tags, checks ``v2`` out and records the bump. Returns the commit and
+    the documented remedy (a git command for ``<wt>/sub``)."""
+    seed = tmp_path / "sub-seed"
+    _git(["checkout", "-q", "--detach"], seed)
+    release = _commit(seed, {"f": "release\n"}, "release v2, on no branch")
+    _git(["tag", "-a", "v2", "-m", "v2"], seed)
+    _git(["push", "-q", "--no-follow-tags", str(sub_remote), "refs/tags/v2"], seed)
+    _git([*_FILE_TRANSPORT, "submodule", "update", "--init", "-q", "--", "sub"], wt)
+    _git(["fetch", "-q", "--tags", "origin"], wt / "sub")
+    _git(["checkout", "-q", "v2"], wt / "sub")
+    _git(["add", "sub"], wt)
+    _git(["commit", "-q", "-m", "bump sub to the v2 release"], wt)
+    assert _git(["for-each-ref", "--contains", release, "--format=%(refname)"],
+                sub_remote) == "refs/tags/v2"
+    return release, ["fetch", "-q", "origin", "+refs/tags/v2:refs/remotes/origin/tags/v2"]
+
+
+def _bumped_to_a_commit_fetched_by_name(tmp_path: Path, wt: Path,
+                                        sub_remote: Path) -> tuple[str, list[str]]:
+    """The agent populates ``sub`` (its ``refs/remotes/origin/main`` at s1);
+    the remote's ``main`` then moves on to s3, which the agent fetches by name —
+    into FETCH_HEAD only, the tracking ref left stale — checks out and records.
+    Returns s3 and the documented remedy (a git command for ``<wt>/sub``)."""
+    seed = tmp_path / "sub-seed"
+    _git([*_FILE_TRANSPORT, "submodule", "update", "--init", "-q", "--", "sub"], wt)
+    s1 = _git(["rev-parse", "refs/remotes/origin/main"], wt / "sub")
+    s3 = _commit(seed, {"f": "3\n"}, "s3, on the remote's main")
+    _git(["push", "-q", "--no-follow-tags", str(sub_remote), "main"], seed)
+    _git(["fetch", "-q", "origin", s3], wt / "sub")
+    _git(["checkout", "-q", s3], wt / "sub")
+    _git(["add", "sub"], wt)
+    _git(["commit", "-q", "-m", "bump sub to s3"], wt)
+    assert _git(["rev-parse", "refs/heads/main"], sub_remote) == s3
+    assert _git(["rev-parse", "refs/remotes/origin/main"], wt / "sub") == s1   # stale
+    return s3, ["fetch", "-q", "origin"]
+
+
+@pytest.mark.parametrize("bump", [_bumped_to_a_release_only_under_a_tag,
+                                  _bumped_to_a_commit_fetched_by_name],
+                         ids=["only-under-a-tag", "fetched-by-name-under-stale-tracking-refs"])
+def test_a_commit_the_submodules_remote_has_is_refused_while_no_tracking_ref_reaches_it(
+        tmp_path, monkeypatch, bump):
+    """``check`` reads reachability from the submodule's local remote-tracking
+    refs; it never asks the submodule's remote. So a commit that remote does
+    have is refused while none of them reaches it — pinned (git 2.56; such a
+    bump published before the flag): a release published only under the tag
+    ``v2`` (a default fetch maps no tag into ``refs/remotes/*``), or a commit
+    on the remote's ``main`` fetched by name while ``refs/remotes/origin/main``
+    is stale. Nothing reaches origin or the submodule's remote, and no PR is
+    opened. The documented remedy, run in ``<worktree>/sub`` — ``git fetch
+    origin +refs/tags/v2:refs/remotes/origin/tags/v2`` for the tag-only
+    commit, ``git fetch origin`` for the stale ref — lets the same publish go
+    out, with still nothing pushed to the submodule's remote."""
+    repo, wt, origin, sub_remote, _s1 = _superproject(tmp_path)
+    target, remedy = bump(tmp_path, wt, sub_remote)
+    reviewed = _git(["rev-parse", "HEAD"], wt)
+    assert _git(["for-each-ref", "--contains", target, "refs/remotes"], wt / "sub") == ""
+    origin_before, sub_before = _refs(origin), _refs(sub_remote)
+    gh_calls, pushes = _gh_over_real_git(monkeypatch)
+
+    refused = _publish(repo, wt, reviewed)
+
+    assert not refused.ok and "not be found on any remote" in refused.detail, refused.detail
+    assert "\n  sub\n" in refused.detail, refused.detail
+    assert _refs(origin) == origin_before and _refs(sub_remote) == sub_before
+    assert [argv for argv, _rc in pushes] == [_PLAIN_PUSH]
+    assert not _created(gh_calls)
+
+    _git(remedy, wt / "sub")
+    published = _publish(repo, wt, reviewed)
+
+    assert published.ok and published.url == _URL, published.detail
+    assert _gitlink(origin) == target
+    assert _refs(sub_remote) == sub_before
+    assert pushes[1:] == [(_PLAIN_PUSH, 0)]
+    assert _created(gh_calls)
+
+
 @pytest.mark.parametrize("on_a_remote", [False, True], ids=["refused", "published"])
 def test_the_submodule_check_needs_no_network(tmp_path, monkeypatch, on_a_remote):
     """``check`` is answered from the submodule's own remote-tracking refs. Its
@@ -478,7 +653,9 @@ def test_the_submodule_check_needs_no_network(tmp_path, monkeypatch, on_a_remote
     /bin/false — with on-demand configured, and git still refuses (s2 on no
     remote-tracking ref) or publishes (s2 fetched earlier) exactly as with the
     remote in place: any attempt to reach it would have failed the push with
-    "transport 'ssh' not allowed" instead."""
+    "transport 'ssh' not allowed" instead. (The one exception, not set up here:
+    a submodule configured as a partial clone lazily fetches a gitlink commit
+    it lacks from its promisor remote.)"""
     repo, wt, origin, sub_remote, _s1 = _superproject(tmp_path)
     s2 = _agent_bumps_the_submodule(wt)
     if on_a_remote:

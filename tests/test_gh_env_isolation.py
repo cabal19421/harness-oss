@@ -30,7 +30,11 @@ from harness.pipeline import pr as prmod
 from harness.pipeline.worktree import WorktreeManager
 
 _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
-                     "-c", "commit.gpgsign=false")
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 #: A gh that logs argv and the location/auth variables it was handed, and
 #: answers the way gh does under GH_REPO: that repository already has an open

@@ -5859,8 +5859,11 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
     """
     resolved = git(["rev-parse", "--verify", base], cwd=cwd, env=_REAL_HISTORY)
     if not resolved.ok:
+        # The lines that name cwd pass it through _log_text, as the ones that
+        # name base or head with %s do (below): a repository path that is not
+        # UTF-8 made a strict UTF-8 log file drop each such record.
         logger.debug("landed_proof: base %r does not resolve in %s → no proof "
-                     "(rc=%s)", base, cwd, resolved.code)
+                     "(rc=%s)", base, _log_text(str(cwd)), resolved.code)
         return LandedProof(None, "no-base", resolved.code,
                            f"the base {base!r} does not resolve "
                            f"({_git_error_line(resolved)})")
@@ -5868,13 +5871,18 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
               env=_REAL_HISTORY)
     if not tip.ok:
         logger.debug("landed_proof: head %r does not resolve to a commit in %s → "
-                     "no proof (rc=%s)", head, cwd, tip.code)
+                     "no proof (rc=%s)", head, _log_text(str(cwd)), tip.code)
         return LandedProof(None, "no-head", tip.code,
                            f"the head {head!r} does not resolve to a commit "
                            f"({_git_error_line(tip)})")
     if is_ancestor(cwd, head, base, real_history=True):
+        # Each line that formats base or head with %s passes it through
+        # _log_text (a %r is encodable already): prune hands in a branch name
+        # that is not UTF-8 as surrogate escapes, and a strict UTF-8 log file
+        # (--log-file / HARNESS_LOG_FILE) printed "--- Logging error ---" with
+        # a traceback for each such record, and dropped it.
         logger.debug("landed_proof: %s is an ancestor of %s → landed "
-                     "(plain merge)", head, base)
+                     "(plain merge)", _log_text(head), _log_text(base))
         return LandedProof(True, "ancestor")
     base_tree = git(["rev-parse", "--verify", f"{base}^{{tree}}"], cwd=cwd,
                     env=_REAL_HISTORY)
@@ -5887,7 +5895,7 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
     drivers = _merge_drivers(cwd)
     if isinstance(drivers, GitResult):
         logger.debug("landed_proof: cannot list the merge drivers configured in %s "
-                     "→ no proof (rc=%s)", cwd, drivers.code)
+                     "→ no proof (rc=%s)", _log_text(str(cwd)), drivers.code)
         return LandedProof(None, "unavailable", drivers.code,
                            "the merge drivers the configuration defines cannot be "
                            f"listed ({_git_error_line(drivers)})")
@@ -5909,7 +5917,8 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
         refused = _refused_merges(cwd, conflicted, drivers)
         if isinstance(refused, GitResult):
             logger.debug("landed_proof: cannot read the merge attributes of the "
-                         "files merge-tree(%s, %s) conflicts in → no proof", base, head)
+                         "files merge-tree(%s, %s) conflicts in → no proof",
+                         _log_text(base), _log_text(head))
             return LandedProof(None, "unavailable", refused.code,
                                "the merge attributes of the conflicting files cannot "
                                f"be read ({_git_error_line(refused)})")
@@ -5922,10 +5931,10 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
                       f"— {shown}{more} — and the proof runs no driver, so git's "
                       "own line merge decided none of them")
             logger.debug("landed_proof: merge-tree(%s, %s): %s → no proof",
-                         base, head, detail)
+                         _log_text(base), _log_text(head), detail)
             return LandedProof(None, "merge-driver", 1, detail)
         logger.debug("landed_proof: merge-tree(%s, %s) conflicts → NOT landed",
-                     base, head)
+                     _log_text(base), _log_text(head))
         return LandedProof(False, "conflict", 1)
     if not merged_tree:
         detail = (f"`git merge-tree --write-tree` exited {res.code}: "
@@ -5936,11 +5945,12 @@ def landed_proof(cwd: Path | str, base: str, head: str = "HEAD") -> LandedProof:
             detail += (f" — the squash-landed proof needs git >= "
                        f"{MERGE_TREE_WRITE_GIT}; this is git {old}")
         logger.debug("landed_proof: merge-tree(%s, %s) gave no answer → proof "
-                     "unavailable: %s", base, head, detail)
+                     "unavailable: %s", _log_text(base), _log_text(head), detail)
         return LandedProof(None, "unavailable", res.code, detail)
     landed = merged_tree == base_tree.out
     logger.debug("landed_proof: merge-tree(%s, %s)=%s vs base tree %s → %s",
-                 base, head, trunc(merged_tree, 40), trunc(base_tree.out, 40),
+                 _log_text(base), _log_text(head), trunc(merged_tree, 40),
+                 trunc(base_tree.out, 40),
                  "landed (squash-equivalent)" if landed else "NOT landed")
     return LandedProof(landed, "tree-equal" if landed else "tree-differs")
 
@@ -6220,21 +6230,35 @@ def force_push_with_lease(
     (``+refs/heads/*:refs/heads/*``, in the shared common dir an agent can
     write) made the push a forced one, which overrides any lease.
 
-    Nothing else rides on it: ``--no-follow-tags`` and
+    No other ref rides on it: ``--no-follow-tags`` and
     ``--recurse-submodules=check`` lead the argv, in that order, as on the
     plain push in ``pr.GitHubPR.open``. Each overrides a key of the same
-    agent-writable config. Under ``push.followTags=true`` every annotated tag
+    agent-writable config, which still decides the push options transmitted
+    (``push.pushOption``). Under ``push.followTags=true`` every annotated tag
     the branch reaches went out with the push — tag messages, which the
     pre-push message guard never reads. Under
     ``push.recurseSubmodules=on-demand``, or ``submodule.recurse=true``, each
     populated submodule's same-named branch was first pushed to that
-    submodule's own remote. ``check`` pushes no submodule: when a changed
+    submodule's own remote, and ``push.recurseSubmodules=only`` pushed the
+    submodule's branch and skipped this push altogether, exiting 0 with
+    nothing on *remote*. ``check`` pushes no submodule: when a changed
     gitlink names a commit no remote-tracking ref of a populated submodule
-    reaches, git refuses the whole push with its own diagnosis. Those refs
-    are read locally, with no network, and an agent can write them too, so
-    the refusal stops a gitlink nobody can fetch without proving that anyone
-    can; a submodule the worktree never populated, or one with no
-    remote-tracking ref at all, is not checked. An operator's own ``check`` is
+    reaches, git refuses the whole push with its own diagnosis.
+    Reachability is read from those local refs, never asked of the
+    submodule's remote, so a commit the remote holds only under a tag, or
+    one fetched by name while the tracking refs are stale, is refused too.
+    The check contacts no remote, with one exception: a submodule configured
+    as a partial clone lazily fetches a gitlink commit it lacks from its
+    promisor remote, through its own transport config. An agent can write
+    those refs too, so the refusal stops a gitlink nobody can fetch without
+    proving that anyone can. Not checked: a submodule the worktree never
+    populated, one with no remote-tracking ref at all, a populated one that
+    does not hold the gitlink's commit, or holds it but reaches it from none
+    of its refs and not from HEAD (git asks ``rev-list <commit> --not --all``
+    there before anything else), and one git cannot open at its path (a
+    broken gitfile, a symlinked path); and the superproject's own
+    ``refs/remotes/<remote>/*`` decide which pushed commits are examined, so
+    one there that reaches the bump hides it. An operator's own ``check`` is
     honoured, where ``no`` would switch it off.
 
     Confined to *worktree* like the pipeline's plain push (:func:`git`'s

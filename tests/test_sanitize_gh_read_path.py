@@ -39,7 +39,11 @@ from tests.gh_read_model import ENCODERS, gh_read
 _NOTE = "Control characters were neutralized for publication"
 _PINS = ("-c", "core.ignoreStat=false", "-c", "status.showUntrackedFiles=normal",
          "-c", "submodule.recurse=false", "-c", "color.ui=never",
-         "-c", "commit.gpgsign=false")
+         "-c", "commit.gpgsign=false",
+         "-c", "tag.gpgsign=false",
+         "-c", "protocol.file.allow=always",
+         "-c", "safe.bareRepository=all",
+         "-c", "branch.autoSetupMerge=true")
 
 
 def _publish_body_text(text: str) -> str:

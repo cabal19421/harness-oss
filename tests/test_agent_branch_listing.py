@@ -27,6 +27,7 @@ fixtures' own calls are pinned (``_FIXTURE_GIT_PINS``).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -44,7 +45,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "commit.gpgsign=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
-                     "-c", "submodule.recurse=false")
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 #: Every agent branch :func:`_layout` makes, in refname order.
 _AGENT_BRANCHES = ["agent/a", "agent/act", "agent/b", "agent/c", "agent/unlanded",
@@ -151,7 +156,8 @@ def test_prune_deletes_every_landed_agent_branch_whatever_the_list_config(tmp_pa
     out = wm.prune_merged()
 
     assert out == {"deleted": _LANDED, "kept_unlanded": ["agent/unlanded"],
-                   "kept_unproven": [], "kept_active": ["agent/act"], "delete_failed": []}
+                   "kept_unproven": [], "kept_active": ["agent/act"], "delete_failed": [],
+                   "listing_failed": []}
     assert _branches(repo) == ["refs/heads/agent/act", "refs/heads/agent/unlanded",
                                "refs/heads/agentish", "refs/heads/feature/agent/q",
                                "refs/heads/main"]
@@ -172,7 +178,7 @@ def test_the_unlanded_opt_in_deletes_real_branches_under_column_ui(tmp_path, cap
     assert out == {"deleted": ["agent/a", "agent/b", "agent/c", "agent/unlanded",
                                "agent/x/y"],
                    "kept_unlanded": [], "kept_unproven": [], "kept_active": ["agent/act"],
-                   "delete_failed": []}
+                   "delete_failed": [], "listing_failed": []}
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warned) == 1, warned
     assert warned[0].startswith("prune: deleting UNLANDED branch agent/unlanded — "), warned
@@ -182,8 +188,9 @@ def test_the_unlanded_opt_in_deletes_real_branches_under_column_ui(tmp_path, cap
 
 def test_a_listing_git_cannot_produce_lists_nothing_and_says_so(tmp_path, monkeypatch,
                                                                caplog):
-    """A listing that fails is no branch to prune, and a WARNING names git's
-    exit code and error — never a silent "nothing to prune"."""
+    """A listing that fails is no branch to prune: nothing is deleted, a
+    WARNING names git's exit code and error, and the result carries them as
+    ``listing_failed`` — never a silent "nothing to prune"."""
     repo, wm = _layout(tmp_path)
     real_git = gitutil.git
 
@@ -196,8 +203,9 @@ def test_a_listing_git_cannot_produce_lists_nothing_and_says_so(tmp_path, monkey
     with caplog.at_level(logging.WARNING, logger="harness.pipeline.worktree"):
         out = wm.prune_merged()
 
+    timed_out = "`git for-each-ref` exited 124: git for-each-ref timed out after 120s"
     assert out == {"deleted": [], "kept_unlanded": [], "kept_unproven": [],
-                   "kept_active": [], "delete_failed": []}
+                   "kept_active": [], "delete_failed": [], "listing_failed": [timed_out]}
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("cannot list the agent/* branches" in w and "exited 124" in w
                and "timed out" in w for w in warned), warned
@@ -267,6 +275,227 @@ def test_a_non_utf8_checked_out_branch_is_pinned_not_crashed(tmp_path):
     assert quoted in out["kept_active"]
     assert quoted not in out["deleted"] and quoted not in out["delete_failed"]
     assert f"refs/heads/{_NON_UTF8_BRANCH}" in _raw_branches(repo)  # never deleted: it is live
+
+
+#: Two more non-UTF-8 agent branches: one holding work main lacks (``0xfd``),
+#: and one whose ``c.txt`` conflicts with main's (``0xfc``).
+_NON_UTF8_UNLANDED = "agent/" + "\udcfd" + "u"
+_NON_UTF8_CONFLICT = "agent/" + "\udcfc" + "c"
+
+
+def _non_utf8_branches(repo: Path) -> None:
+    """:data:`_NON_UTF8_BRANCH` at main (landed, an ancestor),
+    :data:`_NON_UTF8_UNLANDED` with a file main lacks, and
+    :data:`_NON_UTF8_CONFLICT` with ``c.txt`` edited one way while main edits
+    it another. Each is built on an ASCII branch and only then given its raw
+    bytes, so no fixture call prints a name that is not UTF-8."""
+    _git(["branch", _NON_UTF8_BRANCH, "main"], repo)
+    _git(["checkout", "-q", "-b", "tmp-unlanded"], repo)
+    _commit(repo, "only-on-the-branch", day=6)
+    _git(["checkout", "-q", "-b", "tmp-conflict", "main"], repo)
+    (repo / "c.txt").write_text("the branch's side\n")
+    _git(["commit", "-q", "-am", "branch side"], repo, date="2026-01-07T00:00:00Z")
+    _git(["checkout", "-q", "main"], repo)
+    (repo / "c.txt").write_text("main's side\n")
+    _git(["commit", "-q", "-am", "main side"], repo, date="2026-01-08T00:00:00Z")
+    _git(["branch", "-m", "tmp-unlanded", _NON_UTF8_UNLANDED], repo)
+    _git(["branch", "-m", "tmp-conflict", _NON_UTF8_CONFLICT], repo)
+
+
+@contextlib.contextmanager
+def _utf8_log_file(path: Path):
+    """The harness logger writing DEBUG to *path* the way ``--log-file`` /
+    ``HARNESS_LOG_FILE`` does (``harness.log.setup_logging``): a
+    ``FileHandler(encoding="utf-8")``. Its strict encoding cannot write a lone
+    surrogate: such a record prints "--- Logging error ---" with a traceback
+    on stderr, and is dropped from the file."""
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger("harness")
+    level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(level)
+        handler.close()
+
+
+def test_a_non_utf8_branch_keeps_its_landed_proof_lines_in_a_utf8_log_file(tmp_path,
+                                                                          capsys):
+    """Prune lists a non-UTF-8 branch now (its surrogate escapes), so it asks
+    ``gitutil.landed_proof`` about it, and the proof's debug lines formatted
+    the ref names raw. Under ``--log-file`` each such record printed "---
+    Logging error ---" with a ``UnicodeEncodeError`` traceback on stderr and
+    was dropped from the file; prune itself went on, so what was lost is the
+    record of why each branch was deleted or kept. PRE-FIX: three tracebacks
+    here, and no ``landed_proof:`` line in the file. Each name goes through
+    ``gitutil._log_text`` now, which writes every byte that is not UTF-8 as
+    ``\\xNN``, as gitutil's echo of the git command already did."""
+    repo = _repo(tmp_path)
+    _non_utf8_branches(repo)
+    wm = WorktreeManager(repo, tmp_path / "wt", base_branch="main")
+    log = tmp_path / "harness.log"
+    capsys.readouterr()
+
+    with _utf8_log_file(log):
+        out = wm.prune_merged()
+
+    stderr = capsys.readouterr().err
+    assert "Logging error" not in stderr and "UnicodeEncodeError" not in stderr, stderr
+    proof_lines = [line for line in log.read_text(encoding="utf-8").splitlines()
+                   if "landed_proof: " in line]
+    assert any(line.endswith(r"landed_proof: refs/heads/agent/\xff\xfe is an ancestor "
+                             r"of refs/heads/main → landed (plain merge)")
+               for line in proof_lines), proof_lines
+    assert any(line.endswith(r"landed_proof: merge-tree(refs/heads/main, "
+                             r"refs/heads/agent/\xfcc) conflicts → NOT landed")
+               for line in proof_lines), proof_lines
+    assert any(r"landed_proof: merge-tree(refs/heads/main, refs/heads/agent/\xfdu)="
+               in line and line.endswith("→ NOT landed") for line in proof_lines), \
+        proof_lines
+    # What prune did is unchanged: the landed branch deleted, the other two
+    # kept as unlanded, each reported in git's quoting.
+    assert out["deleted"] == [*_LANDED, r'"agent/\377\376"'], out
+    assert out["kept_unlanded"] == ["agent/unlanded", r'"agent/\374c"',
+                                    r'"agent/\375u"'], out
+    assert out["kept_unproven"] == [] and out["kept_active"] == [], out
+    assert out["delete_failed"] == [] and out["listing_failed"] == [], out
+    left = _raw_branches(repo)
+    assert f"refs/heads/{_NON_UTF8_BRANCH}" not in left
+    assert {f"refs/heads/{_NON_UTF8_UNLANDED}", f"refs/heads/{_NON_UTF8_CONFLICT}"} <= set(left)
+
+
+@pytest.mark.parametrize("route, how", [
+    pytest.param("merge-driver", "merge-driver", id="conflicts-only-in-driver-files"),
+    pytest.param("attributes", "unavailable", id="merge-attributes-unreadable"),
+    pytest.param("no-tree", "unavailable", id="merge-tree-gave-no-answer"),
+])
+def test_every_landed_proof_line_writes_a_non_utf8_name_the_log_file_can_hold(
+        tmp_path, capsys, monkeypatch, route, how):
+    """The proof's other lines that name base and head, reached when the merge
+    conflicts only in files a merge driver would merge, when the conflicting
+    files' merge attributes cannot be read, or when ``merge-tree`` gives no
+    answer: each writes the non-UTF-8 head as ``\\xNN`` too, so its record
+    reaches a UTF-8 log file. PRE-FIX each printed "--- Logging error ---"
+    and was dropped."""
+    repo = _repo(tmp_path)
+    _non_utf8_branches(repo)
+    if route == "merge-driver":
+        # A driver the configuration defines, refused by the proof as every one is.
+        _git(["config", "merge.text.driver", "true"], repo)
+    elif route == "attributes":
+        monkeypatch.setattr(gitutil, "_refused_merges",
+                            lambda *_args: gitutil.GitResult(1, "", "fatal: unreadable"))
+    else:
+        real_git = gitutil.git
+
+        def merge_tree_gives_no_tree(args, **kwargs):
+            if "merge-tree" in args:
+                return gitutil.GitResult(128, "", "fatal: no tree today")
+            return real_git(args, **kwargs)
+
+        monkeypatch.setattr(gitutil, "git", merge_tree_gives_no_tree)
+    log = tmp_path / "harness.log"
+    capsys.readouterr()
+
+    with _utf8_log_file(log):
+        proof = gitutil.landed_proof(repo, "refs/heads/main",
+                                     f"refs/heads/{_NON_UTF8_CONFLICT}")
+
+    stderr = capsys.readouterr().err
+    assert "Logging error" not in stderr and "UnicodeEncodeError" not in stderr, stderr
+    assert (proof.landed, proof.how) == (None, how), proof
+    text = log.read_text(encoding="utf-8")
+    assert [line for line in text.splitlines() if "landed_proof: " in line and
+            r"merge-tree(refs/heads/main, refs/heads/agent/\xfcc)" in line], text
+
+
+def _non_utf8_repo(tmp_path: Path) -> Path:
+    """A repository at a path whose last part is not UTF-8 (``repo-\\xff\\xfe``,
+    as surrogate escapes, the way the filesystem codec hands harness such a
+    path): ``main`` with one commit, and ``agent/x`` with a commit main lacks.
+    Every fixture call is quiet, so none prints the path."""
+    repo = Path(os.fsdecode(os.fsencode(tmp_path) + b"/repo-\xff\xfe"))
+    repo.mkdir()
+    _git(["init", "-q", "-b", "main"], repo)
+    _commit(repo, "init", day=1)
+    _git(["checkout", "-q", "-b", "agent/x"], repo)
+    _commit(repo, "only-on-the-branch", day=2)
+    _git(["checkout", "-q", "main"], repo)
+    return repo
+
+
+def test_a_repository_at_a_non_utf8_path_keeps_the_no_base_record_in_a_utf8_log_file(
+        tmp_path, capsys):
+    """``gitutil.landed_proof``'s lines that name the repository formatted its
+    path raw, so in a repository at a path that is not UTF-8 a UTF-8 log file
+    (``--log-file`` / ``HARNESS_LOG_FILE``) lost them: each printed "---
+    Logging error ---" with a ``UnicodeEncodeError`` traceback on stderr and
+    was dropped, here the record of why prune kept a branch whose base does
+    not resolve. PRE-FIX: that traceback, and no such line in the file. The
+    path goes through ``gitutil._log_text`` now, which writes each byte that
+    is not UTF-8 as ``\\xNN``. The base is a full ref name, which
+    ``qualify_ref`` hands back without asking git, and the manager is built
+    before the log file is attached: only prune's own run is under test."""
+    repo = _non_utf8_repo(tmp_path)
+    wm = WorktreeManager(repo, tmp_path / "wt", base_branch="refs/heads/gone")
+    log = tmp_path / "harness.log"
+    capsys.readouterr()
+
+    with _utf8_log_file(log):
+        out = wm.prune_merged()
+
+    stderr = capsys.readouterr().err
+    assert "Logging error" not in stderr and "UnicodeEncodeError" not in stderr, stderr
+    shown = f"{wm.repo.parent}" + r"/repo-\xff\xfe"
+    text = log.read_text(encoding="utf-8")
+    assert any(line.endswith(f"landed_proof: base 'refs/heads/gone' does not resolve "
+                             f"in {shown} → no proof (rc=128)")
+               for line in text.splitlines()), text
+    # What prune did is unchanged: the branch is kept as unproven, not deleted.
+    assert out == {"deleted": [], "kept_unlanded": [], "kept_unproven": ["agent/x"],
+                   "kept_active": [], "delete_failed": [], "listing_failed": []}
+    assert _branches(repo) == ["refs/heads/agent/x", "refs/heads/main"]
+
+
+@pytest.mark.parametrize("route, how, said", [
+    pytest.param("no-head", "no-head",
+                 "landed_proof: head 'refs/heads/agent/gone' does not resolve to a "
+                 "commit in {} → no proof (rc=128)", id="head-does-not-resolve"),
+    pytest.param("drivers", "unavailable",
+                 "landed_proof: cannot list the merge drivers configured in {} → no "
+                 "proof (rc=1)", id="merge-drivers-cannot-be-listed"),
+])
+def test_every_landed_proof_line_writes_a_non_utf8_repository_path_the_log_file_can_hold(
+        tmp_path, capsys, monkeypatch, route, how, said):
+    """The proof's other lines that name the repository, reached when the head
+    does not resolve to a commit or when the merge drivers the configuration
+    defines cannot be listed: each writes a path that is not UTF-8 as
+    ``\\xNN`` too, so its record reaches a UTF-8 log file. PRE-FIX each
+    printed "--- Logging error ---" and was dropped."""
+    repo = _non_utf8_repo(tmp_path)
+    head = "refs/heads/agent/x"
+    if route == "no-head":
+        head = "refs/heads/agent/gone"
+    else:
+        monkeypatch.setattr(gitutil, "_merge_drivers",
+                            lambda _cwd: gitutil.GitResult(1, "", "fatal: unreadable"))
+    log = tmp_path / "harness.log"
+    capsys.readouterr()
+
+    with _utf8_log_file(log):
+        proof = gitutil.landed_proof(repo, "refs/heads/main", head)
+
+    stderr = capsys.readouterr().err
+    assert "Logging error" not in stderr and "UnicodeEncodeError" not in stderr, stderr
+    assert (proof.landed, proof.how) == (None, how), proof
+    shown = f"{repo.parent}" + r"/repo-\xff\xfe"
+    text = log.read_text(encoding="utf-8")
+    assert any(line.endswith(said.format(shown)) for line in text.splitlines()), text
 
 
 def test_a_landed_branch_whose_deletion_fails_is_reported_as_delete_failed(tmp_path,
@@ -356,8 +585,8 @@ def test_a_branch_gone_before_its_proof_is_kept_unproven_never_unlanded(
     repo, wm = _layout(tmp_path)
     listed = wm.list_agent_branches
 
-    def listing_then_one_goes() -> list[str]:
-        names = listed()
+    def listing_then_one_goes(**kw) -> list[str]:
+        names = listed(**kw)
         _git(["branch", "-D", "agent/b"], repo)
         return names
 
@@ -414,3 +643,59 @@ def test_harness_prune_prints_the_branches_it_deleted_under_column_ui(tmp_path, 
     assert "refs/heads/" not in printed, printed
     assert _branches(repo) == ["refs/heads/agent/unlanded", "refs/heads/agentish",
                                "refs/heads/feature/agent/q", "refs/heads/main"]
+
+
+def test_harness_prune_says_the_branches_could_not_be_listed_and_exits_2(
+        tmp_path, capsys, caplog):
+    """One garbage line in ``.git/packed-refs`` makes ``git for-each-ref`` exit
+    128 (git 2.56: "unexpected line in .git/packed-refs"), so the listing lists
+    nothing and prune deletes nothing, with a WARNING that says so. PRE-FIX the
+    result was every bucket empty, and ``harness pipeline prune`` printed "no
+    agent/* branches to prune" and exited 0, contradicting the WARNING. Now
+    ``listing_failed`` holds git's exit code and error line, every other
+    bucket is empty, and the CLI says the branches could not be listed, with
+    git's error, and that no branch was pruned — exiting 2, as every git
+    refusal of a pipeline subcommand does. Nothing is deleted."""
+    from harness import cli
+    from harness.pipeline.orchestrator import PipelineOrchestrator
+    from harness.pipeline.spec import PipelineConfig
+
+    repo = _repo(tmp_path)
+    (repo / "designs").mkdir()
+    (repo / "designs" / "d.md").write_text("# D\n## Tasks\n- [ ] task one (id: t1)\n")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-q", "-m", "a design"], repo, date="2026-01-08T00:00:00Z")
+    cfg = PipelineConfig(repo=repo, designs_dir="designs", backend="ide-handoff",
+                         pr_mode="local")
+    PipelineOrchestrator(cfg, log=lambda *a, **k: None).plan()
+    before = _branches(repo)
+    packed = repo / ".git" / "packed-refs"
+    intact = packed.read_bytes() if packed.exists() else b""
+    with packed.open("ab") as fh:
+        fh.write(b"garbage line\n")
+    # The premise: git itself cannot list the branches now.
+    listing = subprocess.run(["git", *_FIXTURE_GIT_PINS, "for-each-ref", "refs/heads/"],
+                             cwd=str(repo), capture_output=True, text=True, check=False)
+    assert listing.returncode == 128, listing
+    assert "fatal: unexpected line in .git/packed-refs: garbage line" in listing.stderr
+    error = ("`git for-each-ref` exited 128: fatal: unexpected line in "
+             ".git/packed-refs: garbage line")
+    wm = WorktreeManager(repo, tmp_path / "wt", base_branch="main")
+
+    with caplog.at_level(logging.WARNING, logger="harness.pipeline.worktree"):
+        out = wm.prune_merged()
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["pipeline", "prune", "--repo", str(repo)])
+    printed = capsys.readouterr().out
+
+    assert out == {"deleted": [], "kept_unlanded": [], "kept_unproven": [],
+                   "kept_active": [], "delete_failed": [], "listing_failed": [error]}
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("cannot list the agent/* branches" in w for w in warned), warned
+    assert exited.value.code == 2, printed
+    assert "no agent/* branches to prune" not in printed, printed
+    assert f"the agent/* branches could not be listed ({error})" in printed, printed
+    assert "no branch was pruned" in printed, printed
+    packed.write_bytes(intact)
+    assert _branches(repo) == before                    # nothing was deleted

@@ -59,7 +59,11 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false", "-c", "color.ui=never",
                      "-c", "commit.gpgsign=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
-                     "-c", "submodule.recurse=false")
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 URL = "https://github.com/o/r/pull/1"
 TITLE = "Do the thing [t1]"
@@ -691,6 +695,9 @@ class _GitHubWorld:
         _git(["add", "-A"], repo)
         _git(["commit", "-q", "-m", "init"], repo)
         _git(["remote", "add", "origin", str(self.origin)], repo)
+        # The fixture's opt-in: harness's push to this local-path origin carries
+        # no pin, and protocol.file.allow=never in the run's config refuses it.
+        _git(["config", "protocol.file.allow", "always"], repo)
         _git(["push", "-q", "-u", "origin", "main"], repo)
 
         backend = _TwoPassBackend()

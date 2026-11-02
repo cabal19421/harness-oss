@@ -256,7 +256,7 @@ The full list, with the exit codes and the quota path, is in
 ```bash
 harness status               # environment doctor: grounding solver, backends, deps, extensions
 harness pipeline backends    # which code-writing backends are usable here
-pytest -q                    # (after `.[dev]`) → 2921 passed, 1 skipped
+pytest -q                    # (after `.[dev]`) → 2952 passed, 1 skipped
 harness verify - --lang go <<<'package main
 import "fmtx"
 func main(){}'               # grounding smoke test (should FAIL on the bad import)

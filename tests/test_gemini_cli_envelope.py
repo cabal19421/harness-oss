@@ -33,6 +33,7 @@ from harness.pipeline.looptools import (
     quota_reset_seconds,
 )
 from harness.pipeline.notes import RunLog
+from harness.pipeline.trace import Tracer
 from harness.pipeline.worktree import WorktreeManager
 from tests.test_gemini_cli_flags import (
     ENVELOPE,
@@ -827,6 +828,83 @@ def test_a_held_pipe_at_the_turn_limit_is_swept_as_after_a_clean_exit(gem, tmp_p
         for pid in cli.leftovers():
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+
+
+# ── the cost estimate ───────────────────────────────────────────────────────────
+
+
+def test_an_estimate_that_is_not_finite_or_is_below_zero_counts_nothing(gem, tmp_path,
+                                                                        monkeypatch, caplog):
+    """A Gemini CLI call's cost is harness's estimate from its envelope's stats,
+    summed over the models that served it, and a model's estimate that is not
+    finite or is below zero is no reading of what it spent: it counts $0, as an
+    unpriced model does, with a DEBUG line that says so — the legacy family's
+    rule for its envelope's cost, applied to each model — and the call's tokens
+    still count. Three calls under max_cost_usd=1.0, each judged red: a token
+    count so large that it times its model's rate overflows (+Infinity), and
+    HARNESS_MODEL_PRICES rates that are not a number (NaN) and below zero (a
+    negative estimate). The loop runs all three, its budget still reads $0 when
+    it stops, and every `agent` span reads $0 as strict JSON. Beside a model
+    priced as usual, each counts nothing and the other model's estimate stands.
+    PRE-FIX each figure was charged as it was, summed with the other models'
+    estimates: the Infinity stopped the run after one launch on "cost budget
+    reached ($inf ≥ $1.00)", the spans wrote a bare NaN and a negative cost
+    into trace.jsonl, a negative estimate beside agent-test-pro's $0.20 made
+    the call $0.10, and a count no double holds (401 digits) raised
+    OverflowError out of the parser, and out of the call's outcome with it."""
+    monkeypatch.setenv("HARNESS_MODEL_PRICES", "agent-test-pro=1/0.25/10,"
+                       "agent-test-nan=nan/nan/nan,agent-test-below=-1/-0.25/-10")
+    cli = gem.stand_in()
+    for mode, model, counts in (
+            ("inf", "agent-test-pro", {"candidates": 1e308}),
+            ("nan", "agent-test-nan", {"prompt": 1000, "candidates": 50}),
+            ("below", "agent-test-below", {"prompt": 1000, "candidates": 50})):
+        # Each launch prints an envelope of its own and exits 0.
+        cli.serve_error(mode, "", 0, stdout=json.dumps(
+            {**ENVELOPE, "stats": {"models": {model: {"tokens": counts}}}}))
+    cli.modes("inf,nan,below")
+    ctx = _managed_ctx(tmp_path, monkeypatch, max_iters=3, max_consecutive_failures=4,
+                       max_cost_usd=1.0)
+    ctx.trace = Tracer(ctx.config.state_dir, run_id="r", task_id="t")
+
+    with caplog.at_level(logging.DEBUG, logger="harness"):
+        out = _Judged(cli.cli, [False]).implement(ctx)
+
+    assert out.status == "failed" and out.detail.startswith("did not converge"), out.detail
+    assert len(cli.launches()) == 3
+    huge = int(1e308)
+
+    def refuse(token: str):
+        raise ValueError(f"not strict JSON: {token}")
+
+    trace = (Path(ctx.config.state_dir) / "trace.jsonl").read_text(encoding="utf-8")
+    spans = [json.loads(line, parse_constant=refuse) for line in trace.splitlines()]
+    assert [(span["tokens"], span["cost_usd"]) for span in spans
+            if span["type"] == "agent"] == [(huge, 0.0), (1050, 0.0), (1050, 0.0)]
+    said = [r.getMessage() for r in caplog.records]
+    for model, read in (("agent-test-pro", "$inf (not finite)"),
+                        ("agent-test-nan", "$nan (not a number)"),
+                        ("agent-test-below", "$-0.0015 (below zero)")):
+        assert (f"the cost estimate for {model!r} reads {read} — its part of this call "
+                f"counts $0 toward the budget, as an unpriced model's does") in said, \
+            [s for s in said if "estimate for" in s]
+    # The loop's own budget as it stopped: every token counted, and $0.
+    assert any(f"(~{huge + 2100} tokens, $0.0000)" in s for s in said), \
+        [s for s in said if "exhausted" in s]
+    assert not warnings_matching(caplog, "no parseable usage")
+    assert not warnings_matching(caplog, "printed no stats")
+
+    # Each served model is judged alone: agent-test-pro's 100k prompt and 10k
+    # candidates are $0.20 whatever is beside them, and every token counts.
+    pro = {"prompt": 100_000, "candidates": 10_000}
+    for model, counts, tokens in (
+            ("agent-test-below", {"prompt": 50_000, "candidates": 5_000}, 55_000),
+            ("agent-test-nan", {"prompt": 1000, "candidates": 50}, 1050),
+            ("gemini-2.5-pro", {"prompt": 10**400}, 10**400)):
+        stats = {"stats": {"models": {"agent-test-pro": {"tokens": pro},
+                                      model: {"tokens": counts}}}}
+        got = looptools.parse_gemini_usage(json.dumps(stats))
+        assert got[0] == 110_000 + tokens and got[1] == pytest.approx(0.2), (model, got)
 
 
 # ── the verifier ────────────────────────────────────────────────────────────────

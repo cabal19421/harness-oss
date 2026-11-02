@@ -47,7 +47,12 @@ _FIXTURE_GIT_PINS = ("-c", "core.ignoreStat=false",
                      "-c", "status.showUntrackedFiles=normal",
                      "-c", "diff.ignoreSubmodules=none",
                      "-c", "submodule.recurse=false",
-                     "-c", "color.ui=never")
+                     "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args, cwd):
@@ -515,6 +520,60 @@ def test_worktree_requires_commit(tmp_path):
     wm = WorktreeManager(repo, tmp_path / "wt", base_branch="main")
     with pytest.raises(GitError):
         wm.ensure("x")                     # no initial commit → refused
+
+
+@pytest.mark.parametrize("shape", ["autosetup-in-the-global-config",
+                                   "autosetup-in-the-shared-config",
+                                   "remote-tracking-base"])
+def test_a_new_task_branch_is_created_without_an_upstream(tmp_path, monkeypatch, shape):
+    """``ensure`` creates ``agent/<id>`` with ``--no-track``. PRE-FIX, under
+    ``branch.autoSetupMerge=always`` and ``branch.autoSetupRebase=always`` — in
+    an operator's global config, or in the shared ``.git/config`` an agent can
+    write — the ``worktree add -b`` off the local base wrote
+    ``branch.agent/<id>.remote=.``, ``.merge=refs/heads/main`` and
+    ``.rebase=true`` into the repository's shared config; and under git's
+    default, a base that resolves to origin's remote-tracking branch (no local
+    branch of that name) recorded it as the upstream. An agent's bare
+    ``git pull`` then merged or rebased the base into its task branch. harness
+    itself reads no upstream (the publish names its refspec in full and
+    records one with ``push -u``). Nothing else about the new tree changes."""
+    repo = _init_repo(tmp_path / "repo")
+    base = "main"
+    if shape == "autosetup-in-the-global-config":
+        cfg = tmp_path / "global.gitconfig"
+        cfg.write_text("[branch]\n\tautoSetupMerge = always\n\tautoSetupRebase = always\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    elif shape == "autosetup-in-the-shared-config":
+        _git(["config", "branch.autoSetupMerge", "always"], repo)
+        _git(["config", "branch.autoSetupRebase", "always"], repo)
+    else:
+        # origin's `release`, fetched earlier; no local branch of that name.
+        # Nothing is fetched or pushed: origin need not exist.
+        base = "release"
+        _git(["remote", "add", "origin", str(tmp_path / "origin.git")], repo)
+        _git(["update-ref", "refs/remotes/origin/release", "HEAD"], repo)
+    tip = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    local = ["config", "--local", "--list"]          # the repository's own file only
+    before = _git(local, repo).stdout
+    wm = WorktreeManager(repo, tmp_path / "wt", base_branch=base)
+    if shape == "remote-tracking-base":
+        assert wm.base_rev == "refs/remotes/origin/release"         # the premise
+
+    wt = wm.ensure("t")
+
+    tracking = _git(["config", "--local", "--get-regexp", r"^branch\.agent/t\."], repo)
+    assert tracking.returncode == 1 and tracking.stdout == "", tracking.stdout
+    assert _git(local, repo).stdout == before
+    upstream = _git(["rev-parse", "--symbolic-full-name", "agent/t@{upstream}"], wt.path)
+    assert upstream.returncode != 0 and "no upstream" in upstream.stderr, upstream
+    # Otherwise the tree is what it always was.
+    assert (wt.path, wt.branch, wt.reused) == (wm.path_for("t"), "agent/t", False)
+    assert _git(["symbolic-ref", "HEAD"], wt.path).stdout.strip() == "refs/heads/agent/t"
+    assert _git(["rev-parse", "refs/heads/agent/t"], repo).stdout.strip() == tip
+    listing = _git(["worktree", "list", "--porcelain"], repo).stdout.splitlines()
+    assert f"worktree {wt.path.resolve()}" in listing
+    assert "branch refs/heads/agent/t" in listing
+    assert _git(["status", "--porcelain"], wt.path).stdout == ""
 
 
 # ── backends ────────────────────────────────────────────────────────────────────

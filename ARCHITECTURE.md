@@ -340,7 +340,7 @@ Everything else is contained at each subsystem's boundary:
 |---|---|
 | `0` | Success |
 | `1` | Failure (e.g. `verify` grounding failed, a pipeline task failed) |
-| `2` | Usage error (bad or missing arguments), or one of these refusals: a mutating `pipeline` subcommand (`run`, `requeue`, `prune`, `complete`, `plan`, `tmux`, or `supervise --recover`) launched from inside a live run on the same state dir, or any of them but `run` and `supervise --recover` while a live run holds that state dir's `run.lock` (a conflicting `run` reports `locked` instead and exits `1`); a `pipeline` git refusal such as a `--base` that does not resolve; `verify` / `pipeline verify-diff` with a required z3 that is unusable |
+| `2` | Usage error (bad or missing arguments), or one of these refusals: a mutating `pipeline` subcommand (`run`, `requeue`, `prune`, `complete`, `plan`, `tmux`, or `supervise --recover`) launched from inside a live run on the same state dir, or any of them but `run` and `supervise --recover` while a live run holds that state dir's `run.lock` (a conflicting `run` reports `locked` instead and exits `1`); a `pipeline` git refusal such as a `--base` that does not resolve or a `pipeline prune` whose agent/* branches git cannot list; `verify` / `pipeline verify-diff` with a required z3 that is unusable |
 
 `harness verify` doubles as a pre-commit / CI gate with this 0/1/2 contract:
 `0` = grounded, `1` = grounding failed, `2` = usage error or a required z3 that

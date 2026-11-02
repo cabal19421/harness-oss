@@ -8,7 +8,7 @@ own tooling never rescan them.
 
 This is the structured, resumable version of::
 
-    git worktree add -q "../wt-$id" -b "agent/$id" "$base"
+    git worktree add -q --no-track "../wt-$id" -b "agent/$id" "$base"
 
 with idempotent create (reuse an existing worktree/branch instead of erroring)
 and clean teardown.
@@ -46,7 +46,10 @@ def _branch_shown(branch: str) -> str:
     ``git branch -D`` byte for byte — but its surrogate escapes fail every
     strict encoder (a UTF-8 stdout, a log file). That name is shown in git's
     own quoting (:func:`gitutil.display_path`); every other name, exactly as
-    git has it.
+    git has it. The spelling is prune's own, in its result and in its log
+    lines here: gitutil's lines about the same branch — its echo of each git
+    command, and :func:`gitutil.landed_proof`'s — write each byte of the name
+    that is not UTF-8 as ``\\xNN`` instead (``gitutil._log_text``).
     """
     try:
         branch.encode("utf-8")
@@ -431,7 +434,15 @@ class WorktreeManager:
             # this path is `_branch_exists` proving a branch is really there.
             args += [str(wt), branch]
         else:
-            args += [str(wt), "-b", branch, self.base_rev]
+            # --no-track: `-b` recorded the base as the new branch's upstream
+            # in the SHARED config under branch.autoSetupMerge=always (an
+            # operator's global config, or one an agent wrote), and off a
+            # remote-tracking base under git's default too — with
+            # branch.autoSetupRebase=always, rebase=true as well — so an
+            # agent's bare `git pull` merged or rebased the base into its task
+            # branch. harness reads no upstream: the publish names its refspec
+            # in full, and its `push -u` records one.
+            args += ["--no-track", str(wt), "-b", branch, self.base_rev]
         logger.info("task %s: creating worktree %s on %s branch %s (base %s)",
                     task_id, wt,
                     "existing (resume)" if resuming else "new", branch,
@@ -1365,10 +1376,18 @@ class WorktreeManager:
         read as unlanded work there.
 
         Returns ``{"deleted", "kept_unlanded", "kept_unproven", "kept_active",
-        "delete_failed"}`` lists of branches, each name as git has it unless it
-        is not UTF-8: that one is listed, and logged, in git's quoting
-        (:func:`gitutil.display_path`), while ``git branch -D`` still gets its
-        exact bytes.
+        "delete_failed", "listing_failed"}``. The first five are lists of
+        branches, each name as git has it unless it is not UTF-8: that one is
+        listed in git's quoting (:func:`gitutil.display_path`), and prune's
+        own log lines spell it the same way (:func:`_branch_shown`), while
+        ``git branch -D`` still gets its exact bytes. gitutil's lines about
+        the same branch (its echo of each git command, and
+        :func:`gitutil.landed_proof`'s) write each byte of the name that is
+        not UTF-8 as ``\\xNN`` instead (``gitutil._log_text``). ``listing_failed``
+        is empty when the branches were listed. When git could not list them
+        it holds one entry, ``git for-each-ref``'s exit code and error line;
+        every other list is then empty and nothing was deleted, and a caller
+        can tell that from nothing to prune.
         """
         if force is not None:
             logger.debug("prune_merged(force=%s) is deprecated — mapping it to "
@@ -1377,9 +1396,9 @@ class WorktreeManager:
         pinned = self._checked_out_branches()
         out: dict[str, list[str]] = {"deleted": [], "kept_unlanded": [],
                                      "kept_unproven": [], "kept_active": [],
-                                     "delete_failed": []}
+                                     "delete_failed": [], "listing_failed": []}
         unproven: list[gitutil.LandedProof] = []
-        branches = self.list_agent_branches()
+        branches = self.list_agent_branches(failed=out["listing_failed"])
         base_rev = self.base_rev      # resolved once, not per branch
         logger.debug("prune_merged: %d agent branch(es), %d pinned by worktrees, "
                      "base=%s allow_unlanded=%s", len(branches), len(pinned),
@@ -1485,7 +1504,7 @@ class WorktreeManager:
                      task_id, ahead, base_rev, ahead > 0)
         return ahead > 0
 
-    def list_agent_branches(self) -> list[str]:
+    def list_agent_branches(self, *, failed: list[str] | None = None) -> list[str]:
         """Every ``agent/*`` branch, by name, in refname order.
 
         Read with plumbing: ``git for-each-ref`` prints one refname per line,
@@ -1507,7 +1526,10 @@ class WorktreeManager:
         unpinned) and is not the name ``git branch -D`` takes.
 
         A listing git cannot produce lists nothing, so prune deletes nothing,
-        and a WARNING names git's exit code and error.
+        and a WARNING names git's exit code and error. Given *failed*, that
+        exit code and git's error line are appended to it as well: how
+        :meth:`prune_merged` reports the failure (``listing_failed``) rather
+        than an empty prune.
 
         Decoded with the filesystem codec (``fs_paths``): git takes bytes that
         are not UTF-8 in a branch name, and one such name raised
@@ -1525,6 +1547,11 @@ class WorktreeManager:
                            "exited %s: %s; listing none (prune deletes nothing)",
                            self.BRANCH_PREFIX, self.repo, res.code,
                            trunc(res.err or res.out, 200))
+            if failed is not None:
+                # One printable line (git echoes a corrupt line of packed-refs
+                # as it found it), for a caller that shows it to the operator.
+                failed.append(f"`git for-each-ref` exited {res.code}: "
+                              f"{gitutil._git_error_line(res)}")
             return []
         heads = "refs/heads/"
         return [ref[len(heads):] for ref in res.out.split("\n")

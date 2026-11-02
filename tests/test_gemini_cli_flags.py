@@ -407,9 +407,18 @@ def gem(tmp_path, monkeypatch):
     yield from gemini_setup(tmp_path, monkeypatch)
 
 
-#: The fixtures' own git calls, pinned against the user's config.
-_FIXTURE_GIT_PINS = ("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-                     "-c", "core.ignoreStat=false", "-c", "color.ui=never")
+# This file's own git calls (never harness's) carry these pins: under a hostile
+# global or system git config the run then judges harness, not the fixture.
+_FIXTURE_GIT_PINS = ("-c", "core.hooksPath=/dev/null",
+                     "-c", "core.ignoreStat=false", "-c", "color.ui=never",
+                     "-c", "commit.gpgsign=false",
+                     "-c", "status.showUntrackedFiles=normal",
+                     "-c", "diff.ignoreSubmodules=none",
+                     "-c", "submodule.recurse=false",
+                     "-c", "tag.gpgsign=false",
+                     "-c", "protocol.file.allow=always",
+                     "-c", "safe.bareRepository=all",
+                     "-c", "branch.autoSetupMerge=true")
 
 
 def _git(args, cwd):
